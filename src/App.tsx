@@ -44,6 +44,7 @@ export const App: React.FC = () => {
   const logout = useAppStore((s) => s.logout);
   const setInspectorOpen = useAppStore((s) => s.setInspectorOpen);
   const toggleInspector = useAppStore((s) => s.toggleInspector);
+  const setChatDrawerOpen = useAppStore((s) => s.setChatDrawerOpen);
   const toggleChatDrawer = useAppStore((s) => s.toggleChatDrawer);
   const setSearchQuery = useAppStore((s) => s.setSearchQuery);
   const runSearch = useAppStore((s) => s.runSearch);
@@ -231,7 +232,7 @@ export const App: React.FC = () => {
         }
       }}
     >
-      <FeedbackHost />
+      <FeedbackHost floatingToasts={false} />
       <Lightbox />
       <UploadModal
         open={uploadModalOpen}
@@ -292,9 +293,6 @@ export const App: React.FC = () => {
                 /
               </span>
             </label>
-            <button type="submit" className="button" aria-label="Search">
-              Search
-            </button>
           </form>
 
           <button
@@ -305,12 +303,12 @@ export const App: React.FC = () => {
             onClick={toggleChatDrawer}
           >
             <Sparkles size={14} />
-            <span>Ask AI</span>
+            <span className="header-btn-label">Ask AI</span>
           </button>
 
           <div className="workspace-controls">
             {user && (
-              <div className="row" style={{ gap: 6 }}>
+              <div className="row header-secondary-control" style={{ gap: 6 }}>
                 <span className="workspace-label">{user.display_name}</span>
                 <Badge tone={user.role === 'admin' ? 'info' : 'muted'}>{user.role}</Badge>
               </div>
@@ -326,13 +324,13 @@ export const App: React.FC = () => {
                 }}
               >
                 <Upload size={14} />
-                <span>Upload</span>
+                <span className="header-btn-label">Upload</span>
               </button>
             )}
 
             <button
               type="button"
-              className="button button-quiet"
+              className="button button-quiet header-secondary-control"
               onClick={() => void logout()}
             >
               <LogOut size={14} />
@@ -349,7 +347,7 @@ export const App: React.FC = () => {
               }}
             >
               <PanelRight size={14} />
-              <span>Inspector</span>
+              <span className="header-btn-label">Inspector</span>
             </button>
 
             {isTauri() && windowsCaption && <WindowsCaptionButtons />}
@@ -374,8 +372,15 @@ export const App: React.FC = () => {
             )}
           </main>
 
-          {inspectorOpen && (
-            <div className="inspector-scrim" aria-hidden="true" onClick={closeInspector} />
+          {(inspectorOpen || chatDrawerOpen) && (
+            <div
+              className="inspector-scrim"
+              aria-hidden="true"
+              onClick={() => {
+                if (inspectorOpen) closeInspector();
+                if (chatDrawerOpen) setChatDrawerOpen(false);
+              }}
+            />
           )}
 
           <div

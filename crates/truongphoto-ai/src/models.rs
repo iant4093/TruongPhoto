@@ -447,6 +447,17 @@ impl ModelDownloader {
         let final_path = target_dir.join(&rel_path);
         let part_path = PathBuf::from(format!("{}.part", final_path.display()));
 
+        if expected_sha256.is_none() {
+            if let Ok(meta) = tokio::fs::metadata(&final_path).await {
+                if meta.is_file() && meta.len() > 0 {
+                    let existing_len = meta.len();
+                    let effective_total = total_hint.max(prior_bytes.saturating_add(existing_len));
+                    on_progress(prior_bytes.saturating_add(existing_len), effective_total);
+                    return Ok((String::new(), existing_len));
+                }
+            }
+        }
+
         if let Some(parent) = final_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

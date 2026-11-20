@@ -256,8 +256,16 @@ export const useAppStore = create<AppState>((set, get) => {
     ...initialDataState,
 
     setActiveNav: (nav) => set({ activeNav: nav }),
-    toggleInspector: () => set((s) => ({ inspectorOpen: !s.inspectorOpen })),
-    setInspectorOpen: (open) => set({ inspectorOpen: open }),
+    toggleInspector: () =>
+      set((s) => ({
+        inspectorOpen: !s.inspectorOpen,
+        ...(!s.inspectorOpen ? { chatDrawerOpen: false } : {}),
+      })),
+    setInspectorOpen: (open) =>
+      set((s) => ({
+        inspectorOpen: open,
+        ...(open ? { chatDrawerOpen: false } : { chatDrawerOpen: s.chatDrawerOpen }),
+      })),
     setSearchQuery: (query) => set({ searchQuery: query }),
 
     selectAsset: (id) => set({ selectedAssetId: id }),
@@ -342,8 +350,16 @@ export const useAppStore = create<AppState>((set, get) => {
       set({ aiDashboard });
     },
 
-    setChatDrawerOpen: (open) => set({ chatDrawerOpen: open }),
-    toggleChatDrawer: () => set((s) => ({ chatDrawerOpen: !s.chatDrawerOpen })),
+    setChatDrawerOpen: (open) =>
+      set((s) => ({
+        chatDrawerOpen: open,
+        ...(open ? { inspectorOpen: false } : { inspectorOpen: s.inspectorOpen }),
+      })),
+    toggleChatDrawer: () =>
+      set((s) => ({
+        chatDrawerOpen: !s.chatDrawerOpen,
+        ...(!s.chatDrawerOpen ? { inspectorOpen: false } : {}),
+      })),
 
     loadChatSessions: async () => {
       const seq = chatSeq;

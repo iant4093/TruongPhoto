@@ -1614,3 +1614,218 @@ input[type='number'].text-input { width: 90px; }
 .tray-actions-row > .button {
   flex: 1;
 }
+
+/* UI Simplification, Overlap Fixes & Consumer AI Cards */
+.timeline-date-header {
+  height: 42px;
+  padding: 0 4px;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.timeline-scrubber {
+  z-index: 8;
+}
+
+.tile-pill {
+  max-width: calc(100% - 42px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lightbox-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.lightbox-info-drawer {
+  width: 320px;
+  flex-shrink: 0;
+}
+
+.lightbox-toolbar {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.ai-simple-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-card);
+}
+
+.ai-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.ai-feature-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-card);
+}
+
+.preset-pill-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.preset-choice-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: #1c1c1c;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  font-size: 12px;
+  transition: border-color 120ms ease-out, background 120ms ease-out;
+}
+
+.preset-choice-card > .row {
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.preset-choice-card:hover {
+  border-color: #555;
+  background: #222;
+}
+
+.preset-choice-card.is-selected {
+  border-color: #dcdcdc;
+  background: #282828;
+}
+
+.setup-ai-box {
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #1c1c1c;
+}
+
+.advanced-accordion {
+  display: flex;
+  flex-direction: column;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #1b1b1b;
+}
+
+.advanced-accordion-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: color 120ms ease-out, background 120ms ease-out;
+}
+
+.advanced-accordion-trigger:hover {
+  color: var(--text-primary);
+  background: #222;
+}
+
+.advanced-accordion-body {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  padding: 0 14px;
+  transition: max-height 180ms ease-out, opacity 140ms ease-out, padding 140ms ease-out;
+}
+
+.advanced-accordion-body.is-open {
+  max-height: 5000px;
+  opacity: 1;
+  pointer-events: auto;
+  padding: 0 14px 14px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+@media (max-width: 1080px) {
+  .header-secondary-control {
+    display: none !important;
+  }
+}
+
+@media (max-width: 960px) {
+  .lightbox-body > .lightbox-info-drawer {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(340px, 100%);
+    z-index: 15;
+    box-shadow: -10px 0 28px #000b;
+  }
+}
+
+@media (max-width: 767px) {
+  .native-titlebar .workspace-header {
+    padding-left: 78px;
+  }
+  .omnibar-shortcut {
+    display: none;
+  }
+  .workspace-header {
+    gap: 6px;
+    padding-right: 10px;
+  }
+  .omnibar {
+    min-width: 0;
+    flex: 1;
+  }
+  .inspector-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 940;
+  }
+  .chat-drawer-slot {
+    z-index: 960;
+  }
+  .qr-panel {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 560px) {
+  .header-btn-label {
+    display: none;
+  }
+}

@@ -533,7 +533,7 @@ export const Lightbox: React.FC = () => {
         </div>
       </header>
 
-      <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+      <div className="lightbox-body">
         <div
           ref={stageRef}
           className="lightbox-stage"
@@ -627,9 +627,8 @@ export const Lightbox: React.FC = () => {
 
         {infoOpen && (
           <aside
-            className="inspector-drawer"
+            className="inspector-drawer lightbox-info-drawer"
             aria-label="Lightbox asset inspector"
-            style={{ width: 320, flexShrink: 0 }}
           >
             <div className="inspector-heading">
               <span>Details</span>

@@ -4,9 +4,11 @@ import {
   Map as MapLibreMap,
   Marker,
   addProtocol,
+  setWorkerUrl,
   type GeoJSONSourceSpecification,
   type StyleSpecification,
 } from 'maplibre-gl';
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Protocol } from 'pmtiles';
 import { Globe, MapPin, Maximize2, X } from 'lucide-react';
@@ -41,6 +43,9 @@ export function hasWebGLSupport(): boolean {
 
 function ensurePmtilesProtocol(): void {
   if (pmtilesProtocolRegistered) return;
+  if (typeof maplibreWorkerUrl === 'string' && maplibreWorkerUrl.length > 0) {
+    setWorkerUrl(maplibreWorkerUrl);
+  }
   const protocol = new Protocol();
   addProtocol('pmtiles', protocol.tile);
   pmtilesProtocolRegistered = true;

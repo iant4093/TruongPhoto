@@ -153,6 +153,12 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
     getItemKey: (index) => rows[index]?.key ?? index,
   });
 
+  // Re-measure virtual rows whenever row layout, container width, or row height changes
+  // so @tanstack/react-virtual never uses stale cached offsets that cause vertical row overlap.
+  useEffect(() => {
+    rowVirtualizer.measure();
+  }, [rowVirtualizer, rows, containerWidth, targetRowHeight]);
+
   const virtualItems = rowVirtualizer.getVirtualItems();
 
   // Trigger cursor pagination when approaching the bottom 25% of loaded rows.
@@ -391,6 +397,9 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                   top: 0,
                   left: 0,
                   width: '100%',
+                  height: `${virtualRow.size}px`,
+                  boxSizing: 'border-box',
+                  overflow: 'hidden',
                   transform: `translateY(${virtualRow.start}px)`,
                 }}
               >

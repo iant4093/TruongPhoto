@@ -31,6 +31,8 @@ export const TimelineView: React.FC = () => {
   const setUploadModalOpen = useAppStore((s) => s.setUploadModalOpen);
   const searchQuery = useAppStore((s) => s.searchQuery);
   const libraryRevision = useAppStore((s) => s.libraryRevision);
+  const inspectorOpen = useAppStore((s) => s.inspectorOpen);
+  const chatDrawerOpen = useAppStore((s) => s.chatDrawerOpen);
 
   const canUpload = user?.role === 'admin' || user?.role === 'contributor';
 
@@ -126,8 +128,8 @@ export const TimelineView: React.FC = () => {
   return (
     <div>
       <ViewHeader
-        title="Timeline"
-        subtitle={`${plural(totalCount, 'asset')} across ${plural(folders.length, 'watched folder')}`}
+        title="Photos"
+        subtitle={`${plural(totalCount, 'photo')} in ${plural(folders.length, 'folder')}`}
         actions={
           jumpTarget ? (
             <button
@@ -172,11 +174,13 @@ export const TimelineView: React.FC = () => {
             onAssetUpdated={handleAssetUpdated}
             onAssetsTrashed={handleAssetsTrashed}
           />
-          <TimelineScrubber
-            buckets={buckets}
-            activeYear={jumpTarget?.year ?? null}
-            onJumpToMonth={handleJumpToMonth}
-          />
+          {buckets.length > 1 && !inspectorOpen && !chatDrawerOpen && (
+            <TimelineScrubber
+              buckets={buckets}
+              activeYear={jumpTarget?.year ?? null}
+              onJumpToMonth={handleJumpToMonth}
+            />
+          )}
         </>
       ) : query ? (
         <EmptyState

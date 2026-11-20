@@ -270,9 +270,19 @@ async fn run_model_download(
                 error_message: None,
                 updated_at_ms: now_ms,
             };
+            let should_reset_stage2 = matches!(
+                spec.role,
+                "face_detector" | "face_embedder" | "ocr_det" | "ocr_rec"
+            );
             let _ = state
                 .db
-                .write(move |conn| repo::ai::upsert_ai_model_row(conn, &row))
+                .write(move |conn| {
+                    repo::ai::upsert_ai_model_row(conn, &row)?;
+                    if should_reset_stage2 {
+                        let _ = repo::ai::reset_all_assets_ai_stage_to_1(conn, now_ms)?;
+                    }
+                    Ok(())
+                })
                 .await;
             let _ = state.ws_tx.send(WsServerEvent::JobProgress {
                 job_id: 0,

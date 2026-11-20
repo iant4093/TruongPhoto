@@ -185,14 +185,33 @@ pub(crate) async fn execute_hybrid_search(
         .await?;
 
     if candidates.vector_ids.is_empty() {
-        let (items, total_count) = if want_ocr && !ocr_hits.is_empty() {
-            materialize_ocr_hits(state, rbac.scope.clone(), ocr_hits, offset, limit).await?
-        } else {
-            (Vec::new(), 0)
-        };
+        if want_ocr && !ocr_hits.is_empty() {
+            let (items, total_count) =
+                materialize_ocr_hits(state, rbac.scope.clone(), ocr_hits, offset, limit).await?;
+            return Ok(SearchResponse {
+                items,
+                total_count,
+                planner_mode: PlannerMode::SqlOnly,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+        if want_ocr {
+            let scope = rbac.scope.clone();
+            let req_sql = req.clone();
+            let (assets, total_count) = state
+                .db
+                .read(move |conn| repo::search::list_sql_filtered_assets(conn, &scope, &req_sql))
+                .await?;
+            return Ok(SearchResponse {
+                items: sql_assets_to_hits(assets, true),
+                total_count,
+                planner_mode: PlannerMode::SqlOnly,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
         return Ok(SearchResponse {
-            items,
-            total_count,
+            items: Vec::new(),
+            total_count: 0,
             planner_mode: PlannerMode::SqlOnly,
             elapsed_ms: started.elapsed().as_millis() as u64,
         });

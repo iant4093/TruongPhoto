@@ -317,6 +317,31 @@ describe('SetupWizardView', () => {
       if (url === '/api/folders') return jsonResponse({ items: sampleFolders });
       if (url === '/api/admin/users') return jsonResponse({ items: sampleAdminUsers });
       if (url === '/api/admin/settings') return jsonResponse(sampleSettings);
+      if (url.startsWith('/api/folders/') && url.endsWith('/scan')) {
+        return jsonResponse({ job_id: 1, folder_id: 'f-1' }, 202);
+      }
+      if (url === '/api/admin/ai/tier') {
+        return new Response(null, { status: 202 });
+      }
+      if (url.startsWith('/api/admin/ai/models/') && url.endsWith('/download')) {
+        return new Response(null, { status: 202 });
+      }
+      if (url === '/api/admin/ai/models') {
+        return jsonResponse({
+          ort_available: true,
+          ort_ep: 'CoreML ANE',
+          hardware: sampleSetupStatus.hardware,
+          state: {
+            active_vision_tier: 'tier2',
+            staging_vision_tier: null,
+            paused: false,
+            idle_unload_secs: 300,
+            updated_at_ms: 1700000000000,
+          },
+          models: [],
+          queue: { pending_assets: 0, indexed_assets: 0, staging_remaining: 0 },
+        });
+      }
       throw new Error(`Unexpected fetch: ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);

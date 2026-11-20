@@ -290,6 +290,11 @@ pub fn list_sql_filtered_assets(
                   OR LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'
                   OR LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'
                   OR EXISTS (
+                      SELECT 1 FROM asset_files afq
+                      WHERE afq.asset_id = v.id
+                        AND LOWER(afq.rel_path) LIKE ?{idx} ESCAPE '\\'
+                  )
+                  OR EXISTS (
                       SELECT 1 FROM media_tags mtq
                       WHERE mtq.asset_id = v.id
                         AND mtq.state = 'active'

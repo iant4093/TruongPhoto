@@ -830,6 +830,7 @@ pub fn spawn_ai_background_tasks(state: Arc<AppState>) -> Vec<JoinHandle<()>> {
                 break;
             }
 
+            let mut did_work = false;
             loop {
                 if worker_state.shutdown_token.is_cancelled() {
                     break;
@@ -849,6 +850,7 @@ pub fn spawn_ai_background_tasks(state: Arc<AppState>) -> Vec<JoinHandle<()>> {
                 match process_stage2_batch(&worker_state, batch_size).await {
                     Ok(0) => break,
                     Ok(_) => {
+                        did_work = true;
                         if throttle.active && throttle.reason.as_deref() == Some("high_cpu") {
                             tokio::select! {
                                 _ = worker_state.shutdown_token.cancelled() => break,
@@ -865,6 +867,9 @@ pub fn spawn_ai_background_tasks(state: Arc<AppState>) -> Vec<JoinHandle<()>> {
                         break;
                     }
                 }
+            }
+            if did_work && !worker_state.shutdown_token.is_cancelled() {
+                let _ = run_face_clustering(&worker_state).await;
             }
         }
     });

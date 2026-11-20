@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import {
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   DatabaseBackup,
   Download,
@@ -92,6 +94,7 @@ export const SettingsView: React.FC = () => {
   const refreshAiDashboard = useAppStore((s) => s.refreshAiDashboard);
 
   const isAdmin = user?.role === 'admin';
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [scanningFolderIds, setScanningFolderIds] = useState<Record<string, boolean>>({});
   const [jobFolderMap, setJobFolderMap] = useState<Record<number, string>>({});
 
@@ -1331,7 +1334,22 @@ export const SettingsView: React.FC = () => {
             </div>
           </div>
 
-          <SectionTitle>Storage &amp; Backups</SectionTitle>
+          <div className="advanced-accordion" style={{ marginTop: 18 }}>
+            <button
+              type="button"
+              className="advanced-accordion-trigger"
+              aria-expanded={showAdvancedSettings}
+              onClick={() => setShowAdvancedSettings((v) => !v)}
+            >
+              <span>
+                {showAdvancedSettings
+                  ? 'Hide Advanced Storage, Backups & Performance Settings'
+                  : 'Show Advanced Storage, Backups & Performance Settings'}
+              </span>
+              {showAdvancedSettings ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            </button>
+            <div className={`advanced-accordion-body ${showAdvancedSettings ? 'is-open' : ''}`}>
+              <SectionTitle>Storage &amp; Backups</SectionTitle>
           <form className="card card-body stack" onSubmit={(e) => void handleSaveStorage(e)}>
             <label className="settings-field">
               <span>Managed Uploads Path</span>
@@ -1562,6 +1580,8 @@ export const SettingsView: React.FC = () => {
                     : 'Download Offline World Basemap (world-basemap-pmtiles)'}
                 </span>
               </button>
+            </div>
+          </div>
             </div>
           </div>
         </>

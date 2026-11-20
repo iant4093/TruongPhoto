@@ -8,12 +8,10 @@ import {
   Trash2,
   Users,
 } from 'lucide-react';
-import { formatBytes } from '../lib/format';
 import { isTauri } from '../lib/tauri';
 import { useAppStore } from '../store/useAppStore';
 import type { NavTab, ThrottleStatus } from '../types/api';
 import { StatusBanner } from './Feedback';
-import { Badge } from './ui';
 import { WindowControls, isWindowsPlatform } from './WindowControls';
 
 export const PRIMARY_NAV_ITEMS: ReadonlyArray<
@@ -54,15 +52,12 @@ export const Sidebar: React.FC = () => {
   const activeNav = useAppStore((s) => s.activeNav);
   const setActiveNav = useAppStore((s) => s.setActiveNav);
   const systemInfo = useAppStore((s) => s.systemInfo);
-  const liveMetrics = useAppStore((s) => s.liveMetrics);
   const wsConnected = useAppStore((s) => s.wsConnected);
-  const powerState = useAppStore((s) => s.powerState);
   const throttleStatus = useAppStore((s) => s.throttleStatus);
+  const activeJobs = useAppStore((s) => s.activeJobs);
 
   const assetCount = systemInfo?.stats.asset_count ?? 0;
-  const dbBytes = liveMetrics?.db_size_bytes ?? systemInfo?.stats.db_size_bytes ?? 0;
-  const ramBytes = liveMetrics?.process_ram_bytes ?? null;
-  const onBattery = throttleStatus?.on_battery ?? powerState?.on_battery ?? false;
+  const activeJobCount = Object.keys(activeJobs).length;
 
   const renderNavButton = (
     [key, label, Icon]: readonly [
@@ -101,16 +96,8 @@ export const Sidebar: React.FC = () => {
         <StatusBanner />
         <div className="sidebar-resources">
           <div className="resource-row">
-            <span>Assets</span>
+            <span>Photos</span>
             <span>{assetCount.toLocaleString()}</span>
-          </div>
-          <div className="resource-row">
-            <span>RAM</span>
-            <span aria-live="off">{ramBytes === null ? '—' : formatBytes(ramBytes)}</span>
-          </div>
-          <div className="resource-row">
-            <span>Database</span>
-            <span>{formatBytes(dbBytes)}</span>
           </div>
           <div className="resource-row">
             <span>Status</span>
@@ -119,17 +106,7 @@ export const Sidebar: React.FC = () => {
                 className={`ws-dot ${wsConnected ? 'is-connected' : ''}`}
                 aria-hidden="true"
               />
-              <span>{wsConnected ? 'Live' : 'Offline'}</span>
-            </span>
-          </div>
-          <div className="resource-row">
-            <span>Power</span>
-            <span>
-              {onBattery ? (
-                <Badge tone="warn">Battery</Badge>
-              ) : (
-                <Badge tone="ok">AC</Badge>
-              )}
+              <span>{activeJobCount > 0 ? 'Indexing…' : wsConnected ? 'Ready' : 'Offline'}</span>
             </span>
           </div>
           {throttleStatus?.active && (
