@@ -36,6 +36,14 @@ if (!env.TAURI_SIGNING_PRIVATE_KEY) {
   env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= '';
 }
 
+// 1b. Fetch bundled llama-server runtime before Tauri packages installers
+const fetchLlama = spawnSync(process.execPath, [join(root, 'scripts', 'fetch-llama-runtime.mjs')], {
+  cwd: root,
+  env,
+  stdio: 'inherit',
+});
+if (fetchLlama.status !== 0) process.exit(fetchLlama.status ?? 1);
+
 // Run the local Tauri CLI through Node: `npx` is `npx.cmd` on Windows, which spawnSync cannot
 // start without a shell.
 const tauriCli = join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js');

@@ -27,7 +27,7 @@ struct CachedSession {
 
 struct GlobalOrtState {
     env: Environment,
-    dylib_path: PathBuf,
+    dylib_path: Option<PathBuf>,
     ep_name: &'static str,
 }
 
@@ -98,12 +98,7 @@ pub fn discover_ort_dylib() -> Option<PathBuf> {
 }
 
 fn init_global_ort() -> Result<GlobalOrtState, String> {
-    let Some(dylib_path) = discover_ort_dylib() else {
-        return Err("ONNX Runtime dynamic library not found".to_string());
-    };
-
-    let env = ort::init_from(&dylib_path)
-        .map_err(|e| format!("ort::init_from({}): {e}", dylib_path.display()))?
+    let env = ort::init()
         .with_name("truongphoto")
         .build()
         .map_err(|e| format!("ort environment build: {e}"))?;
@@ -117,14 +112,13 @@ fn init_global_ort() -> Result<GlobalOrtState, String> {
     };
 
     tracing::info!(
-        path = %dylib_path.display(),
         ep = ep_name,
-        "initialized ONNX Runtime dynamic library"
+        "initialized embedded ONNX Runtime (statically linked)"
     );
 
     Ok(GlobalOrtState {
         env,
-        dylib_path,
+        dylib_path: None,
         ep_name,
     })
 }
@@ -169,10 +163,10 @@ impl OrtRuntimeManager {
         }
     }
 
-    /// Returns the discovered ONNX Runtime dynamic library path, if loaded.
+    /// Returns the discovered ONNX Runtime dynamic library path, if dynamically loaded.
     pub fn dylib_path(&self) -> Option<&Path> {
         match GLOBAL_ORT.get() {
-            Some(Ok(state)) => Some(state.dylib_path.as_path()),
+            Some(Ok(state)) => state.dylib_path.as_deref(),
             _ => None,
         }
     }
@@ -199,6 +193,18 @@ impl OrtRuntimeManager {
             }
         }
         evicted
+    }
+
+    /// Immediately drops a specific cached ONNX Runtime session to free RAM.
+    pub fn evict_session(&self, key: SessionKey) -> bool {
+        let slot = self.sessions.lock().get(&key).cloned();
+        if let Some(slot) = slot {
+            let mut guard = slot.lock();
+            if guard.take().is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Immediately drops all cached ONNX Runtime sessions.
@@ -250,33 +256,55 @@ impl OrtRuntimeManager {
 
     fn build_session(&self, env: &Environment, model_path: &Path) -> Result<Session, AiError> {
         let _ = std::fs::create_dir_all(&self.coreml_cache_dir);
-        let mut builder = Session::builder(env)
+
+        // 1. Try hardware-accelerated execution provider first (CoreML on macOS, DirectML on Windows).
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let mut hw_builder = Session::builder(env)
+                .map_err(|e| AiError::Ort(e.to_string()))?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| AiError::Ort(e.to_string()))?;
+
+            #[cfg(target_os = "macos")]
+            {
+                let cache_dir = self.coreml_cache_dir.to_string_lossy().into_owned();
+                let ep = ort::ep::CoreML::default()
+                    .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
+                    .with_static_input_shapes(true)
+                    .with_model_cache_dir(&cache_dir)
+                    .build();
+                hw_builder = hw_builder
+                    .with_execution_providers([ep])
+                    .unwrap_or_else(|e| e.recover());
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let ep = ort::ep::DirectML::default().build();
+                hw_builder = hw_builder
+                    .with_execution_providers([ep])
+                    .unwrap_or_else(|e| e.recover());
+            }
+
+            match hw_builder.commit_from_file(model_path) {
+                Ok(sess) => return Ok(sess),
+                Err(hw_err) => {
+                    tracing::warn!(
+                        model = %model_path.display(),
+                        error = %hw_err,
+                        "hardware EP session build failed; falling back to CPU EP"
+                    );
+                }
+            }
+        }
+
+        // 2. Universal CPU execution provider fallback (100% operator coverage).
+        let mut cpu_builder = Session::builder(env)
             .map_err(|e| AiError::Ort(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| AiError::Ort(e.to_string()))?;
 
-        #[cfg(target_os = "macos")]
-        {
-            let cache_dir = self.coreml_cache_dir.to_string_lossy().into_owned();
-            let ep = ort::ep::CoreML::default()
-                .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
-                .with_static_input_shapes(true)
-                .with_model_cache_dir(&cache_dir)
-                .build();
-            builder = builder
-                .with_execution_providers([ep])
-                .unwrap_or_else(|e| e.recover());
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            let ep = ort::ep::DirectML::default().build();
-            builder = builder
-                .with_execution_providers([ep])
-                .unwrap_or_else(|e| e.recover());
-        }
-
-        builder
+        cpu_builder
             .commit_from_file(model_path)
             .map_err(|e| AiError::Ort(format!("load {}: {e}", model_path.display())))
     }

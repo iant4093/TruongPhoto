@@ -6,9 +6,9 @@ pub const MAX_AUTO_TAGS: usize = 8;
 /// Returns the calibrated SigLIP2 cosine similarity threshold for zero-shot tagging.
 pub const fn tier_tag_threshold(tier: AiTier) -> f32 {
     match tier {
-        AiTier::Tier1 => 0.13,
-        AiTier::Tier2 => 0.14,
-        AiTier::Tier3 => 0.15,
+        AiTier::Tier1 => 0.10,
+        AiTier::Tier2 => 0.11,
+        AiTier::Tier3 => 0.11,
     }
 }
 

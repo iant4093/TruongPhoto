@@ -421,7 +421,26 @@ pub async fn send_message(
         .clamp(1, MAX_CHAT_LIMIT) as u32;
     let search_req = build_search_request_from_plan(&plan, person_ids, search_limit);
 
-    let mut search_resp = execute_hybrid_search(&state, &rbac, search_req).await?;
+    let has_any_search_criteria = search_req.query.is_some()
+        || search_req.person_ids.is_some()
+        || search_req.tags.is_some()
+        || search_req.camera_model.is_some()
+        || search_req.geo_query.is_some()
+        || search_req.kind.is_some()
+        || search_req.favorite.is_some()
+        || search_req.date_from_ms.is_some()
+        || search_req.date_to_ms.is_some();
+
+    let mut search_resp = if has_any_search_criteria {
+        execute_hybrid_search(&state, &rbac, search_req).await?
+    } else {
+        truongphoto_core::SearchResponse {
+            items: Vec::new(),
+            total_count: 0,
+            planner_mode: truongphoto_core::PlannerMode::SqlOnly,
+            elapsed_ms: 0,
+        }
+    };
     let mut reranked = false;
 
     if active_chat_tier == ChatTier::Tier3

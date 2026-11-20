@@ -46,6 +46,9 @@
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/llama/*": "llama/"
+    },
     "macOS": {
       "signingIdentity": "-",
       "entitlements": "Entitlements.plist"

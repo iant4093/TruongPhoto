@@ -101,6 +101,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           BUNDLES: ${{ matrix.bundles }}
         run: |
+          node scripts/fetch-llama-runtime.mjs
           # Signed updater archives need the private key (absent on fork PRs).
           if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then updater=true; else updater=false; fi
           npx tauri build --bundles "$BUNDLES" \

@@ -28,6 +28,7 @@ getrandom.workspace = true
 hex.workspace = true
 http-body-util.workspace = true
 http-range-header.workspace = true
+image.workspace = true
 local-ip-address.workspace = true
 mdns-sd.workspace = true
 mime_guess.workspace = true

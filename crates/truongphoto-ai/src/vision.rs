@@ -80,6 +80,77 @@ impl OrtSiglip2Backend {
         Ok(arc)
     }
 
+    fn embed_texts_batch(
+        &self,
+        tier: AiTier,
+        queries: &[String],
+    ) -> Result<Vec<Vec<f32>>, AiError> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tokenizer = self.get_or_load_tokenizer(tier)?;
+        let model_path = model_dir(&self.models_dir, tier.vision_model_id())
+            .join("onnx")
+            .join("text_model_fp16.onnx");
+        let dim = tier.dim();
+        const BATCH_SIZE: usize = 8;
+        let mut results = Vec::with_capacity(queries.len());
+
+        for chunk in queries.chunks(BATCH_SIZE) {
+            let b = chunk.len();
+            let mut input_ids = vec![0i64; b * SIGLIP2_MAX_SEQ_LEN];
+            for (row_idx, q) in chunk.iter().enumerate() {
+                let normalized_query = q.trim().to_lowercase();
+                let encoding = tokenizer
+                    .encode(normalized_query, true)
+                    .map_err(|e| AiError::Tokenizer(e.to_string()))?;
+                let row_offset = row_idx * SIGLIP2_MAX_SEQ_LEN;
+                for (i, &tok) in encoding
+                    .get_ids()
+                    .iter()
+                    .take(SIGLIP2_MAX_SEQ_LEN)
+                    .enumerate()
+                {
+                    input_ids[row_offset + i] = tok as i64;
+                }
+            }
+
+            let shape = [b, SIGLIP2_MAX_SEQ_LEN];
+            let batch_vecs =
+                self.ort
+                    .with_session(SessionKey::VisionText(tier), &model_path, |session| {
+                        let tensor = TensorRef::from_array_view((&shape[..], input_ids.as_slice()))
+                            .map_err(|e| AiError::Ort(e.to_string()))?;
+                        let outputs = session
+                            .run(ort::inputs!["input_ids" => tensor])
+                            .map_err(|e| AiError::Ort(e.to_string()))?;
+                        let value = outputs
+                            .get("pooler_output")
+                            .or_else(|| outputs.get("text_embeds"))
+                            .unwrap_or(&outputs[0]);
+                        let (_out_shape, data) = value
+                            .try_extract_tensor::<f32>()
+                            .map_err(|e| AiError::Ort(e.to_string()))?;
+                        if data.len() < b * dim {
+                            return Err(AiError::Ort(format!(
+                                "batched text output too short: expected >= {}, got {}",
+                                b * dim,
+                                data.len()
+                            )));
+                        }
+                        let mut out = Vec::with_capacity(b);
+                        for row_idx in 0..b {
+                            let start = row_idx * dim;
+                            out.push(l2_normalize(&data[start..start + dim]));
+                        }
+                        Ok(out)
+                    })?;
+            results.extend(batch_vecs);
+        }
+
+        Ok(results)
+    }
+
     fn get_or_build_tag_embeddings(
         &self,
         tier: AiTier,
@@ -87,17 +158,45 @@ impl OrtSiglip2Backend {
         if let Some(cached) = self.tag_bank_cache.read().get(&tier) {
             return Ok(cached.clone());
         }
-        let mut entries = Vec::with_capacity(PHOTOGRAPHY_TAGS.len());
-        for &tag in PHOTOGRAPHY_TAGS {
-            let p1 = self.embed_text(tier, &format!("a photo of a {tag}"))?;
-            let p2 = self.embed_text(tier, &format!("a picture of {tag}"))?;
-            let avg: Vec<f32> = p1
-                .iter()
-                .zip(p2.iter())
-                .map(|(&a, &b)| 0.5 * (a + b))
-                .collect();
-            entries.push((tag.to_string(), l2_normalize(&avg)));
+
+        let dim = tier.dim();
+        let expected_bytes = PHOTOGRAPHY_TAGS.len() * dim * std::mem::size_of::<f32>();
+        let cache_path =
+            model_dir(&self.models_dir, tier.vision_model_id()).join("tag_bank_v1.bin");
+
+        if let Ok(raw) = std::fs::read(&cache_path) {
+            if raw.len() == expected_bytes {
+                let mut entries = Vec::with_capacity(PHOTOGRAPHY_TAGS.len());
+                let floats: &[f32] = bytemuck::cast_slice(&raw);
+                for (idx, &tag) in PHOTOGRAPHY_TAGS.iter().enumerate() {
+                    let start = idx * dim;
+                    entries.push((tag.to_string(), floats[start..start + dim].to_vec()));
+                }
+                self.tag_bank_cache.write().insert(tier, entries.clone());
+                return Ok(entries);
+            }
         }
+
+        let prompts: Vec<String> = PHOTOGRAPHY_TAGS
+            .iter()
+            .map(|&tag| format!("a photo of {tag}."))
+            .collect();
+        let vecs = self.embed_texts_batch(tier, &prompts)?;
+        // Immediately release the large text encoder session so Stage 2 image indexing stays lean on RAM.
+        self.ort.evict_session(SessionKey::VisionText(tier));
+
+        let mut entries = Vec::with_capacity(PHOTOGRAPHY_TAGS.len());
+        let mut flat = Vec::with_capacity(PHOTOGRAPHY_TAGS.len() * dim);
+        for (&tag, vec) in PHOTOGRAPHY_TAGS.iter().zip(vecs.into_iter()) {
+            flat.extend_from_slice(&vec);
+            entries.push((tag.to_string(), vec));
+        }
+
+        let tmp_path = cache_path.with_extension("bin.tmp");
+        if std::fs::write(&tmp_path, bytemuck::cast_slice(&flat)).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &cache_path);
+        }
+
         self.tag_bank_cache.write().insert(tier, entries.clone());
         Ok(entries)
     }

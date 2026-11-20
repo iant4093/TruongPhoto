@@ -175,7 +175,14 @@ fn decode_frames_for_asset(
         }]);
     }
 
-    let img = decode_image_to_srgb(src_path).map_err(|e| e.to_string())?;
+    let mut img = decode_image_to_srgb(src_path).map_err(|e| e.to_string())?;
+    let max_side = img.width().max(img.height());
+    if max_side > 1600 {
+        let scale = 1600.0f32 / (max_side as f32);
+        let new_w = ((img.width() as f32 * scale).round() as u32).max(1);
+        let new_h = ((img.height() as f32 * scale).round() as u32).max(1);
+        img = image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle);
+    }
     Ok(vec![SampledKeyframe {
         timestamp_ms: 0,
         image: img,
@@ -830,7 +837,7 @@ pub fn spawn_ai_background_tasks(state: Arc<AppState>) -> Vec<JoinHandle<()>> {
                 break;
             }
 
-            let mut did_work = false;
+            let mut processed_since_cluster = 0usize;
             loop {
                 if worker_state.shutdown_token.is_cancelled() {
                     break;
@@ -849,8 +856,12 @@ pub fn spawn_ai_background_tasks(state: Arc<AppState>) -> Vec<JoinHandle<()>> {
                 };
                 match process_stage2_batch(&worker_state, batch_size).await {
                     Ok(0) => break,
-                    Ok(_) => {
-                        did_work = true;
+                    Ok(n) => {
+                        processed_since_cluster += n;
+                        if processed_since_cluster >= 48 {
+                            let _ = run_face_clustering(&worker_state).await;
+                            processed_since_cluster = 0;
+                        }
                         if throttle.active && throttle.reason.as_deref() == Some("high_cpu") {
                             tokio::select! {
                                 _ = worker_state.shutdown_token.cancelled() => break,
@@ -868,7 +879,7 @@ pub fn spawn_ai_background_tasks(state: Arc<AppState>) -> Vec<JoinHandle<()>> {
                     }
                 }
             }
-            if did_work && !worker_state.shutdown_token.is_cancelled() {
+            if processed_since_cluster > 0 && !worker_state.shutdown_token.is_cancelled() {
                 let _ = run_face_clustering(&worker_state).await;
             }
         }

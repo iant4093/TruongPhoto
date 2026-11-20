@@ -81,7 +81,7 @@ impl SidecarLlamaRouter {
         if tier == ChatTier::Tier0 {
             return Ok(None);
         }
-        let Some(bin_path) = discover_llama_server_bin() else {
+        let Some(bin_path) = discover_llama_server_bin_with_models_dir(&self.models_dir) else {
             return Ok(None);
         };
         let Some((gguf_path, mmproj_path)) = self.resolve_model_paths(tier) else {
@@ -113,9 +113,16 @@ impl SidecarLlamaRouter {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
+            .arg("--reasoning-budget")
+            .arg("0")
+            .arg("-c")
+            .arg("4096")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(bin_dir) = bin_path.parent() {
+            cmd.current_dir(bin_dir);
+        }
         if let Some(mmproj) = &mmproj_path {
             cmd.arg("--mmproj").arg(mmproj);
         }
@@ -148,8 +155,13 @@ impl SidecarLlamaRouter {
 
 impl ChatRouterBackend for SidecarLlamaRouter {
     fn route_turn(&self, tier: ChatTier, input: &ChatTurnInput) -> Result<RouterPlan, AiError> {
-        let Some(port) = self.ensure_server_port(tier)? else {
-            return self.classic.route_turn(tier, input);
+        let port = match self.ensure_server_port(tier) {
+            Ok(Some(port)) => port,
+            Ok(None) => return self.classic.route_turn(tier, input),
+            Err(err) => {
+                tracing::warn!(tier = %tier, error = %err, "llama-server startup failed; falling back to ClassicChatRouter");
+                return self.classic.route_turn(tier, input);
+            }
         };
 
         let schema_val: Value = serde_json::from_str(ROUTER_PLAN_JSON_SCHEMA)
@@ -190,11 +202,22 @@ impl ChatRouterBackend for SidecarLlamaRouter {
             }
         });
 
-        let content = post_chat_completion(port, &payload)?;
+        let content = match post_chat_completion(port, &payload) {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::warn!(tier = %tier, error = %err, "llama-server completion failed; falling back to ClassicChatRouter");
+                return self.classic.route_turn(tier, input);
+            }
+        };
         self.touch_last_used();
 
-        let parsed = parse_and_validate_router_plan(&content)?;
-        Ok(merge_router_plan(&input.prior_filters, &parsed))
+        match parse_and_validate_router_plan(&content) {
+            Ok(parsed) => Ok(merge_router_plan(&input.prior_filters, &parsed)),
+            Err(err) => {
+                tracing::warn!(tier = %tier, error = %err, "llama-server returned invalid RouterPlan JSON; falling back to ClassicChatRouter");
+                self.classic.route_turn(tier, input)
+            }
+        }
     }
 
     fn rerank_thumbnails(
@@ -347,8 +370,17 @@ struct SidecarRerankPayload {
     observation: Option<String>,
 }
 
-/// Discovers a `llama-server` executable via `TP_LLAMA_SERVER_BIN` or adjacent app resource paths.
+/// Discovers a `llama-server` executable via `TP_LLAMA_SERVER_BIN`, bundled app resource paths,
+/// `<data_dir>/runtime/llama`, or standard Homebrew paths.
 pub fn discover_llama_server_bin() -> Option<PathBuf> {
+    discover_llama_server_bin_opt(None)
+}
+
+fn discover_llama_server_bin_with_models_dir(models_dir: &Path) -> Option<PathBuf> {
+    discover_llama_server_bin_opt(Some(models_dir))
+}
+
+fn discover_llama_server_bin_opt(models_dir: Option<&Path>) -> Option<PathBuf> {
     if let Ok(val) = std::env::var("TP_LLAMA_SERVER_BIN") {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
@@ -367,17 +399,47 @@ pub fn discover_llama_server_bin() -> Option<PathBuf> {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join(bin_name);
-            if sibling.is_file() {
-                return Some(sibling);
+            for cand in [dir.join(bin_name), dir.join("llama").join(bin_name)] {
+                if cand.is_file() {
+                    return Some(cand);
+                }
             }
             if cfg!(target_os = "macos") {
                 if let Some(contents) = dir.parent() {
-                    let res = contents.join("Resources").join(bin_name);
-                    if res.is_file() {
-                        return Some(res);
+                    for cand in [
+                        contents.join("Resources").join("llama").join(bin_name),
+                        contents.join("Resources").join(bin_name),
+                    ] {
+                        if cand.is_file() {
+                            return Some(cand);
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    if let Some(mdir) = models_dir {
+        if let Some(data_dir) = mdir.parent() {
+            for cand in [
+                data_dir.join("runtime").join("llama").join(bin_name),
+                data_dir.join("runtime").join(bin_name),
+            ] {
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        for cand in [
+            "/opt/homebrew/bin/llama-server",
+            "/usr/local/bin/llama-server",
+        ] {
+            let p = Path::new(cand);
+            if p.is_file() {
+                return Some(p.to_path_buf());
             }
         }
     }
@@ -394,14 +456,18 @@ fn pick_ephemeral_port() -> Result<u16, AiError> {
 fn build_router_system_prompt(input: &ChatTurnInput) -> String {
     let prior_json = serde_json::to_string(&input.prior_filters).unwrap_or_else(|_| "{}".into());
     format!(
-        "You are TruongPhoto's private offline query router. Convert the user's natural-language request into a strict RouterPlan JSON object.\n\
+        "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a strict RouterPlan JSON object.\n\
          Rules:\n\
          - Current UTC date: {}\n\
          - Known RBAC-visible person names: {:?}\n\
          - Prior active filters JSON: {}\n\
+         - Put visual concepts, subjects, scenes, or moods in \"semantic_query\" (e.g. \"cars at night\", \"portrait outdoors\", \"sunset beach\").\n\
+         - Leave \"tags\": [] UNLESS the user explicitly asks for a tag (e.g. \"tagged X\" or \"#X\"). Never invent speculative tags.\n\
+         - Leave \"kind\": null unless the user explicitly asks for only photos, only videos, raw files, or live photos.\n\
+         - If the user greets you (e.g. \"hi\", \"hello\", \"hey\", \"help\") or asks a general question without requesting photos, set clear_prior_filters=true, set all filter fields to null / [], and write a warm, concise assistant_reply suggesting example photo searches.\n\
          - Set clear_prior_filters=true ONLY when the user resets/starts over or asks for an unrelated topic instead.\n\
          - Never invent file paths or extra JSON keys.\n\
-         - Populate concise, grounded assistant_reply and 2-3 follow_up_suggestions.",
+         - Populate concise, helpful assistant_reply and 2-3 short follow_up_suggestions.",
         input.current_date_utc.to_rfc3339(),
         input.known_person_names,
         prior_json,

@@ -11,6 +11,8 @@ release-assets/
 /smoke
 # Generated sidecar binaries and downloads
 src-tauri/bin
+src-tauri/resources/llama/*
+!src-tauri/resources/llama/.gitkeep
 src-tauri/tauri.macos.conf.json
 # Local agent task files and test media
 .agents
