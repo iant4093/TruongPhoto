@@ -1,0 +1,26 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tray",
+  "description": "Minimal capabilities of the TruongPhoto menu bar / tray popover window",
+  "windows": [
+    "tray-popover"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:*/**",
+      "http://localhost:1420/**"
+    ]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-unminimize",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "shell:allow-open",
+    "allow-get-desktop-bootstrap",
+    "allow-get-power-state",
+    "allow-show-main-window",
+    "allow-quit-app"
+  ]
+}

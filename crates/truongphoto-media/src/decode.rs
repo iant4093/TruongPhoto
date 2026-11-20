@@ -1,0 +1,308 @@
+use crate::classify::{self, MediaCategory};
+use crate::color::{bake_icc_to_srgb, composite_to_rgb, compute_histogram};
+use crate::metadata;
+use crate::raw;
+use crate::video;
+use crate::MediaError;
+use image::imageops::FilterType;
+use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage};
+use jxl_oxide::JxlImage;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+use truongphoto_core::Histogram256;
+
+/// Thumbnail generation result containing oriented pixel dimensions, WebP size, and RGB/Luma histogram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedThumb {
+    pub width: u32,
+    pub height: u32,
+    pub thumb_bytes_len: u64,
+    pub histogram: Histogram256,
+}
+
+fn decode_standard_image_reader(
+    reader: ImageReader<BufReader<File>>,
+) -> Result<RgbImage, MediaError> {
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| MediaError::Decode(format!("image decoder init failed: {e}")))?;
+
+    let orientation = decoder.orientation().ok();
+    let icc_profile = decoder.icc_profile().ok().flatten();
+
+    let mut dyn_img = DynamicImage::from_decoder(decoder)
+        .map_err(|e| MediaError::Decode(format!("image decode failed: {e}")))?;
+
+    if let Some(orient) = orientation {
+        dyn_img.apply_orientation(orient);
+    }
+
+    let mut rgb = composite_to_rgb(dyn_img);
+    if let Some(icc) = icc_profile.as_deref() {
+        if !icc.is_empty() {
+            if let Err(err) = bake_icc_to_srgb(rgb.as_mut(), icc) {
+                tracing::debug!(error = %err, "skipping non-RGB or unsupported ICC profile bake");
+            }
+        }
+    }
+    Ok(rgb)
+}
+
+fn decode_jxl_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
+    let image = JxlImage::builder()
+        .open(path)
+        .map_err(|e| MediaError::Decode(format!("JXL open failed: {e}")))?;
+    let icc = image.original_icc().map(|b| b.to_vec());
+    let render = image
+        .render_frame(0)
+        .map_err(|e| MediaError::Decode(format!("JXL render failed: {e}")))?;
+
+    let mut stream = render.stream_no_alpha();
+    let width = stream.width();
+    let height = stream.height();
+    let channels = stream.channels() as usize;
+
+    let mut raw_samples = vec![0u8; (width as usize) * (height as usize) * channels];
+    stream.write_to_buffer(&mut raw_samples);
+
+    let mut rgb_bytes = if channels == 3 {
+        raw_samples
+    } else if channels == 1 {
+        let mut expanded = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        for g in raw_samples {
+            expanded.extend_from_slice(&[g, g, g]);
+        }
+        expanded
+    } else if channels >= 4 {
+        let mut dropped = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        for chunk in raw_samples.chunks_exact(channels) {
+            dropped.extend_from_slice(&[chunk[0], chunk[1], chunk[2]]);
+        }
+        dropped
+    } else {
+        return Err(MediaError::Decode(format!(
+            "unsupported JXL channel count {channels}"
+        )));
+    };
+
+    if let Some(icc_bytes) = icc.as_deref() {
+        if !icc_bytes.is_empty() {
+            let _ = bake_icc_to_srgb(&mut rgb_bytes, icc_bytes);
+        }
+    }
+
+    RgbImage::from_raw(width, height, rgb_bytes)
+        .ok_or_else(|| MediaError::Decode("JXL buffer size mismatch".to_string()))
+}
+
+fn decode_via_ffmpeg_png(path: &Path) -> Result<RgbImage, MediaError> {
+    let ffmpeg = video::video_capabilities()
+        .ffmpeg_path
+        .as_deref()
+        .ok_or_else(|| MediaError::ExternalTool {
+            tool: "ffmpeg",
+            message: "ffmpeg executable not found for fallback decode".to_string(),
+        })?;
+    let out = std::process::Command::new(ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
+        .output()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(MediaError::ExternalTool {
+            tool: "ffmpeg",
+            message: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    let dyn_img = image::load_from_memory(&out.stdout)
+        .map_err(|e| MediaError::Decode(format!("ffmpeg PNG fallback decode failed: {e}")))?;
+    Ok(composite_to_rgb(dyn_img))
+}
+
+fn decode_heic_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(jpeg_bytes) = raw::sips_convert_to_jpeg(path, 92) {
+            let dyn_img = image::load_from_memory(&jpeg_bytes)
+                .map_err(|e| MediaError::Decode(format!("sips HEIC JPEG decode failed: {e}")))?;
+            return Ok(composite_to_rgb(dyn_img));
+        }
+    }
+
+    decode_via_ffmpeg_png(path)
+}
+
+fn decode_raw_preview_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
+    if let Some(jpeg_bytes) = raw::extract_embedded_raw_jpeg(path) {
+        if let Ok(mut cursor_reader) =
+            ImageReader::new(std::io::Cursor::new(&jpeg_bytes)).with_guessed_format()
+        {
+            let _ = &mut cursor_reader;
+            if let Ok(mut decoder) = cursor_reader.into_decoder() {
+                let orientation = decoder.orientation().ok();
+                let icc = decoder.icc_profile().ok().flatten();
+                if let Ok(mut dyn_img) = DynamicImage::from_decoder(decoder) {
+                    if let Some(orient) = orientation {
+                        dyn_img.apply_orientation(orient);
+                    }
+                    let mut rgb = composite_to_rgb(dyn_img);
+                    if let Some(icc_bytes) = icc.as_deref() {
+                        let _ = bake_icc_to_srgb(rgb.as_mut(), icc_bytes);
+                    }
+                    return Ok(rgb);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(jpeg_bytes) = raw::sips_convert_to_jpeg(path, 92) {
+            let dyn_img = image::load_from_memory(&jpeg_bytes)
+                .map_err(|e| MediaError::Decode(format!("sips RAW JPEG decode failed: {e}")))?;
+            return Ok(composite_to_rgb(dyn_img));
+        }
+    }
+
+    decode_via_ffmpeg_png(path)
+}
+
+fn decode_livp_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
+    let entries = metadata::inspect_livp(path)?;
+    let bytes = metadata::extract_livp_entry_bytes(path, &entries.still_entry)?;
+    let ext = classify::normalized_extension(Path::new(&entries.still_entry)).unwrap_or_default();
+
+    if classify::is_heic_extension(&ext) || ext == "jxl" || classify::is_raw_extension(&ext) {
+        let mut tmp = tempfile::Builder::new()
+            .prefix("tp_livp_")
+            .suffix(&format!(".{ext}"))
+            .tempfile()?;
+        std::io::Write::write_all(&mut tmp, &bytes)?;
+        return decode_image_to_srgb(tmp.path());
+    }
+
+    let reader = ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|e| MediaError::Decode(format!("livp still format guess failed: {e}")))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| MediaError::Decode(format!("livp still decoder failed: {e}")))?;
+    let orientation = decoder.orientation().ok();
+    let icc = decoder.icc_profile().ok().flatten();
+    let mut dyn_img = DynamicImage::from_decoder(decoder)
+        .map_err(|e| MediaError::Decode(format!("livp still decode failed: {e}")))?;
+    if let Some(orient) = orientation {
+        dyn_img.apply_orientation(orient);
+    }
+    let mut rgb = composite_to_rgb(dyn_img);
+    if let Some(icc_bytes) = icc.as_deref() {
+        let _ = bake_icc_to_srgb(rgb.as_mut(), icc_bytes);
+    }
+    Ok(rgb)
+}
+
+/// Decodes any supported photo, RAW, `.livp`, or video poster frame into an oriented, sRGB-baked `RgbImage`.
+pub fn decode_image_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
+    let category = classify::classify_path(path)
+        .ok_or_else(|| MediaError::UnsupportedFormat(path.display().to_string()))?;
+    let ext = classify::normalized_extension(path).unwrap_or_default();
+
+    match category {
+        MediaCategory::Video => video::extract_video_poster_frame(path),
+        MediaCategory::Livp => decode_livp_to_srgb(path),
+        MediaCategory::Raw => decode_raw_preview_to_srgb(path),
+        MediaCategory::Photo => {
+            if ext == "jxl" {
+                decode_jxl_to_srgb(path)
+            } else if classify::is_heic_extension(&ext) {
+                decode_heic_to_srgb(path)
+            } else {
+                let file = File::open(path)?;
+                let reader = ImageReader::new(BufReader::new(file))
+                    .with_guessed_format()
+                    .map_err(|e| MediaError::Decode(format!("format guess failed: {e}")))?;
+                match decode_standard_image_reader(reader) {
+                    Ok(rgb) => Ok(rgb),
+                    Err(err) if ext == "avif" => {
+                        tracing::debug!(error = %err, "trying ffmpeg fallback for AVIF");
+                        decode_via_ffmpeg_png(path)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+}
+
+/// Resizes `rgb` proportionally if its longest edge exceeds `max_edge` and encodes lossy WebP.
+pub fn encode_webp_resized(
+    rgb: &RgbImage,
+    max_edge: u32,
+    quality: f32,
+) -> Result<Vec<u8>, MediaError> {
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return Err(MediaError::Decode(
+            "cannot encode empty image to WebP".to_string(),
+        ));
+    }
+
+    let max_dim = w.max(h);
+    let owned_resized: RgbImage;
+    let target: &RgbImage = if max_edge > 0 && max_dim > max_edge {
+        let scale = (max_edge as f64) / (max_dim as f64);
+        let new_w = ((w as f64) * scale).round().max(1.0) as u32;
+        let new_h = ((h as f64) * scale).round().max(1.0) as u32;
+        owned_resized = image::imageops::resize(rgb, new_w, new_h, FilterType::Lanczos3);
+        &owned_resized
+    } else {
+        rgb
+    };
+
+    let encoder = webp::Encoder::from_rgb(target.as_raw(), target.width(), target.height());
+    let webp_mem = encoder.encode(quality);
+    Ok(webp_mem.to_vec())
+}
+
+fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> Result<(), MediaError> {
+    let parent = dest.parent().ok_or_else(|| {
+        MediaError::Decode("destination path has no parent directory".to_string())
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut tmp, bytes)?;
+    std::io::Write::flush(&mut tmp)?;
+    tmp.persist(dest).map_err(|e| MediaError::Io(e.error))?;
+    Ok(())
+}
+
+/// Generates a persistent 400px lossy WebP (Q80) thumbnail atomically and computes the 256-bin RGB+Luma histogram.
+pub fn generate_thumb_and_histogram(
+    src: &Path,
+    thumb_out: &Path,
+) -> Result<GeneratedThumb, MediaError> {
+    let rgb = decode_image_to_srgb(src)?;
+    let histogram = compute_histogram(&rgb);
+    let webp_bytes = encode_webp_resized(&rgb, 400, 80.0)?;
+    atomic_write_bytes(thumb_out, &webp_bytes)?;
+    Ok(GeneratedThumb {
+        width: rgb.width(),
+        height: rgb.height(),
+        thumb_bytes_len: webp_bytes.len() as u64,
+        histogram,
+    })
+}
+
+/// Generates a lossy WebP (Q85) lightbox preview capped at `max_edge` atomically, returning written byte length.
+pub fn generate_preview_webp(
+    src: &Path,
+    preview_out: &Path,
+    max_edge: u32,
+) -> Result<u64, MediaError> {
+    let rgb = decode_image_to_srgb(src)?;
+    let webp_bytes = encode_webp_resized(&rgb, max_edge, 85.0)?;
+    atomic_write_bytes(preview_out, &webp_bytes)?;
+    Ok(webp_bytes.len() as u64)
+}

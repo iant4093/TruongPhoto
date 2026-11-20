@@ -1,0 +1,35 @@
+[package]
+name = "truongphoto-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+image.workspace = true
+jxl-oxide.workspace = true
+libloading.workspace = true
+moxcms.workspace = true
+nom-exif.workspace = true
+parking_lot.workspace = true
+quick-xml.workspace = true
+reverse_geocoder.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+truongphoto-core = { workspace = true }
+walkdir.workspace = true
+webp.workspace = true
+zip.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+plist.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true

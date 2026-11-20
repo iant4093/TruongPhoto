@@ -1,0 +1,139 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/truongphoto-core",
+    "crates/truongphoto-db",
+    "crates/truongphoto-media",
+    "crates/truongphoto-ai",
+    "crates/truongphoto-server",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.90"
+authors = ["Ian Truong"]
+
+[workspace.dependencies]
+# Internal crates
+truongphoto-core = { path = "crates/truongphoto-core" }
+truongphoto-db = { path = "crates/truongphoto-db" }
+truongphoto-media = { path = "crates/truongphoto-media" }
+truongphoto-ai = { path = "crates/truongphoto-ai" }
+truongphoto-server = { path = "crates/truongphoto-server" }
+
+# Async & HTTP / WebSocket
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["rt", "io"] }
+futures-util = "0.3.34"
+axum = { version = "0.8.9", features = ["ws", "macros", "multipart"] }
+axum-extra = { version = "0.12.6", features = ["cookie"] }
+cookie = "0.18.2"
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace", "compression-gzip", "limit", "set-header"] }
+http-body-util = "0.1.5"
+http-range-header = "1.1.0"
+rust-embed = { version = "8.14.0", features = ["interpolate-folder-path"] }
+mime_guess = "2.0.5"
+
+# Media, Metadata, XMP, Archive & Offline Geocoding
+nom-exif = "3.8.0"
+reverse_geocoder = "4.1.1"
+quick-xml = "0.42.0"
+zip = { version = "9.8.0", default-features = false, features = ["deflate"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "rayon"] }
+webp = { version = "0.3.1", default-features = false }
+jxl-oxide = "0.12.6"
+moxcms = "0.9.2"
+libloading = "0.9.1"
+
+# FS Watcher, Volume UUID, Trash & Temp Files
+notify = "8.2.2"
+notify-debouncer-mini = "0.7.0"
+walkdir = "2.5.0"
+trash = "5.4.0"
+plist = "1.10.4"
+tempfile = "3.27.0"
+libc = "0.2.183"
+
+# Database & Data Structures
+# NOTE: libsqlite3-sys 0.40.0 compiles bundled SQLite with -DSQLITE_ENABLE_FTS5 by default.
+rusqlite = { version = "0.43.0", features = ["bundled", "backup", "functions"] }
+roaring = { version = "0.12.0", features = ["serde"] }
+blake3 = "1.8.7"
+
+# Vector Engine & Offline AI (Phase 2)
+usearch = "2.26.6"
+memmap2 = "0.9.12"
+half = { version = "2.7.1", features = ["bytemuck", "use-intrinsics"] }
+bytemuck = { version = "1.22.0", features = ["derive"] }
+rayon = "1.12.0"
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "tracing", "load-dynamic", "api-22", "coreml", "directml"] }
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "json"] }
+
+# Phase 3 optional in-process GGUF inference (gated behind Cargo features; no cmake in default build)
+llama-cpp-2 = { version = "0.1.161", default-features = false }
+
+# Auth & Crypto
+argon2 = { version = "0.6.0", features = ["alloc", "getrandom", "password-hash", "zeroize"] }
+getrandom = "0.4.3"
+sha2 = "0.11.1"
+hex = "0.4.3"
+base64 = "0.23.1"
+subtle = "2.6.1"
+
+# Networking & Hardware
+mdns-sd = "0.22.0"
+local-ip-address = "0.6.13"
+sysinfo = "0.38.4"
+# Pure-Rust SVG QR code generator (MIT OR Apache-2.0, MSRV 1.85, zero image/C deps)
+qrcode = { version = "0.15.0", default-features = false, features = ["svg"] }
+
+# Serialization, Time, Logging, Utilities
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29.3", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+parking_lot = "0.12.5"
+
+# Tauri v2 (STRICTLY 2.x — do NOT pull 3.0.0-alpha.*)
+tauri = { version = "2.12.7", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-build = "2.7.6"
+tauri-plugin-shell = "2.6.0"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-updater = "2.14.1"
+tauri-plugin-process = "2.4.0"
+tauri-plugin-single-instance = "2.5.5"
+
+# Platform native hooks (matching TruongPaper power.rs)
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemServices",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Storage_FileSystem",
+] }
+objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-foundation = "0.3.2"
+objc2-app-kit = "0.3.2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = true
+
+[profile.release.build-override]
+strip = false

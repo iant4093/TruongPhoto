@@ -1,0 +1,23 @@
+node_modules
+node_modules/
+dist
+dist/
+target
+target/
+src-tauri/target
+src-tauri/gen
+release-assets
+release-assets/
+/smoke
+# Generated sidecar binaries and downloads
+src-tauri/bin
+src-tauri/tauri.macos.conf.json
+# Local agent task files and test media
+.agents
+plans/
+test-media
+*.db*
+*.usearch
+*.f16
+.DS_Store
+*.log

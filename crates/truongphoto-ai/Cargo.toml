@@ -1,0 +1,43 @@
+[package]
+name = "truongphoto-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+half.workspace = true
+hex.workspace = true
+image.workspace = true
+llama-cpp-2 = { workspace = true, optional = true }
+memmap2.workspace = true
+ort.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+reqwest.workspace = true
+roaring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+truongphoto-core = { workspace = true }
+usearch.workspace = true
+uuid.workspace = true
+
+[features]
+default = []
+llama-cpp = ["dep:llama-cpp-2", "llama-cpp-2/llguidance", "llama-cpp-2/mtmd"]
+llama-metal = ["llama-cpp", "llama-cpp-2/metal"]
+llama-vulkan-dl = ["llama-cpp", "llama-cpp-2/dynamic-backends", "llama-cpp-2/vulkan"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
