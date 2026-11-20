@@ -152,9 +152,26 @@ fn sample_video_keyframes_fps_mode(
     Ok(keyframes)
 }
 
+fn cached_preview_path(cache_dir: &Path, asset_id: &str) -> Option<PathBuf> {
+    if asset_id.len() < 2 {
+        return None;
+    }
+    let p0 = &asset_id[..2];
+    let candidate = cache_dir
+        .join("previews")
+        .join(p0)
+        .join(format!("{asset_id}.webp"));
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 fn decode_frames_for_asset(
     kind: AssetKind,
     src_path: &Path,
+    preview_path: Option<&Path>,
     video_max_frames: u32,
 ) -> Result<Vec<SampledKeyframe>, String> {
     if kind == AssetKind::Video {
@@ -175,7 +192,11 @@ fn decode_frames_for_asset(
         }]);
     }
 
-    let mut img = decode_image_to_srgb(src_path).map_err(|e| e.to_string())?;
+    // Prefer already-cached 2048px preview when available to skip decoding giant 20-50MB originals.
+    let mut img = match preview_path.and_then(|p| decode_image_to_srgb(p).ok()) {
+        Some(cached) => cached,
+        None => decode_image_to_srgb(src_path).map_err(|e| e.to_string())?,
+    };
     let max_side = img.width().max(img.height());
     if max_side > 1600 {
         let scale = 1600.0f32 / (max_side as f32);
@@ -263,12 +284,15 @@ pub async fn process_stage2_batch(
         return Ok(0);
     }
 
+    let cache_dir = PathBuf::from(&settings.cache_dir);
+
     if let Some(staging_tier) = ai_state.staging_vision_tier {
         return process_staging_tier_batch(
             state,
             ai_state.active_vision_tier,
             staging_tier,
             settings.video_max_frames,
+            &cache_dir,
             max_assets,
         )
         .await;
@@ -278,6 +302,7 @@ pub async fn process_stage2_batch(
         state,
         ai_state.active_vision_tier,
         settings.video_max_frames,
+        &cache_dir,
         max_assets,
     )
     .await
@@ -288,6 +313,7 @@ async fn process_staging_tier_batch(
     active_tier: AiTier,
     staging_tier: AiTier,
     video_max_frames: u32,
+    cache_dir: &Path,
     max_assets: usize,
 ) -> Result<usize, anyhow::Error> {
     let (asset_ids, queue_stats) = state
@@ -342,8 +368,14 @@ async fn process_staging_tier_batch(
 
             let pipe = Arc::clone(&pipeline);
             let kind = summary.kind;
+            let preview_path = cached_preview_path(cache_dir, &asset_id);
             let inferred = tokio::task::spawn_blocking(move || {
-                let frames = match decode_frames_for_asset(kind, &src_path, video_max_frames) {
+                let frames = match decode_frames_for_asset(
+                    kind,
+                    &src_path,
+                    preview_path.as_deref(),
+                    video_max_frames,
+                ) {
                     Ok(f) => f,
                     Err(err) => {
                         tracing::debug!(path = %src_path.display(), error = %err, "stage2 staging decode skipped");
@@ -448,6 +480,7 @@ async fn process_active_stage2_batch(
     state: &Arc<AppState>,
     active_tier: AiTier,
     video_max_frames: u32,
+    cache_dir: &Path,
     max_assets: usize,
 ) -> Result<usize, anyhow::Error> {
     let (asset_ids, raw_centroids, queue_stats) = state
@@ -520,8 +553,14 @@ async fn process_active_stage2_batch(
 
         let pipe = Arc::clone(&pipeline);
         let kind = summary.kind;
+        let preview_path = cached_preview_path(cache_dir, &asset_id);
         let inferred = tokio::task::spawn_blocking(move || {
-            let frames = match decode_frames_for_asset(kind, &src_path, video_max_frames) {
+            let frames = match decode_frames_for_asset(
+                kind,
+                &src_path,
+                preview_path.as_deref(),
+                video_max_frames,
+            ) {
                 Ok(f) => f,
                 Err(err) => {
                     tracing::debug!(path = %src_path.display(), error = %err, "stage2 decode skipped");
@@ -532,48 +571,64 @@ async fn process_active_stage2_batch(
                 return Ok(None);
             }
 
-            let mut vision_vecs = Vec::with_capacity(frames.len());
-            let mut raw_tags = Vec::new();
-            let mut vision_ok = true;
+            // Overlap CPU vision inference with hardware-accelerated (CoreML/DirectML) face + OCR inference.
+            let (vision_res, (faces, ocr)) = std::thread::scope(|s| {
+                let vision_handle = s.spawn(|| {
+                    let mut vision_vecs = Vec::with_capacity(frames.len());
+                    let mut raw_tags = Vec::new();
+                    let mut vision_ok = true;
 
-            for kf in &frames {
-                match pipe.vision.embed_image(active_tier, &kf.image) {
-                    Ok(vec) => {
-                        if let Ok(scored) = pipe.vision.score_zero_shot_tags(active_tier, &vec) {
-                            raw_tags.extend(scored);
+                    for kf in &frames {
+                        match pipe.vision.embed_image(active_tier, &kf.image) {
+                            Ok(vec) => {
+                                if let Ok(scored) =
+                                    pipe.vision.score_zero_shot_tags(active_tier, &vec)
+                                {
+                                    raw_tags.extend(scored);
+                                }
+                                vision_vecs.push((kf.timestamp_ms, vec));
+                            }
+                            Err(e) if is_unavailable_engine_err(&e) => {
+                                vision_ok = false;
+                                break;
+                            }
+                            Err(e) => return Err(e),
                         }
-                        vision_vecs.push((kf.timestamp_ms, vec));
                     }
-                    Err(e) if is_unavailable_engine_err(&e) => {
-                        vision_ok = false;
-                        break;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+                    Ok((vision_vecs, raw_tags, vision_ok))
+                });
 
-            let faces = if has_existing_faces {
-                Vec::new()
-            } else {
-                match pipe.faces.detect_and_embed(&frames[0].image) {
-                    Ok(detected) => detected,
-                    Err(e) if is_unavailable_engine_err(&e) => Vec::new(),
+                let primary_img = &frames[0].image;
+                let faces = if has_existing_faces {
+                    Vec::new()
+                } else {
+                    match pipe.faces.detect_and_embed(primary_img) {
+                        Ok(detected) => detected,
+                        Err(e) if is_unavailable_engine_err(&e) => Vec::new(),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "face detection skipped for asset");
+                            Vec::new()
+                        }
+                    }
+                };
+
+                let ocr = match pipe.ocr.recognize(primary_img) {
+                    Ok(res) if res.full_text.trim().chars().count() >= 2 => Some(res),
+                    Ok(_) => None,
+                    Err(e) if is_unavailable_engine_err(&e) => None,
                     Err(e) => {
-                        tracing::debug!(error = %e, "face detection skipped for asset");
-                        Vec::new()
+                        tracing::debug!(error = %e, "OCR skipped for asset");
+                        None
                     }
-                }
-            };
+                };
 
-            let ocr = match pipe.ocr.recognize(&frames[0].image) {
-                Ok(res) if res.full_text.trim().chars().count() >= 2 => Some(res),
-                Ok(_) => None,
-                Err(e) if is_unavailable_engine_err(&e) => None,
-                Err(e) => {
-                    tracing::debug!(error = %e, "OCR skipped for asset");
-                    None
-                }
-            };
+                let vision_out = vision_handle
+                    .join()
+                    .map_err(|_| AiError::Ort("vision inference worker thread panicked".into()))?;
+                Ok::<_, AiError>((vision_out?, (faces, ocr)))
+            })?;
+
+            let (vision_vecs, raw_tags, vision_ok) = vision_res;
 
             Ok(Some(InferredAssetData {
                 vision_vecs,

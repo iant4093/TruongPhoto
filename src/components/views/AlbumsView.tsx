@@ -34,6 +34,7 @@ import type {
 } from '../../types/api';
 import { Dropdown } from '../Dropdown';
 import { JustifiedTimeline } from '../JustifiedTimeline';
+import { openContextMenu } from '../ContextMenu';
 import { Badge, EmptyState, ViewHeader } from '../ui';
 
 const SORT_ORDER_OPTIONS: ReadonlyArray<readonly [AlbumSortOrder, string]> = [
@@ -618,6 +619,43 @@ export const AlbumsView: React.FC = () => {
               type="button"
               className="album-card"
               onClick={() => setSelectedAlbumId(album.id)}
+              onContextMenu={(e) => {
+                const canDelete = user?.role === 'admin' || album.owner_user_id === user?.id;
+                openContextMenu(e, [
+                  {
+                    id: 'alb-open',
+                    label: 'Open Album',
+                    icon: <FolderHeart size={14} />,
+                    onSelect: () => setSelectedAlbumId(album.id),
+                  },
+                  ...(canDelete
+                    ? [
+                        { type: 'separator' as const, id: 'alb-sep-del' },
+                        {
+                          id: 'alb-delete',
+                          label: 'Delete Album',
+                          icon: <Trash2 size={14} />,
+                          danger: true,
+                          onSelect: async () => {
+                            const ok = await confirmAction(
+                              `Delete album "${album.title}"?`,
+                              'Delete Album',
+                              'This deletes the album only. Photos and videos inside remain in your library.',
+                            );
+                            if (!ok) return;
+                            try {
+                              await deleteAlbum(album.id);
+                              setItems((prev) => prev.filter((a) => a.id !== album.id));
+                              notifySuccess(`Deleted album "${album.title}"`);
+                            } catch (err) {
+                              notifyError(err, 'Could not delete album');
+                            }
+                          },
+                        },
+                      ]
+                    : []),
+                ]);
+              }}
             >
               <div className="album-cover">
                 {album.cover_asset_id ? (

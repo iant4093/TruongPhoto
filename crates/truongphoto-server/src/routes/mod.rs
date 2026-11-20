@@ -12,6 +12,7 @@ pub mod people;
 pub mod search;
 pub mod setup;
 pub mod tailscale;
+pub mod updates;
 pub mod uploads;
 
 use crate::assets_embed::api_not_found;
@@ -74,6 +75,7 @@ pub fn api_router() -> Router<Arc<AppState>> {
             "/admin/tailscale/disable",
             post(tailscale::disable_tailscale),
         )
+        .route("/admin/updates/check", get(updates::check_for_updates))
         // Phase 2 Admin AI Models & Indexing
         .route("/admin/ai/models", get(ai_admin::list_ai_models))
         .route(
@@ -102,6 +104,7 @@ pub fn api_router() -> Router<Arc<AppState>> {
             get(chat::get_session).delete(chat::delete_session),
         )
         .route("/chat/sessions/{id}/messages", post(chat::send_message))
+        .route("/chat/warmup", post(chat::warmup_chat))
         // Hybrid offline-first map view
         .route("/map/config", get(map::get_map_config))
         .route("/map/clusters", get(map::list_map_clusters))

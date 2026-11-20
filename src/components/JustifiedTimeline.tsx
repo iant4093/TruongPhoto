@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Check, FolderPlus, Heart, Star, Trash2, X } from 'lucide-react';
+import { Check, Download, Eye, FolderPlus, Heart, Info, Star, Trash2, X } from 'lucide-react';
 import {
   addAlbumAssets,
   listAlbums,
+  mediaOriginalUrl,
   mediaThumbUrl,
   setAssetFavorite,
   trashAssets,
@@ -12,6 +13,7 @@ import { computeJustifiedRows, type JustifiedRow } from '../lib/justifiedLayout'
 import { notifyError, notifySuccess } from '../store/feedback';
 import { useAppStore } from '../store/useAppStore';
 import type { AlbumSummary, AssetSummary } from '../types/api';
+import { openContextMenu } from './ContextMenu';
 
 const HEADER_ROW_HEIGHT = 42;
 const ROW_GAP = 4;
@@ -65,6 +67,7 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
   const user = useAppStore((s) => s.user);
   const openLightbox = useAppStore((s) => s.openLightbox);
   const selectAsset = useAppStore((s) => s.selectAsset);
+  const setInspectorOpen = useAppStore((s) => s.setInspectorOpen);
   const bumpLibraryRevision = useAppStore((s) => s.bumpLibraryRevision);
 
   const canMutate = user?.role === 'admin' || user?.role === 'contributor';
@@ -309,6 +312,73 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
               onClick={() => {
                 selectAsset(asset.id);
                 openLightbox(asset.id, allAssetIds);
+              }}
+              onContextMenu={(e) => {
+                openContextMenu(e, [
+                  {
+                    id: 'tile-open',
+                    label: 'Open in Viewer',
+                    icon: <Eye size={14} />,
+                    onSelect: () => {
+                      selectAsset(asset.id);
+                      openLightbox(asset.id, allAssetIds);
+                    },
+                  },
+                  {
+                    id: 'tile-inspect',
+                    label: 'Inspect Details',
+                    icon: <Info size={14} />,
+                    onSelect: () => {
+                      selectAsset(asset.id);
+                      setInspectorOpen(true);
+                    },
+                  },
+                  ...(canMutate
+                    ? [
+                        {
+                          id: 'tile-fav',
+                          label: asset.is_favorite ? 'Remove from Favorites' : 'Add to Favorites',
+                          icon: <Star size={14} />,
+                          onSelect: () => handleToggleFavorite(asset),
+                        },
+                        {
+                          id: 'tile-select',
+                          label: isSelected ? 'Deselect Item' : 'Select Item',
+                          icon: <Check size={14} />,
+                          onSelect: () => toggleSelect(asset.id, false),
+                        },
+                      ]
+                    : []),
+                  {
+                    id: 'tile-download',
+                    label: 'Download Original',
+                    icon: <Download size={14} />,
+                    onSelect: () => {
+                      window.open(mediaOriginalUrl(asset.id, { download: true }), '_blank', 'noopener');
+                    },
+                  },
+                  ...(canMutate
+                    ? [
+                        { type: 'separator' as const, id: 'tile-sep-trash' },
+                        {
+                          id: 'tile-trash',
+                          label: 'Move to Trash',
+                          icon: <Trash2 size={14} />,
+                          danger: true,
+                          onSelect: async () => {
+                            try {
+                              await trashAssets([asset.id]);
+                              onAssetsTrashed?.([asset.id]);
+                              bumpLibraryRevision();
+                              notifySuccess('Moved item to Trash');
+                            } catch (err) {
+                              notifyError(err, 'Could not move item to Trash');
+                            }
+                          },
+                        },
+                      ]
+                    : []),
+                ]);
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {

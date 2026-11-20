@@ -4,6 +4,7 @@ import {
   Images,
   MapPin,
   Settings as SettingsIcon,
+  Sparkles,
   Star,
   Trash2,
   Users,
@@ -18,6 +19,7 @@ export const PRIMARY_NAV_ITEMS: ReadonlyArray<
   readonly [NavTab, string, React.ComponentType<{ size?: number; strokeWidth?: number }>]
 > = [
   ['timeline', 'Timeline', Images],
+  ['chat', 'Ask AI', Sparkles],
   ['people', 'People', Users],
   ['albums', 'Albums', FolderHeart],
   ['favorites', 'Favorites', Star],

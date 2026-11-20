@@ -30,6 +30,7 @@ import { formatBytes } from '../lib/format';
 import { notifyError, notifySuccess } from '../store/feedback';
 import { errorMessage, useAppStore } from '../store/useAppStore';
 import type { AiModelStatus, AiModelView, AiTier, ChatTier } from '../types/api';
+import { Dropdown } from './Dropdown';
 import { Badge, SegmentedControl, ToggleRow } from './ui';
 
 const TIER_OPTIONS: ReadonlyArray<readonly [AiTier, string]> = [
@@ -854,23 +855,16 @@ export const AiModelsPanel: React.FC = () => {
                   </button>
                 </div>
 
-                <label className="row" style={{ gap: 8, fontSize: 12 }}>
+                <div className="row" style={{ gap: 8, fontSize: 12 }}>
                   <span className="workspace-label">Idle Memory Unload</span>
-                  <select
-                    aria-label="Idle Memory Unload"
-                    className="text-input"
-                    style={{ width: 'auto', minHeight: 30, padding: '4px 8px' }}
+                  <Dropdown
+                    label="Idle Memory Unload"
                     value={state.idle_unload_secs}
                     disabled={busyControl === 'idle'}
-                    onChange={(e) => void handleIdleUnloadChange(Number(e.target.value))}
-                  >
-                    {IDLE_TIMEOUT_OPTIONS.map(([secs, label]) => (
-                      <option key={secs} value={secs}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                    options={IDLE_TIMEOUT_OPTIONS}
+                    onChange={(secs) => void handleIdleUnloadChange(secs)}
+                  />
+                </div>
               </div>
             </div>
 

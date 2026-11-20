@@ -256,6 +256,10 @@ impl OrtRuntimeManager {
 
     fn build_session(&self, env: &Environment, model_path: &Path) -> Result<Session, AiError> {
         let _ = std::fs::create_dir_all(&self.coreml_cache_dir);
+        let intra_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8);
 
         // 1. Try hardware-accelerated execution provider first (CoreML on macOS, DirectML on Windows).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -263,6 +267,10 @@ impl OrtRuntimeManager {
             let mut hw_builder = Session::builder(env)
                 .map_err(|e| AiError::Ort(e.to_string()))?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| AiError::Ort(e.to_string()))?
+                .with_intra_threads(intra_threads)
+                .map_err(|e| AiError::Ort(e.to_string()))?
+                .with_inter_threads(1)
                 .map_err(|e| AiError::Ort(e.to_string()))?;
 
             #[cfg(target_os = "macos")]
@@ -302,6 +310,10 @@ impl OrtRuntimeManager {
         let mut cpu_builder = Session::builder(env)
             .map_err(|e| AiError::Ort(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| AiError::Ort(e.to_string()))?
+            .with_intra_threads(intra_threads)
+            .map_err(|e| AiError::Ort(e.to_string()))?
+            .with_inter_threads(1)
             .map_err(|e| AiError::Ort(e.to_string()))?;
 
         cpu_builder

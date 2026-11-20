@@ -13,6 +13,7 @@ import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escape
 import { notifyError, notifySuccess } from '../store/feedback';
 import { useAppStore } from '../store/useAppStore';
 import type { AssetKind, ChatTier, RouterPlan } from '../types/api';
+import { Dropdown } from './Dropdown';
 
 const CHAT_TIER_BADGES: Record<ChatTier, string> = {
   tier0: 'Classic Tier 0',
@@ -209,29 +210,23 @@ export const ChatDrawer: React.FC = () => {
           </div>
 
           <div className="row" style={{ gap: 6 }}>
-            <select
-              aria-label="Chat session"
-              className="text-input"
-              style={{ flex: 1, minHeight: 30, padding: '4px 8px', fontSize: 12 }}
-              value={activeChatSessionId ?? ''}
-              disabled={chatSending}
-              onChange={(e) => {
-                const nextId = e.target.value;
-                if (!nextId) return;
-                void selectChatSession(nextId).catch((err) =>
-                  notifyError(err, 'Could not load chat session'),
-                );
-              }}
-            >
-              <option value="">
-                {chatSessions.length === 0 ? 'New conversation' : 'Select conversation…'}
-              </option>
-              {chatSessions.map((session) => (
-                <option key={session.id} value={session.id}>
-                  {session.title}
-                </option>
-              ))}
-            </select>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <Dropdown
+                label="Chat session"
+                value={activeChatSessionId ?? ''}
+                disabled={chatSending}
+                placeholder={
+                  chatSessions.length === 0 ? 'New conversation' : 'Select conversation…'
+                }
+                options={chatSessions.map((session) => [session.id, session.title] as const)}
+                onChange={(nextId) => {
+                  if (!nextId) return;
+                  void selectChatSession(nextId).catch((err) =>
+                    notifyError(err, 'Could not load chat session'),
+                  );
+                }}
+              />
+            </div>
 
             <button
               type="button"
@@ -352,6 +347,18 @@ export const ChatDrawer: React.FC = () => {
                 </div>
               );
             })
+          )}
+          {chatSending && (
+            <div className="chat-turn is-assistant is-thinking" role="status" aria-live="polite">
+              <div className="chat-thinking-line">
+                <span className="chat-thinking-dots" aria-hidden="true">
+                  <span />
+                  <span />
+                  <span />
+                </span>
+                <span className="chat-thinking-label">Thinking…</span>
+              </div>
+            </div>
           )}
           <div ref={messagesEndRef} />
         </div>

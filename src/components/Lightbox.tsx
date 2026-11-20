@@ -25,6 +25,7 @@ import { notifyError, notifySuccess } from '../store/feedback';
 import { errorMessage, useAppStore } from '../store/useAppStore';
 import type { AssetDetail } from '../types/api';
 import { AssetInspector } from './AssetInspector';
+import { openContextMenu } from './ContextMenu';
 import { VideoPlayer } from './VideoPlayer';
 
 function touchDistance(a: React.Touch, b: React.Touch): number {
@@ -53,8 +54,10 @@ export const Lightbox: React.FC = () => {
   const [livePlaying, setLivePlaying] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
 
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
 
   // Touch & pointer gesture tracking
   const gestureRef = useRef<{
@@ -67,6 +70,7 @@ export const Lightbox: React.FC = () => {
     lastTapAt: number;
     longPressTimer: number | null;
     dragging: boolean;
+    didDrag: boolean;
   }>({
     startX: 0,
     startY: 0,
@@ -77,6 +81,7 @@ export const Lightbox: React.FC = () => {
     lastTapAt: 0,
     longPressTimer: null,
     dragging: false,
+    didDrag: false,
   });
 
   const currentIndex = useMemo(() => {
@@ -380,24 +385,139 @@ export const Lightbox: React.FC = () => {
   };
 
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (zoom <= 1 || isVideo) return;
-    gestureRef.current.dragging = true;
+    if (e.button !== 0 || isVideo) return;
+    gestureRef.current.didDrag = false;
     gestureRef.current.startX = e.clientX;
     gestureRef.current.startY = e.clientY;
     gestureRef.current.startPanX = pan.x;
     gestureRef.current.startPanY = pan.y;
+    if (zoom > 1.05) {
+      gestureRef.current.dragging = true;
+      setIsDragging(true);
+    }
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!gestureRef.current.dragging || zoom <= 1) return;
+    if (!gestureRef.current.dragging || zoom <= 1.05) return;
+    const dx = e.clientX - gestureRef.current.startX;
+    const dy = e.clientY - gestureRef.current.startY;
+    if (Math.hypot(dx, dy) > 4) {
+      gestureRef.current.didDrag = true;
+    }
     setPan({
-      x: gestureRef.current.startPanX + (e.clientX - gestureRef.current.startX),
-      y: gestureRef.current.startPanY + (e.clientY - gestureRef.current.startY),
+      x: gestureRef.current.startPanX + dx,
+      y: gestureRef.current.startPanY + dy,
     });
   };
 
   const handleMouseUp = () => {
     gestureRef.current.dragging = false;
+    setIsDragging(false);
+  };
+
+  const handleImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
+    if (isVideo) return;
+    if (gestureRef.current.didDrag) {
+      gestureRef.current.didDrag = false;
+      return;
+    }
+    if (zoom > 1.05) {
+      setZoom(1);
+      setPan({ x: 0, y: 0 });
+      return;
+    }
+    const targetZoom = 2.25;
+    const rect = imgRef.current?.getBoundingClientRect();
+    if (rect && rect.width > 0 && rect.height > 0) {
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const offsetX = e.clientX - cx;
+      const offsetY = e.clientY - cy;
+      setPan({
+        x: Math.round(-offsetX * (targetZoom - 1) * 0.75),
+        y: Math.round(-offsetY * (targetZoom - 1) * 0.75),
+      });
+    } else {
+      setPan({ x: 0, y: 0 });
+    }
+    setZoom(targetZoom);
+  };
+
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (isVideo) return;
+    if (Math.abs(e.deltaY) < 1) return;
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    setZoom((prev) => {
+      const next = Math.min(4, Math.max(1, Number((prev * factor).toFixed(2))));
+      if (next <= 1.02) {
+        setPan({ x: 0, y: 0 });
+        return 1;
+      }
+      return next;
+    });
+  };
+
+  const handleMediaContextMenu = (e: React.MouseEvent) => {
+    if (!lightboxAssetId) return;
+    openContextMenu(e, [
+      ...(!isVideo
+        ? [
+            {
+              id: 'lb-zoom',
+              label: zoom > 1.05 ? 'Reset Zoom (100%)' : 'Zoom In (225%)',
+              icon: <ZoomIn size={14} />,
+              onSelect: () => {
+                if (zoom > 1.05) {
+                  setZoom(1);
+                  setPan({ x: 0, y: 0 });
+                } else {
+                  setZoom(2.25);
+                  setPan({ x: 0, y: 0 });
+                }
+              },
+            },
+          ]
+        : []),
+      ...(canMutate && detail
+        ? [
+            {
+              id: 'lb-fav',
+              label: detail.summary.is_favorite ? 'Remove from Favorites' : 'Add to Favorites',
+              icon: <Star size={14} />,
+              shortcut: 'F',
+              onSelect: () => handleToggleFavorite(),
+            },
+          ]
+        : []),
+      {
+        id: 'lb-info',
+        label: infoOpen ? 'Hide Details' : 'Inspect Details',
+        icon: <Info size={14} />,
+        shortcut: 'I',
+        onSelect: () => setInfoOpen((prev) => !prev),
+      },
+      {
+        id: 'lb-download',
+        label: 'Download Original',
+        icon: <Download size={14} />,
+        onSelect: () => {
+          window.open(mediaOriginalUrl(lightboxAssetId, { download: true }), '_blank', 'noopener');
+        },
+      },
+      ...(canMutate
+        ? [
+            { type: 'separator' as const, id: 'lb-sep-del' },
+            {
+              id: 'lb-trash',
+              label: 'Move to Trash',
+              icon: <Trash2 size={14} />,
+              danger: true,
+              onSelect: () => handleMoveToTrash(),
+            },
+          ]
+        : []),
+    ]);
   };
 
   return (
@@ -407,7 +527,7 @@ export const Lightbox: React.FC = () => {
       aria-modal="true"
       aria-label="Media lightbox"
     >
-      <header className="lightbox-toolbar">
+      <header className="lightbox-toolbar" data-tauri-drag-region>
         <div className="row" style={{ gap: 10, minWidth: 0 }}>
           <button
             type="button"
@@ -544,6 +664,8 @@ export const Lightbox: React.FC = () => {
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
           onMouseLeave={handleMouseUp}
+          onWheel={handleWheel}
+          onContextMenu={handleMediaContextMenu}
         >
           {hasPrev && (
             <button
@@ -583,15 +705,19 @@ export const Lightbox: React.FC = () => {
               }}
             >
               <img
+                ref={imgRef}
                 className="lightbox-media"
                 src={stillUrl}
                 alt={titleText}
                 draggable={false}
+                onClick={handleImageClick}
                 style={{
                   transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-                  cursor: zoom > 1 ? 'grab' : 'default',
+                  cursor: zoom > 1.05 ? (isDragging ? 'grabbing' : 'grab') : 'zoom-in',
                   opacity: livePlaying ? 0 : 1,
-                  transition: 'opacity 180ms ease-out',
+                  transition: isDragging
+                    ? 'opacity 180ms ease-out'
+                    : 'transform 200ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out',
                 }}
               />
 

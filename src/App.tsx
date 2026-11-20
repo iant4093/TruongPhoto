@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { LogOut, PanelRight, Search, Sparkles, Upload, UploadCloud, X } from 'lucide-react';
+import { LogOut, PanelRight, Search, Upload, UploadCloud, X } from 'lucide-react';
 import { ChatDrawer } from './components/ChatDrawer';
+import { ContextMenuHost } from './components/ContextMenu';
 import { FeedbackHost } from './components/Feedback';
 import { InspectorDrawer } from './components/InspectorDrawer';
 import { Lightbox } from './components/Lightbox';
@@ -11,6 +12,7 @@ import { UploadModal } from './components/UploadModal';
 import { Badge } from './components/ui';
 import { WindowsCaptionButtons, isWindowsPlatform } from './components/WindowControls';
 import { AlbumsView } from './components/views/AlbumsView';
+import { ChatView } from './components/views/ChatView';
 import { FavoritesView } from './components/views/FavoritesView';
 import { MapView } from './components/views/MapView';
 import { PeopleView } from './components/views/PeopleView';
@@ -22,10 +24,25 @@ import { TrashView } from './components/views/TrashView';
 import { isTauri } from './lib/tauri';
 import { notifyError } from './store/feedback';
 import { useAppStore } from './store/useAppStore';
+import type { NavTab } from './types/api';
 
 const nativeMacTitlebar =
   typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
 const windowsCaption = !nativeMacTitlebar && isWindowsPlatform();
+
+const MEDIA_GRID_TABS = new Set<NavTab>(['timeline', 'people', 'albums', 'favorites']);
+const UPLOAD_TABS = new Set<NavTab>(['timeline', 'albums', 'favorites']);
+
+const NAV_TITLES: Record<NavTab, string> = {
+  timeline: 'Timeline',
+  chat: 'Ask AI',
+  people: 'People',
+  albums: 'Albums',
+  favorites: 'Favorites',
+  map: 'Map',
+  trash: 'Recently Deleted',
+  settings: 'Settings',
+};
 
 export const App: React.FC = () => {
   const bootstrapping = useAppStore((s) => s.bootstrapping);
@@ -42,16 +59,20 @@ export const App: React.FC = () => {
 
   const bootstrap = useAppStore((s) => s.bootstrap);
   const logout = useAppStore((s) => s.logout);
+  const setActiveNav = useAppStore((s) => s.setActiveNav);
   const setInspectorOpen = useAppStore((s) => s.setInspectorOpen);
   const toggleInspector = useAppStore((s) => s.toggleInspector);
   const setChatDrawerOpen = useAppStore((s) => s.setChatDrawerOpen);
-  const toggleChatDrawer = useAppStore((s) => s.toggleChatDrawer);
   const setSearchQuery = useAppStore((s) => s.setSearchQuery);
   const runSearch = useAppStore((s) => s.runSearch);
   const clearSearch = useAppStore((s) => s.clearSearch);
   const setUploadModalOpen = useAppStore((s) => s.setUploadModalOpen);
 
   const canUpload = user?.role === 'admin' || user?.role === 'contributor';
+  const showSearchOmnibar = searchActive || MEDIA_GRID_TABS.has(activeNav);
+  const showInspectorControl = searchActive || MEDIA_GRID_TABS.has(activeNav);
+  const showUploadControl = canUpload && (searchActive || UPLOAD_TABS.has(activeNav));
+  const hideWorkspaceHeader = !searchActive && activeNav === 'chat';
 
   const [windowDragActive, setWindowDragActive] = useState(false);
   const [droppedFiles, setDroppedFiles] = useState<File[]>([]);
@@ -61,10 +82,14 @@ export const App: React.FC = () => {
   const openerRef = useRef<HTMLElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const wasInspectorOpen = useRef(false);
-  const prevNavRef = useRef(activeNav);
+  const prevNavRef = useRef<NavTab>(activeNav);
+  const lastNonChatNavRef = useRef<NavTab>('timeline');
 
   useEffect(() => {
     if (prevNavRef.current !== activeNav) {
+      if (prevNavRef.current !== 'chat') {
+        lastNonChatNavRef.current = prevNavRef.current;
+      }
       prevNavRef.current = activeNav;
       if (searchActive) {
         clearSearch();
@@ -76,13 +101,18 @@ export const App: React.FC = () => {
     void bootstrap();
   }, [bootstrap]);
 
-  // '/' focuses Omnibar when not typing in a control; Cmd/Ctrl+K toggles Ask AI drawer.
+  // '/' focuses Omnibar when not typing in a control; Cmd/Ctrl+K jumps to Ask AI workspace.
   useEffect(() => {
     if (!authenticated) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'k') {
         event.preventDefault();
-        toggleChatDrawer();
+        const cur = useAppStore.getState().activeNav;
+        if (cur === 'chat') {
+          setActiveNav(lastNonChatNavRef.current || 'timeline');
+        } else {
+          setActiveNav('chat');
+        }
         return;
       }
       if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -96,12 +126,13 @@ export const App: React.FC = () => {
       ) {
         return;
       }
+      if (!searchInputRef.current) return;
       event.preventDefault();
-      searchInputRef.current?.focus();
+      searchInputRef.current.focus();
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [authenticated, toggleChatDrawer]);
+  }, [authenticated, setActiveNav]);
 
   useEffect(() => {
     if (inspectorOpen && !wasInspectorOpen.current) {
@@ -121,9 +152,11 @@ export const App: React.FC = () => {
     setDroppedFiles([]);
   }, [setUploadModalOpen]);
 
+  const macDesktop = isTauri() && nativeMacTitlebar;
+
   if (bootstrapping) {
     return (
-      <div className="auth-viewport">
+      <div className={`auth-viewport${macDesktop ? ' native-titlebar' : ''}`} data-tauri-drag-region>
         <div className="auth-shell">
           <div className="auth-header" role="status">
             <img src="/app-icon.png" width={36} height={36} alt="" />
@@ -137,7 +170,7 @@ export const App: React.FC = () => {
 
   if (bootstrapError && !authenticated) {
     return (
-      <div className="auth-viewport">
+      <div className={`auth-viewport${macDesktop ? ' native-titlebar' : ''}`} data-tauri-drag-region>
         <div className="auth-shell">
           <div className="auth-header">
             <img src="/app-icon.png" width={36} height={36} alt="" />
@@ -183,6 +216,8 @@ export const App: React.FC = () => {
     switch (activeNav) {
       case 'timeline':
         return <TimelineView />;
+      case 'chat':
+        return <ChatView />;
       case 'people':
         return <PeopleView />;
       case 'albums':
@@ -203,7 +238,7 @@ export const App: React.FC = () => {
 
   return (
     <div
-      className={`app-window-frame studio-shell${isTauri() && nativeMacTitlebar ? ' native-titlebar' : ''}${isTauri() && windowsCaption ? ' windows-caption' : ''}`}
+      className={`app-window-frame studio-shell${macDesktop ? ' native-titlebar' : ''}${isTauri() && windowsCaption ? ' windows-caption' : ''}`}
       onDragEnter={(e) => {
         if (!canUpload || !hasFileDrag(e)) return;
         dragDepthRef.current += 1;
@@ -233,6 +268,7 @@ export const App: React.FC = () => {
       }}
     >
       <FeedbackHost floatingToasts={false} />
+      <ContextMenuHost />
       <Lightbox />
       <UploadModal
         open={uploadModalOpen}
@@ -253,108 +289,107 @@ export const App: React.FC = () => {
       <Sidebar />
 
       <div className="workspace">
-        <header className="workspace-header" data-tauri-drag-region>
-          <form
-            className="omnibar"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void runSearch({ query: searchQuery.trim() || null, offset: 0 }).catch((err) =>
-                notifyError(err, 'Search failed'),
-              );
-            }}
-          >
-            <label className="omnibar-field" aria-label="Search library">
-              <Search size={14} aria-hidden="true" />
-              <input
-                ref={searchInputRef}
-                type="search"
-                placeholder="Search library…"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Escape') {
-                    if (searchActive || searchQuery) clearSearch();
-                    else searchInputRef.current?.blur();
-                  }
+        {!hideWorkspaceHeader && (
+          <header className="workspace-header" data-tauri-drag-region>
+            {showSearchOmnibar ? (
+              <form
+                className="omnibar"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void runSearch({ query: searchQuery.trim() || null, offset: 0 }).catch((err) =>
+                    notifyError(err, 'Search failed'),
+                  );
                 }}
-              />
-              {(searchQuery || searchActive) && (
-                <button
-                  type="button"
-                  className="icon-button"
-                  style={{ width: 22, height: 22 }}
-                  aria-label="Clear search"
-                  onClick={clearSearch}
-                >
-                  <X size={13} />
-                </button>
-              )}
-              <span className="omnibar-shortcut" aria-hidden="true">
-                /
-              </span>
-            </label>
-          </form>
-
-          <button
-            type="button"
-            className={`button details-toggle ${chatDrawerOpen ? 'is-active' : ''}`}
-            aria-pressed={chatDrawerOpen}
-            title="Ask AI (Cmd/Ctrl+K)"
-            onClick={toggleChatDrawer}
-          >
-            <Sparkles size={14} />
-            <span className="header-btn-label">Ask AI</span>
-          </button>
-
-          <div className="workspace-controls">
-            {user && (
-              <div className="row header-secondary-control" style={{ gap: 6 }}>
-                <span className="workspace-label">{user.display_name}</span>
-                <Badge tone={user.role === 'admin' ? 'info' : 'muted'}>{user.role}</Badge>
+              >
+                <label className="omnibar-field" aria-label="Search library">
+                  <Search size={14} aria-hidden="true" />
+                  <input
+                    ref={searchInputRef}
+                    type="search"
+                    placeholder="Search library…"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') {
+                        if (searchActive || searchQuery) clearSearch();
+                        else searchInputRef.current?.blur();
+                      }
+                    }}
+                  />
+                  {(searchQuery || searchActive) && (
+                    <button
+                      type="button"
+                      className="icon-button"
+                      style={{ width: 22, height: 22 }}
+                      aria-label="Clear search"
+                      onClick={clearSearch}
+                    >
+                      <X size={13} />
+                    </button>
+                  )}
+                  <span className="omnibar-shortcut" aria-hidden="true">
+                    /
+                  </span>
+                </label>
+              </form>
+            ) : (
+              <div className="workspace-header-title" data-tauri-drag-region>
+                {NAV_TITLES[activeNav]}
               </div>
             )}
 
-            {canUpload && (
+            <div className="workspace-controls">
+              {user && (
+                <div className="row header-secondary-control" style={{ gap: 6 }}>
+                  <span className="workspace-label">{user.display_name}</span>
+                  <Badge tone={user.role === 'admin' ? 'info' : 'muted'}>{user.role}</Badge>
+                </div>
+              )}
+
+              {showUploadControl && (
+                <button
+                  type="button"
+                  className="button button-primary"
+                  onClick={() => {
+                    setDroppedFiles([]);
+                    setUploadModalOpen(true);
+                  }}
+                >
+                  <Upload size={14} />
+                  <span className="header-btn-label">Upload</span>
+                </button>
+              )}
+
               <button
                 type="button"
-                className="button button-primary"
-                onClick={() => {
-                  setDroppedFiles([]);
-                  setUploadModalOpen(true);
-                }}
+                className="button button-quiet header-secondary-control"
+                onClick={() => void logout()}
               >
-                <Upload size={14} />
-                <span className="header-btn-label">Upload</span>
+                <LogOut size={14} />
+                <span>Sign Out</span>
               </button>
-            )}
 
-            <button
-              type="button"
-              className="button button-quiet header-secondary-control"
-              onClick={() => void logout()}
-            >
-              <LogOut size={14} />
-              <span>Sign Out</span>
-            </button>
+              {showInspectorControl && (
+                <button
+                  type="button"
+                  className={`button details-toggle ${inspectorOpen ? 'is-active' : ''}`}
+                  aria-pressed={inspectorOpen}
+                  onClick={(event) => {
+                    openerRef.current = event.currentTarget;
+                    toggleInspector();
+                  }}
+                >
+                  <PanelRight size={14} />
+                  <span className="header-btn-label">Inspector</span>
+                </button>
+              )}
 
-            <button
-              type="button"
-              className={`button details-toggle ${inspectorOpen ? 'is-active' : ''}`}
-              aria-pressed={inspectorOpen}
-              onClick={(event) => {
-                openerRef.current = event.currentTarget;
-                toggleInspector();
-              }}
-            >
-              <PanelRight size={14} />
-              <span className="header-btn-label">Inspector</span>
-            </button>
+              {isTauri() && windowsCaption && <WindowsCaptionButtons />}
+            </div>
+          </header>
+        )}
 
-            {isTauri() && windowsCaption && <WindowsCaptionButtons />}
-          </div>
-        </header>
-
-        <div className={`workspace-body ${inspectorOpen ? 'with-inspector' : ''}`}>
+        <div className={`workspace-body ${inspectorOpen && showInspectorControl ? 'with-inspector' : ''}`}>
           <main className="content-viewport">
             {searchActive ? (
               <div key="search" className="view-content is-full-bleed">
@@ -364,7 +399,11 @@ export const App: React.FC = () => {
               <div
                 key={activeNav}
                 className={
-                  activeNav === 'settings' ? 'settings-enter' : 'view-content is-full-bleed'
+                  activeNav === 'settings'
+                    ? 'settings-enter'
+                    : activeNav === 'chat'
+                      ? 'chat-enter'
+                      : 'view-content is-full-bleed'
                 }
               >
                 {renderActiveView()}
@@ -372,7 +411,7 @@ export const App: React.FC = () => {
             )}
           </main>
 
-          {(inspectorOpen || chatDrawerOpen) && (
+          {((inspectorOpen && showInspectorControl) || chatDrawerOpen) && (
             <div
               className="inspector-scrim"
               aria-hidden="true"
@@ -383,17 +422,19 @@ export const App: React.FC = () => {
             />
           )}
 
-          <div
-            className="inspector-slot"
-            inert={!inspectorOpen}
-            aria-hidden={!inspectorOpen}
-          >
-            <InspectorDrawer
-              open={inspectorOpen}
-              closeRef={closeButtonRef}
-              onClose={closeInspector}
-            />
-          </div>
+          {showInspectorControl && (
+            <div
+              className="inspector-slot"
+              inert={!inspectorOpen}
+              aria-hidden={!inspectorOpen}
+            >
+              <InspectorDrawer
+                open={inspectorOpen}
+                closeRef={closeButtonRef}
+                onClose={closeInspector}
+              />
+            </div>
+          )}
 
           <ChatDrawer />
         </div>

@@ -2,8 +2,8 @@ import React from 'react';
 import {
   FolderHeart,
   Images,
-  MapPin,
   Settings as SettingsIcon,
+  Sparkles,
   Users,
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
@@ -13,9 +13,9 @@ export const MOBILE_TABS: ReadonlyArray<
   readonly [NavTab, string, React.ComponentType<{ size?: number; strokeWidth?: number }>]
 > = [
   ['timeline', 'Timeline', Images],
+  ['chat', 'Ask AI', Sparkles],
   ['people', 'People', Users],
   ['albums', 'Albums', FolderHeart],
-  ['map', 'Map', MapPin],
   ['settings', 'Settings', SettingsIcon],
 ];
 

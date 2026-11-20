@@ -4,6 +4,7 @@ import { listPeople } from '../lib/api';
 import { notifyError } from '../store/feedback';
 import { useAppStore } from '../store/useAppStore';
 import type { AssetKind, PersonSummary, SearchMode, SearchRequest } from '../types/api';
+import { Dropdown } from './Dropdown';
 import { SegmentedControl } from './ui';
 
 const SEARCH_MODES: ReadonlyArray<readonly [SearchMode, string]> = [
@@ -146,23 +147,15 @@ export const SearchFilterBar: React.FC = () => {
 
       {expanded && (
         <div className="search-filter-grid">
-          <label className="settings-field" style={{ marginBottom: 0 }}>
+          <div className="settings-field" style={{ marginBottom: 0 }}>
             <span className="workspace-label">Media Kind</span>
-            <select
-              aria-label="Media Kind"
-              className="text-input"
+            <Dropdown
+              label="Media Kind"
               value={searchRequest.kind ?? ''}
-              onChange={(e) =>
-                executeSearch({ kind: (e.target.value as AssetKind | '') || null })
-              }
-            >
-              {KIND_OPTIONS.map(([val, label]) => (
-                <option key={val || 'all'} value={val}>
-                  {label}
-                </option>
-              ))}
-            </select>
-          </label>
+              options={KIND_OPTIONS}
+              onChange={(val) => executeSearch({ kind: (val as AssetKind | '') || null })}
+            />
+          </div>
 
           <label className="settings-field" style={{ marginBottom: 0 }}>
             <span className="workspace-label">Camera</span>
@@ -200,26 +193,22 @@ export const SearchFilterBar: React.FC = () => {
             />
           </label>
 
-          <label className="settings-field" style={{ marginBottom: 0 }}>
+          <div className="settings-field" style={{ marginBottom: 0 }}>
             <span className="workspace-label">Person</span>
-            <select
-              aria-label="Person"
-              className="text-input"
+            <Dropdown
+              label="Person"
               value={searchRequest.person_ids?.[0] ?? ''}
-              onChange={(e) =>
+              options={[
+                ['', 'Any person'] as const,
+                ...people.map((person) => [person.id, person.name || 'Unnamed'] as const),
+              ]}
+              onChange={(val) =>
                 executeSearch({
-                  person_ids: e.target.value ? [e.target.value] : null,
+                  person_ids: val ? [val] : null,
                 })
               }
-            >
-              <option value="">Any person</option>
-              {people.map((person) => (
-                <option key={person.id} value={person.id}>
-                  {person.name || 'Unnamed'}
-                </option>
-              ))}
-            </select>
-          </label>
+            />
+          </div>
 
           <label className="settings-field" style={{ marginBottom: 0 }}>
             <span className="workspace-label">Date From</span>

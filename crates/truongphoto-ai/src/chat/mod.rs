@@ -60,4 +60,10 @@ pub trait ChatRouterBackend: Send + Sync {
     fn evict_idle(&self, max_idle: Duration) -> usize;
 
     fn is_loaded(&self) -> bool;
+
+    /// Optionally pre-warms the local LLM runtime for `tier` in the background.
+    /// Returns `true` if the runtime is warm/ready.
+    fn warmup(&self, _tier: ChatTier) -> bool {
+        false
+    }
 }

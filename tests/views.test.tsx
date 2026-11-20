@@ -470,7 +470,7 @@ describe('MobileTabBar', () => {
     useAppStore.setState({ activeNav: 'timeline' });
     render(<MobileTabBar />);
 
-    const expectedTabs = ['Timeline', 'People', 'Albums', 'Map', 'Settings'];
+    const expectedTabs = ['Timeline', 'Ask AI', 'People', 'Albums', 'Settings'];
     for (const label of expectedTabs) {
       expect(screen.getByRole('button', { name: label })).toBeTruthy();
     }
@@ -479,9 +479,9 @@ describe('MobileTabBar', () => {
       screen.getByRole('button', { name: 'Timeline' }).getAttribute('aria-current'),
     ).toBe('page');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
-    expect(useAppStore.getState().activeNav).toBe('map');
-    expect(screen.getByRole('button', { name: 'Map' }).getAttribute('aria-current')).toBe(
+    fireEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    expect(useAppStore.getState().activeNav).toBe('chat');
+    expect(screen.getByRole('button', { name: 'Ask AI' }).getAttribute('aria-current')).toBe(
       'page',
     );
     expect(

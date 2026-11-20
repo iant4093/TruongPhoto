@@ -86,7 +86,7 @@ export const SetupWizardView: React.FC = () => {
 
   if (!setupStatus) {
     return (
-      <div className="auth-viewport">
+      <div className="auth-viewport" data-tauri-drag-region>
         <div className="auth-shell">
           <div className="card card-body stack">
             <div className="view-loading" role="status">
@@ -242,7 +242,7 @@ export const SetupWizardView: React.FC = () => {
   };
 
   return (
-    <div className="auth-viewport">
+    <div className="auth-viewport" data-tauri-drag-region>
       <div className="auth-shell is-wide">
         <div className="auth-header">
           <img src="/app-icon.png" width={36} height={36} alt="" />

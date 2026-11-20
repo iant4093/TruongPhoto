@@ -620,3 +620,34 @@ pub async fn send_message(
         elapsed_ms,
     }))
 }
+
+#[derive(Debug, Serialize)]
+pub struct ChatWarmupResponse {
+    pub active_chat_tier: ChatTier,
+    pub loaded: bool,
+    pub warming: bool,
+}
+
+/// `POST /api/chat/warmup` — triggers non-blocking background warmup of the active local chat LLM.
+pub async fn warmup_chat(
+    _auth: AuthSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ChatWarmupResponse>, AppError> {
+    let ai_state = state.db.read(repo::ai::get_ai_index_state).await?;
+    let active_tier = ai_state.active_chat_tier;
+    let pipeline = Arc::clone(state.ai.pipeline());
+    let already_loaded = pipeline.chat.is_loaded();
+
+    if active_tier != ChatTier::Tier0 && !already_loaded {
+        let pipe_bg = Arc::clone(&pipeline);
+        tokio::task::spawn_blocking(move || {
+            let _ = pipe_bg.chat.warmup(active_tier);
+        });
+    }
+
+    Ok(Json(ChatWarmupResponse {
+        active_chat_tier: active_tier,
+        loaded: already_loaded,
+        warming: active_tier != ChatTier::Tier0 && !already_loaded,
+    }))
+}

@@ -10,6 +10,7 @@ import { formatDateTime, plural } from '../../lib/format';
 import { confirmAction, notifyError, notifySuccess } from '../../store/feedback';
 import { errorMessage, useAppStore } from '../../store/useAppStore';
 import type { AssetSummary } from '../../types/api';
+import { openContextMenu } from '../ContextMenu';
 import { EmptyState, Thumb, ViewHeader } from '../ui';
 
 const MS_PER_DAY = 86_400_000;
@@ -260,6 +261,60 @@ export const TrashView: React.FC = () => {
                   position: 'relative',
                   outline: isSelected ? '2px solid #e5e5e5' : undefined,
                   outlineOffset: isSelected ? -2 : undefined,
+                }}
+                onContextMenu={(e) => {
+                  const entries = [];
+                  if (canRestore) {
+                    entries.push({
+                      id: 'trash-restore',
+                      label: 'Restore to Library',
+                      icon: <RotateCcw size={14} />,
+                      onSelect: async () => {
+                        setBusy(true);
+                        try {
+                          await restoreTrashAssets([asset.id]);
+                          notifySuccess('Restored item to library');
+                          bumpLibraryRevision();
+                          await load();
+                        } catch (err) {
+                          notifyError(err, 'Could not restore item');
+                        } finally {
+                          setBusy(false);
+                        }
+                      },
+                    });
+                  }
+                  if (isAdmin) {
+                    if (entries.length > 0) {
+                      entries.push({ type: 'separator' as const, id: 'trash-sep' });
+                    }
+                    entries.push({
+                      id: 'trash-purge',
+                      label: 'Delete Permanently',
+                      icon: <Trash2 size={14} />,
+                      danger: true,
+                      onSelect: async () => {
+                        const ok = await confirmAction(
+                          'Permanently delete this item?',
+                          'Delete Permanently',
+                          describePurgeScope([asset]),
+                        );
+                        if (!ok) return;
+                        setBusy(true);
+                        try {
+                          await purgeTrashAssets({ asset_ids: [asset.id] });
+                          notifySuccess('Permanently deleted item');
+                          bumpLibraryRevision();
+                          await load();
+                        } catch (err) {
+                          notifyError(err, 'Could not purge item');
+                        } finally {
+                          setBusy(false);
+                        }
+                      },
+                    });
+                  }
+                  if (entries.length > 0) openContextMenu(e, entries);
                 }}
               >
                 <div style={{ position: 'relative' }}>

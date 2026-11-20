@@ -356,6 +356,10 @@ impl ChatRouterBackend for SidecarLlamaRouter {
     fn is_loaded(&self) -> bool {
         self.process.lock().is_some()
     }
+
+    fn warmup(&self, tier: ChatTier) -> bool {
+        matches!(self.ensure_server_port(tier), Ok(Some(_)))
+    }
 }
 
 #[derive(Debug, Deserialize)]

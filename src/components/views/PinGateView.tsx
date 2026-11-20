@@ -99,7 +99,7 @@ export const PinGateView: React.FC = () => {
   };
 
   return (
-    <div className="auth-viewport">
+    <div className="auth-viewport" data-tauri-drag-region>
       <div className="auth-shell">
         <div className="auth-header">
           <img src="/app-icon.png" width={36} height={36} alt="" />

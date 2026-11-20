@@ -18,6 +18,7 @@ import type {
   BackupResult,
   ChatSessionSummary,
   ChatSessionWithMessagesResponse,
+  ChatWarmupResponse,
   ClusterFacesResponse,
   CreateAdminUserRequest,
   CreateAlbumRequest,
@@ -57,6 +58,7 @@ import type {
   UpdateAdminUserRequest,
   UpdateAiSettingsRequest,
   UpdateAlbumRequest,
+  UpdateCheckResponse,
   UpdateFolderRequest,
   UpdateOverridesRequest,
   UpdatePersonRequest,
@@ -751,6 +753,16 @@ export const setAiChatTier = (req: SetChatTierRequest): Promise<AiIndexStateView
   request<AiIndexStateView>('/api/admin/ai/chat-tier', {
     method: 'POST',
     body: JSON.stringify(req),
+  });
+
+export const warmupChat = (): Promise<ChatWarmupResponse> =>
+  request<ChatWarmupResponse>('/api/chat/warmup', {
+    method: 'POST',
+  });
+
+export const checkForUpdates = (): Promise<UpdateCheckResponse> =>
+  request<UpdateCheckResponse>('/api/admin/updates/check', {
+    method: 'GET',
   });
 
 export const getMapConfig = (): Promise<MapConfigResponse> =>

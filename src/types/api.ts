@@ -16,7 +16,15 @@ export type ChatTier = 'tier0' | 'tier1' | 'tier2' | 'tier3';
 
 export type MapTileMode = 'offline_pmtiles' | 'online_openfreemap';
 
-export type NavTab = 'timeline' | 'people' | 'albums' | 'favorites' | 'map' | 'trash' | 'settings';
+export type NavTab =
+  | 'timeline'
+  | 'chat'
+  | 'people'
+  | 'albums'
+  | 'favorites'
+  | 'map'
+  | 'trash'
+  | 'settings';
 
 export type ApiErrorCode =
   | 'UNAUTHORIZED'
@@ -906,4 +914,25 @@ export interface BackupListResponse {
   backup_dir: string;
   interval_hours: number;
   keep_count: number;
+}
+
+export interface ChatWarmupResponse {
+  active_chat_tier: ChatTier;
+  loaded: boolean;
+  warming: boolean;
+}
+
+export interface UpdateCheckResponse {
+  status: 'up_to_date' | 'update_available' | 'no_releases' | 'offline';
+  current_version: string;
+  latest_version: string | null;
+  update_available: boolean;
+  release_name: string | null;
+  release_notes: string | null;
+  published_at: string | null;
+  release_url: string;
+  download_url: string | null;
+  asset_name: string | null;
+  repo: string;
+  message: string | null;
 }

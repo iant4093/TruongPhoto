@@ -6,6 +6,7 @@ import {
   Copy,
   DatabaseBackup,
   Download,
+  ExternalLink,
   FolderOpen,
   FolderPlus,
   LogOut,
@@ -15,6 +16,7 @@ import {
   UserPlus,
 } from 'lucide-react';
 import {
+  checkForUpdates,
   createAdminUser,
   createFolder,
   deleteAdminUser,
@@ -53,6 +55,7 @@ import type {
   MapTileMode,
   Role,
   TailscaleStatus,
+  UpdateCheckResponse,
 } from '../../types/api';
 import { AiModelsPanel } from '../AiModelsPanel';
 import { Dropdown } from '../Dropdown';
@@ -129,6 +132,7 @@ export const SettingsView: React.FC = () => {
   // Desktop / Network / Tailscale state
   const [autostartEnabled, setAutostartState] = useState(false);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [updateResult, setUpdateResult] = useState<UpdateCheckResponse | null>(null);
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
   const [tailscaleStatus, setTailscaleStatus] = useState<TailscaleStatus | null>(
     storeTailscaleStatus,
@@ -536,11 +540,18 @@ export const SettingsView: React.FC = () => {
   const handleCheckUpdates = async () => {
     setCheckingUpdates(true);
     try {
-      const result = await checkUpdateFeed();
-      if (result.available) {
-        notifySuccess(`Update ${result.version ?? ''} is available`.trim());
-      } else {
-        notifyInfo('TruongPhoto is up to date.');
+      const ghResult = await checkForUpdates();
+      setUpdateResult(ghResult);
+      if (ghResult.update_available && ghResult.latest_version) {
+        notifySuccess(`Update v${ghResult.latest_version} is available on GitHub Releases.`);
+      } else if (ghResult.status === 'up_to_date') {
+        notifyInfo(`TruongPhoto v${ghResult.current_version} is up to date.`);
+      } else if (ghResult.message) {
+        notifyInfo(ghResult.message);
+      }
+      // Also ping Tauri's native updater feed silently if available.
+      if (isTauri()) {
+        void checkUpdateFeed().catch(() => {});
       }
     } catch (err) {
       notifyError(err, 'Update check failed');
@@ -1139,6 +1150,96 @@ export const SettingsView: React.FC = () => {
             </form>
           </div>
 
+          <SectionTitle>App Updates</SectionTitle>
+          <div className="card card-body stack">
+            <div
+              className="row"
+              style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}
+            >
+              <div>
+                <div className="row" style={{ gap: 8 }}>
+                  <strong style={{ fontSize: 13 }}>GitHub Releases</strong>
+                  <Badge tone="muted">
+                    v{updateResult?.current_version ?? systemInfo?.version ?? '0.1.0'}
+                  </Badge>
+                  {updateResult?.status === 'update_available' && updateResult.latest_version && (
+                    <Badge tone="ok">v{updateResult.latest_version} available</Badge>
+                  )}
+                  {updateResult?.status === 'up_to_date' && <Badge tone="ok">Up to date</Badge>}
+                  {updateResult?.status === 'no_releases' && (
+                    <Badge tone="muted">No releases yet</Badge>
+                  )}
+                  {updateResult?.status === 'offline' && <Badge tone="warn">Offline</Badge>}
+                </div>
+                <div className="view-subtitle" style={{ marginTop: 2 }}>
+                  Pulls the latest macOS &amp; Windows installers directly from{' '}
+                  <code>iant4093/TruongPhoto</code> on GitHub.
+                </div>
+              </div>
+
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="button button-primary"
+                  disabled={checkingUpdates}
+                  onClick={() => void handleCheckUpdates()}
+                >
+                  <RefreshCw size={14} className={checkingUpdates ? 'spin-icon' : undefined} />
+                  <span>{checkingUpdates ? 'Checking…' : 'Check for Updates'}</span>
+                </button>
+                <button
+                  type="button"
+                  className="button"
+                  onClick={() =>
+                    void openExternalUrl(
+                      updateResult?.release_url ??
+                        'https://github.com/iant4093/TruongPhoto/releases',
+                    )
+                  }
+                >
+                  <ExternalLink size={14} />
+                  <span>Releases</span>
+                </button>
+              </div>
+            </div>
+
+            {updateResult && (
+              <div className="update-result-box" role="status">
+                {updateResult.update_available ? (
+                  <div className="stack" style={{ gap: 8 }}>
+                    <div
+                      className="row"
+                      style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}
+                    >
+                      <strong style={{ fontSize: 13 }}>
+                        {updateResult.release_name || `TruongPhoto v${updateResult.latest_version}`}
+                      </strong>
+                      {updateResult.download_url && (
+                        <button
+                          type="button"
+                          className="button button-primary"
+                          onClick={() => void openExternalUrl(updateResult.download_url!)}
+                        >
+                          <Download size={14} />
+                          <span>
+                            Download {updateResult.asset_name ? updateResult.asset_name : 'Update'}
+                          </span>
+                        </button>
+                      )}
+                    </div>
+                    {updateResult.release_notes && (
+                      <pre className="update-release-notes">{updateResult.release_notes}</pre>
+                    )}
+                  </div>
+                ) : (
+                  <div className="view-subtitle" style={{ marginTop: 0 }}>
+                    {updateResult.message || 'You are running the latest release.'}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           <SectionTitle>Network &amp; Desktop</SectionTitle>
           <div className="card card-body stack">
             <div>
@@ -1207,25 +1308,12 @@ export const SettingsView: React.FC = () => {
               />
 
               {isTauri() && (
-                <>
-                  <ToggleRow
-                    label="Launch at Login"
-                    description="Start TruongPhoto automatically in the menu bar / system tray."
-                    checked={autostartEnabled}
-                    onChange={(next) => void handleToggleAutostart(next)}
-                  />
-                  <div className="row" style={{ justifyContent: 'flex-end' }}>
-                    <button
-                      type="button"
-                      className="button"
-                      disabled={checkingUpdates}
-                      onClick={() => void handleCheckUpdates()}
-                    >
-                      <RefreshCw size={14} />
-                      {checkingUpdates ? 'Checking…' : 'Check for Updates'}
-                    </button>
-                  </div>
-                </>
+                <ToggleRow
+                  label="Launch at Login"
+                  description="Start TruongPhoto automatically in the menu bar / system tray."
+                  checked={autostartEnabled}
+                  onChange={(next) => void handleToggleAutostart(next)}
+                />
               )}
             </div>
 
@@ -1410,20 +1498,20 @@ export const SettingsView: React.FC = () => {
                   onChange={(e) => setBackupKeepCount(e.target.value)}
                 />
               </label>
-              <label className="settings-field" style={{ flex: '0 0 155px' }}>
+              <div className="settings-field" style={{ flex: '0 0 155px' }}>
                 <span>Backup Interval</span>
-                <select
-                  className="text-input"
-                  aria-label="Backup Interval"
+                <Dropdown
+                  label="Backup Interval"
                   value={backupIntervalHours}
-                  onChange={(e) => void handleBackupIntervalChange(e.target.value)}
-                >
-                  <option value="0">Manual (0h)</option>
-                  <option value="6">6h</option>
-                  <option value="24">24h</option>
-                  <option value="168">Weekly (168h)</option>
-                </select>
-              </label>
+                  options={[
+                    ['0', 'Manual (0h)'],
+                    ['6', '6h'],
+                    ['24', '24h'],
+                    ['168', 'Weekly (168h)'],
+                  ]}
+                  onChange={(val) => void handleBackupIntervalChange(val)}
+                />
+              </div>
             </div>
 
             <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>

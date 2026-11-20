@@ -487,7 +487,10 @@ describe('SettingsView Phase 4 Tailscale, Backups & Throttling RBAC', () => {
     expect(within(table).getByText('library-20261119T100000Z.db')).toBeTruthy();
 
     await act(async () => {
-      fireEvent.change(screen.getByLabelText('Backup Interval'), { target: { value: '168' } });
+      fireEvent.click(screen.getByRole('combobox', { name: 'Backup Interval' }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('option', { name: 'Weekly (168h)' }));
     });
     expect(
       calls.some(

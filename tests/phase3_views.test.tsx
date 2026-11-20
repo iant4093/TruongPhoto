@@ -494,7 +494,7 @@ describe('ChatDrawer & App Ask AI shell integration', () => {
     expect(useAppStore.getState().chatDrawerOpen).toBe(false);
   });
 
-  it('mounts Ask AI button in workspace header for Viewer and toggles ChatDrawer with Cmd/Ctrl+K', async () => {
+  it('mounts dedicated Ask AI section for Viewer and toggles Ask AI view with Cmd/Ctrl+K', async () => {
     const authStatus: AuthStatusResponse = {
       initialized: true,
       authenticated: true,
@@ -515,34 +515,38 @@ describe('ChatDrawer & App Ask AI shell integration', () => {
         if (url.startsWith('/api/assets/buckets')) return jsonResponse({ buckets: [] });
         if (url.startsWith('/api/assets')) return jsonResponse({ items: [], next_cursor: null, total_count: 0 });
         if (url === '/api/chat/sessions') return jsonResponse({ items: [] });
+        if (url === '/api/chat/warmup')
+          return jsonResponse({ active_chat_tier: 'tier0', loaded: false, warming: false });
+        if (url === '/api/admin/ai/models') return jsonResponse({ error: { code: 'FORBIDDEN', message: 'Admin only' } }, 403);
         throw new Error(`Unexpected fetch: ${url}`);
       }),
     );
 
     render(<App />);
 
-    const askBtn = await screen.findByRole('button', { name: /Ask AI/i });
-    expect(askBtn).toBeTruthy();
+    const askBtns = await screen.findAllByRole('button', { name: /Ask AI/i });
+    expect(askBtns.length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByRole('button', { name: 'Upload' })).toBeNull();
-    expect(useAppStore.getState().chatDrawerOpen).toBe(false);
+    expect(useAppStore.getState().activeNav).toBe('timeline');
 
-    // Click Ask AI button opens ChatDrawer
+    // Click Ask AI nav opens full dedicated Ask AI workspace (and hides irrelevant photo Inspector)
     await act(async () => {
-      fireEvent.click(askBtn);
+      fireEvent.click(askBtns[0]);
     });
-    expect(useAppStore.getState().chatDrawerOpen).toBe(true);
+    expect(useAppStore.getState().activeNav).toBe('chat');
     expect(await screen.findByLabelText('Ask AI prompt')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Inspector/i })).toBeNull();
 
-    // Cmd/Ctrl+K toggles ChatDrawer closed and back open
+    // Cmd/Ctrl+K toggles back to timeline and back to Ask AI
     await act(async () => {
       fireEvent.keyDown(document, { key: 'k', metaKey: true });
     });
-    expect(useAppStore.getState().chatDrawerOpen).toBe(false);
+    expect(useAppStore.getState().activeNav).toBe('timeline');
 
     await act(async () => {
       fireEvent.keyDown(document, { key: 'k', ctrlKey: true });
     });
-    expect(useAppStore.getState().chatDrawerOpen).toBe(true);
+    expect(useAppStore.getState().activeNav).toBe('chat');
   });
 });
 

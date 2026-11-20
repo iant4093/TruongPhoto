@@ -741,7 +741,10 @@ describe('AiModelsPanel & SettingsView RBAC', () => {
 
     // Idle unload timeout selector
     await act(async () => {
-      fireEvent.change(screen.getByLabelText('Idle Memory Unload'), { target: { value: '900' } });
+      fireEvent.click(screen.getByRole('combobox', { name: 'Idle Memory Unload' }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('option', { name: '15m' }));
     });
     expect(
       calls.some(

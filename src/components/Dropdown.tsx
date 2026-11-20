@@ -12,6 +12,7 @@ export function Dropdown<T extends string | number>({
   onChange,
   placeholder = 'Select…',
   className = '',
+  disabled = false,
 }: {
   label: string;
   value: T;
@@ -19,6 +20,7 @@ export function Dropdown<T extends string | number>({
   onChange: (value: T) => void;
   placeholder?: string;
   className?: string;
+  disabled?: boolean;
 }) {
   const id = useId();
   const trigger = useRef<HTMLButtonElement>(null);
@@ -153,7 +155,7 @@ export function Dropdown<T extends string | number>({
         aria-expanded={open}
         aria-controls={open ? id : undefined}
         aria-activedescendant={open && options[active] ? `${id}-${active}` : undefined}
-        disabled={options.length === 0}
+        disabled={disabled || options.length === 0}
         onClick={() => {
           setActive(Math.max(0, selected));
           search.current = { prefix: '', time: 0 };

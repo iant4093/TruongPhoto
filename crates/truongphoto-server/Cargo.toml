@@ -36,6 +36,7 @@ notify.workspace = true
 notify-debouncer-mini.workspace = true
 parking_lot.workspace = true
 qrcode = { workspace = true }
+reqwest = { workspace = true }
 roaring.workspace = true
 rust-embed.workspace = true
 serde.workspace = true

@@ -106,6 +106,7 @@ export interface AppState {
   chatMessages: ChatMessageView[];
   chatActiveFilters: RouterPlan | null;
   chatSending: boolean;
+  chatPendingStartedAt: number | null;
   chatLastReranked: boolean;
 
   setActiveNav: (nav: NavTab) => void;
@@ -201,6 +202,7 @@ const initialDataState = {
   chatMessages: [] as ChatMessageView[],
   chatActiveFilters: null as RouterPlan | null,
   chatSending: false,
+  chatPendingStartedAt: null as number | null,
   chatLastReranked: false,
 };
 
@@ -255,7 +257,16 @@ export const useAppStore = create<AppState>((set, get) => {
   return {
     ...initialDataState,
 
-    setActiveNav: (nav) => set({ activeNav: nav }),
+    setActiveNav: (nav) =>
+      set((s) => {
+        const supportsInspector =
+          nav === 'timeline' || nav === 'people' || nav === 'albums' || nav === 'favorites';
+        return {
+          activeNav: nav,
+          inspectorOpen: supportsInspector ? s.inspectorOpen : false,
+          ...(nav === 'chat' ? { chatDrawerOpen: false } : {}),
+        };
+      }),
     toggleInspector: () =>
       set((s) => ({
         inspectorOpen: !s.inspectorOpen,
@@ -420,7 +431,27 @@ export const useAppStore = create<AppState>((set, get) => {
 
     sendChatPrompt: async (content, limit) => {
       const seq = chatSeq;
-      set({ chatSending: true });
+      const nowMs = Date.now();
+      const optimisticId = `optimistic-user-${nowMs}`;
+      const optimisticUserMsg: ChatMessageView = {
+        id: optimisticId,
+        session_id: get().activeChatSessionId ?? 'pending',
+        role: 'user',
+        content,
+        plan: null,
+        hits: [],
+        reranked: false,
+        planner_mode: null,
+        elapsed_ms: null,
+        created_at_ms: nowMs,
+      };
+
+      set((state) => ({
+        chatSending: true,
+        chatPendingStartedAt: nowMs,
+        chatMessages: [...state.chatMessages, optimisticUserMsg],
+      }));
+
       try {
         let sessionId = get().activeChatSessionId;
         if (!sessionId) {
@@ -433,7 +464,9 @@ export const useAppStore = create<AppState>((set, get) => {
           set((state) => ({
             chatSessions: [created, ...state.chatSessions.filter((s) => s.id !== created.id)],
             activeChatSessionId: created.id,
-            chatMessages: [],
+            chatMessages: state.chatMessages.map((m) =>
+              m.id === optimisticId ? { ...m, session_id: created.id } : m,
+            ),
             chatActiveFilters: null,
             chatLastReranked: false,
           }));
@@ -442,10 +475,15 @@ export const useAppStore = create<AppState>((set, get) => {
         const res = await sendChatMessage(sessionId, content, limit);
         if (seq === chatSeq) {
           set((state) => ({
-            chatMessages: [...state.chatMessages, res.user_message, res.assistant_message],
+            chatMessages: [
+              ...state.chatMessages.filter((m) => m.id !== optimisticId),
+              res.user_message,
+              res.assistant_message,
+            ],
             chatActiveFilters: res.active_filters,
             chatLastReranked: res.reranked,
             chatSending: false,
+            chatPendingStartedAt: null,
             chatSessions: state.chatSessions.map((s) =>
               s.id === sessionId
                 ? { ...s, updated_at_ms: res.assistant_message.created_at_ms }
@@ -456,7 +494,11 @@ export const useAppStore = create<AppState>((set, get) => {
         return res;
       } catch (err) {
         if (seq === chatSeq) {
-          set({ chatSending: false });
+          set((state) => ({
+            chatMessages: state.chatMessages.filter((m) => m.id !== optimisticId),
+            chatSending: false,
+            chatPendingStartedAt: null,
+          }));
         }
         throw err;
       }

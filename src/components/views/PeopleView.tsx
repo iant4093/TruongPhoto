@@ -24,6 +24,8 @@ import { plural } from '../../lib/format';
 import { notifyError, notifySuccess } from '../../store/feedback';
 import { errorMessage, useAppStore } from '../../store/useAppStore';
 import type { AssetSummary, PersonSummary } from '../../types/api';
+import { openContextMenu } from '../ContextMenu';
+import { Dropdown } from '../Dropdown';
 import { JustifiedTimeline } from '../JustifiedTimeline';
 import { Badge, EmptyState, ViewHeader } from '../ui';
 
@@ -479,25 +481,21 @@ export const PeopleView: React.FC = () => {
             </span>
 
             {mergeSelectedIds.length >= 2 && (
-              <label className="row" style={{ gap: 6, fontSize: 12 }}>
+              <div className="row" style={{ gap: 6, fontSize: 12 }}>
                 <span className="workspace-label">Merge into:</span>
-                <select
-                  aria-label="Target person"
-                  className="text-input"
-                  style={{ width: 'auto', minHeight: 30, padding: '4px 8px' }}
+                <Dropdown
+                  label="Target person"
                   value={mergeTargetId}
-                  onChange={(e) => setMergeTargetId(e.target.value)}
-                >
-                  {mergeSelectedIds.map((id) => {
+                  options={mergeSelectedIds.map((id) => {
                     const p = items.find((item) => item.id === id);
-                    return (
-                      <option key={id} value={id}>
-                        {p?.name || 'Unnamed'} ({plural(p?.face_count ?? 0, 'face')})
-                      </option>
-                    );
+                    return [
+                      id,
+                      `${p?.name || 'Unnamed'} (${plural(p?.face_count ?? 0, 'face')})`,
+                    ] as const;
                   })}
-                </select>
-              </label>
+                  onChange={(val) => setMergeTargetId(val)}
+                />
+              </div>
             )}
           </div>
 
@@ -551,6 +549,62 @@ export const PeopleView: React.FC = () => {
                     setSelectedPersonId(person.id);
                   }
                 }}
+                onContextMenu={(e) =>
+                  openContextMenu(e, [
+                    {
+                      id: 'person-open',
+                      label: 'View Photos',
+                      icon: <Eye size={14} />,
+                      onSelect: () => setSelectedPersonId(person.id),
+                    },
+                    ...(isAdmin
+                      ? [
+                          {
+                            id: 'person-rename',
+                            label: 'Rename Person',
+                            icon: <Pencil size={14} />,
+                            onSelect: () => {
+                              setRenamingId(person.id);
+                              setRenameText(person.name || '');
+                            },
+                          },
+                          {
+                            id: 'person-pin',
+                            label: person.is_pinned ? 'Unpin Person' : 'Pin to Top',
+                            icon: <Pin size={14} />,
+                            onSelect: async () => {
+                              try {
+                                const updated = await updatePerson(person.id, {
+                                  is_pinned: !person.is_pinned,
+                                });
+                                handlePersonUpdated(updated);
+                              } catch (err) {
+                                notifyError(err, 'Could not update person');
+                              }
+                            },
+                          },
+                          {
+                            id: 'person-hide',
+                            label: person.is_hidden ? 'Unhide Person' : 'Hide Person',
+                            icon: person.is_hidden ? <Eye size={14} /> : <EyeOff size={14} />,
+                            onSelect: async () => {
+                              try {
+                                const updated = await updatePerson(person.id, {
+                                  is_hidden: !person.is_hidden,
+                                });
+                                handlePersonUpdated(updated);
+                                if (!showHidden && updated.is_hidden) {
+                                  setItems((prev) => prev.filter((p) => p.id !== updated.id));
+                                }
+                              } catch (err) {
+                                notifyError(err, 'Could not update person');
+                              }
+                            },
+                          },
+                        ]
+                      : []),
+                  ])
+                }
                 onKeyDown={(e) => {
                   if (e.target !== e.currentTarget) return;
                   if (e.key === 'Enter' || e.key === ' ') {
