@@ -627,6 +627,16 @@ pub fn get_asset_detail(
     scope: &RbacScope,
     asset_id: &str,
 ) -> DbResult<Option<AssetDetail>> {
+    get_asset_detail_for_user(conn, scope, asset_id, None)
+}
+
+/// Fetches full asset detail scoped by `scope`, filtering `album_ids` to albums accessible by `caller`.
+pub fn get_asset_detail_for_user(
+    conn: &Connection,
+    scope: &RbacScope,
+    asset_id: &str,
+    caller: Option<(&str, truongphoto_core::Role)>,
+) -> DbResult<Option<AssetDetail>> {
     let mut params: Vec<Value> = vec![Value::Text(asset_id.to_string())];
     let rbac_clause = rbac_sql::folder_clause("v", scope, &mut params);
     let sql = format!(
@@ -652,15 +662,40 @@ pub fn get_asset_detail(
     let tags = tags::list_active_tags(conn, asset_id)?;
     let histogram = load_histogram(conn, asset_id)?;
 
-    let mut album_stmt = conn.prepare(
-        "SELECT album_id
-         FROM album_assets
-         WHERE asset_id = ?1
-         ORDER BY added_at_ms ASC, album_id ASC",
-    )?;
-    let album_ids = album_stmt
-        .query_map(params![asset_id], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let album_ids = match caller {
+        Some((user_id, role)) if role != truongphoto_core::Role::Admin => {
+            let mut album_stmt = conn.prepare(
+                "SELECT aa.album_id
+                 FROM album_assets aa
+                 JOIN albums al ON al.id = aa.album_id
+                 WHERE aa.asset_id = ?1
+                   AND (
+                       al.owner_user_id = ?2
+                       OR EXISTS (
+                           SELECT 1 FROM album_shares s
+                           WHERE s.album_id = al.id AND s.shared_with_user_id = ?2
+                       )
+                   )
+                 ORDER BY aa.added_at_ms ASC, aa.album_id ASC",
+            )?;
+            let ids = album_stmt
+                .query_map(params![asset_id, user_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids
+        }
+        _ => {
+            let mut album_stmt = conn.prepare(
+                "SELECT album_id
+                 FROM album_assets
+                 WHERE asset_id = ?1
+                 ORDER BY added_at_ms ASC, album_id ASC",
+            )?;
+            let ids = album_stmt
+                .query_map(params![asset_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids
+        }
+    };
 
     let playback = build_playback_info(asset_id, summary.kind, &files, video_meta.as_ref());
 

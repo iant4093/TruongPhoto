@@ -735,6 +735,10 @@ describe('AiModelsPanel & SettingsView RBAC', () => {
     await act(async () => {
       fireEvent.click(within(largeCard).getByRole('button', { name: 'Delete' }));
     });
+    const confirmBtn = await screen.findByRole('button', { name: 'Remove Model' });
+    await act(async () => {
+      fireEvent.click(confirmBtn);
+    });
     expect(
       calls.some((c) => c.url === '/api/admin/ai/models/siglip2-large' && c.method === 'DELETE'),
     ).toBe(true);

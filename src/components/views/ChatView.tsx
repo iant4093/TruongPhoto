@@ -12,10 +12,27 @@ import {
   X,
 } from 'lucide-react';
 import { mediaOriginalUrl, mediaThumbUrl, warmupChat } from '../../lib/api';
+import { isTauri } from '../../lib/tauri';
 import { notifyError, notifySuccess } from '../../store/feedback';
 import { useAppStore } from '../../store/useAppStore';
 import type { AssetKind, ChatTier, RouterPlan } from '../../types/api';
 import { openContextMenu } from '../ContextMenu';
+import { WindowsCaptionButtons, isWindowsPlatform } from '../WindowControls';
+
+const nativeMacTitlebar =
+  typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
+const windowsCaption = !nativeMacTitlebar && isWindowsPlatform();
+
+const SORT_LABELS: Record<string, string> = {
+  capture_desc: 'Newest first',
+  capture_asc: 'Oldest first',
+  focal_asc: 'Widest angle first',
+  focal_desc: 'Most zoomed first',
+  iso_desc: 'Highest ISO first',
+  aperture_asc: 'Widest aperture first',
+  shutter_asc: 'Fastest shutter first',
+  shutter_desc: 'Longest exposure first',
+};
 
 const CHAT_TIER_LABELS: Record<ChatTier, string> = {
   tier0: 'Classic Search',
@@ -165,6 +182,14 @@ function buildFilterChips(plan: RouterPlan | null): string[] {
       chips.push(`Orientation: ${o.charAt(0).toUpperCase()}${o.slice(1)}`);
     }
   }
+  if (plan.has_people === false) {
+    chips.push('People: None');
+  } else if (plan.has_people === true) {
+    chips.push('People: Present');
+  }
+  if (plan.sort_by && SORT_LABELS[plan.sort_by]) {
+    chips.push(`Sort: ${SORT_LABELS[plan.sort_by]}`);
+  }
   for (const tag of plan.tags ?? []) {
     if (tag.trim()) {
       chips.push(`Tag: ${tag.trim()}`);
@@ -197,6 +222,7 @@ export const ChatView: React.FC = () => {
   const chatSessions = useAppStore((s) => s.chatSessions);
   const activeChatSessionId = useAppStore((s) => s.activeChatSessionId);
   const chatMessages = useAppStore((s) => s.chatMessages);
+  const user = useAppStore((s) => s.user);
   const chatSending = useAppStore((s) => s.chatSending);
   const chatPendingStartedAt = useAppStore((s) => s.chatPendingStartedAt);
   const aiDashboard = useAppStore((s) => s.aiDashboard);
@@ -216,29 +242,42 @@ export const ChatView: React.FC = () => {
   );
   const [thinkingSecs, setThinkingSecs] = useState(0);
   const [warmingModel, setWarmingModel] = useState(false);
+  const [warmupTier, setWarmupTier] = useState<ChatTier | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const activeTier: ChatTier = aiDashboard?.state.active_chat_tier ?? 'tier0';
+  const activeTier: ChatTier = aiDashboard?.state.active_chat_tier ?? warmupTier ?? 'tier0';
   const tierLabel = CHAT_TIER_LABELS[activeTier];
   const activeSession = chatSessions.find((s) => s.id === activeChatSessionId) ?? null;
 
-  // Load sessions, AI model state, and pre-warm Gemma 4 on GPU when entering Ask AI.
+  // Load sessions, AI model state, and pre-warm Gemma 4 on GPU once when entering Ask AI.
   useEffect(() => {
+    let active = true;
+    let warmTimer: number | null = null;
     void loadChatSessions().catch(() => {});
-    if (!aiDashboard) {
+    if (user?.role === 'admin' && !useAppStore.getState().aiDashboard) {
       void refreshAiDashboard().catch(() => {});
     }
     void warmupChat()
       .then((res) => {
+        if (!active) return;
+        if (res.active_chat_tier) {
+          setWarmupTier(res.active_chat_tier);
+        }
         if (res.warming) {
           setWarmingModel(true);
-          window.setTimeout(() => setWarmingModel(false), 8000);
+          warmTimer = window.setTimeout(() => {
+            if (active) setWarmingModel(false);
+          }, 8000);
         }
       })
       .catch(() => {});
-  }, [aiDashboard, loadChatSessions, refreshAiDashboard]);
+    return () => {
+      active = false;
+      if (warmTimer !== null) window.clearTimeout(warmTimer);
+    };
+  }, [loadChatSessions, refreshAiDashboard, user?.role]);
 
   // Live elapsed timer for the animated thinking bubble.
   useEffect(() => {
@@ -465,6 +504,7 @@ export const ChatView: React.FC = () => {
               <Plus size={14} />
               <span>New Chat</span>
             </button>
+            {isTauri() && windowsCaption && <WindowsCaptionButtons />}
           </div>
         </div>
 

@@ -275,15 +275,27 @@ export const MapView: React.FC = () => {
     void loadInitialMap();
   }, [clusters, loadInitialMap]);
 
-  // Initialize MapLibre GL JS only when WebGL is supported
+  const mapTileMode = config?.tile_mode ?? null;
+  const mapPmtilesUrl = config?.pmtiles_url ?? null;
+  const mapOnlineStyleUrl = config?.online_style_url ?? null;
+
+  // Initialize MapLibre GL JS only when WebGL is supported or map style source actually changes
   useEffect(() => {
-    if (!webglAvailable || !config || !mapContainerRef.current) return;
+    if (!webglAvailable || !mapTileMode || !mapOnlineStyleUrl || !mapContainerRef.current) return;
 
     ensurePmtilesProtocol();
 
+    const styleConfig: MapConfigResponse = {
+      tile_mode: mapTileMode,
+      available_pmtiles: [],
+      pmtiles_url: mapPmtilesUrl,
+      online_style_url: mapOnlineStyleUrl,
+      total_geotagged: 0,
+    };
+
     const map = new MapLibreMap({
       container: mapContainerRef.current,
-      style: buildMapStyle(config),
+      style: buildMapStyle(styleConfig),
       center: [0, 20],
       zoom: 2,
       attributionControl: false,
@@ -320,7 +332,7 @@ export const MapView: React.FC = () => {
       map.remove();
       mapInstanceRef.current = null;
     };
-  }, [webglAvailable, config]);
+  }, [webglAvailable, mapTileMode, mapPmtilesUrl, mapOnlineStyleUrl]);
 
   // Sync Codex DOM cluster markers onto MapLibre map
   useEffect(() => {

@@ -357,7 +357,8 @@ struct ExistingAlbumRow {
     created_at_ms: i64,
 }
 
-/// Updates mutable fields on an album (`title`, `description`, `cover_asset_id`, `sort_order`).
+/// Updates mutable fields on an album (`title`, `description`, `cover_asset_id`, `sort_order`),
+/// enforcing `scope` on cover asset validation and returned cover/counts.
 pub fn update_album(
     conn: &Connection,
     album_id: &str,
@@ -365,6 +366,7 @@ pub fn update_album(
     description: Option<&str>,
     cover_asset_id: Option<&str>,
     sort_order: Option<AlbumSortOrder>,
+    scope: &RbacScope,
 ) -> DbResult<Option<AlbumSummary>> {
     let existing: Option<ExistingAlbumRow> = conn
         .query_row(
@@ -428,12 +430,13 @@ pub fn update_album(
             if trimmed.is_empty() {
                 None
             } else {
+                let mut cover_params: Vec<Value> = vec![Value::Text(trimmed.to_string())];
+                let rbac_clause = rbac_sql::folder_clause("a", scope, &mut cover_params);
+                let cover_sql = format!(
+                    "SELECT 1 FROM assets a WHERE a.id = ?1 AND a.deleted_at_ms IS NULL AND a.is_hidden = 0 AND {rbac_clause}"
+                );
                 let exists: Option<i64> = conn
-                    .query_row(
-                        "SELECT 1 FROM assets WHERE id = ?1 AND deleted_at_ms IS NULL AND is_hidden = 0",
-                        params![trimmed],
-                        |row| row.get(0),
-                    )
+                    .query_row(&cover_sql, params_from_iter(cover_params), |row| row.get(0))
                     .optional()?;
                 if exists.is_none() {
                     return Err(DbError::NotFound(format!(
@@ -462,23 +465,45 @@ pub fn update_album(
         params![new_title, new_desc, new_cover, new_sort_order, ts, album_id],
     )?;
 
-    let asset_count: i64 = conn.query_row(
+    let mut count_params: Vec<Value> = vec![Value::Text(album_id.to_string())];
+    let count_rbac = rbac_sql::folder_clause("a", scope, &mut count_params);
+    let count_sql = format!(
         "SELECT COUNT(*)
          FROM album_assets aa
          JOIN assets a ON a.id = aa.asset_id
          WHERE aa.album_id = ?1
            AND a.deleted_at_ms IS NULL
-           AND a.is_hidden = 0",
-        params![album_id],
-        |row| row.get(0),
-    )?;
+           AND a.is_hidden = 0
+           AND {count_rbac}"
+    );
+    let asset_count: i64 =
+        conn.query_row(&count_sql, params_from_iter(count_params), |row| row.get(0))?;
+
+    let visible_cover = match new_cover.as_deref() {
+        Some(cid) => {
+            let mut vc_params: Vec<Value> = vec![Value::Text(cid.to_string())];
+            let vc_rbac = rbac_sql::folder_clause("a", scope, &mut vc_params);
+            let vc_sql = format!(
+                "SELECT 1 FROM assets a WHERE a.id = ?1 AND a.deleted_at_ms IS NULL AND a.is_hidden = 0 AND {vc_rbac}"
+            );
+            let ok: Option<i64> = conn
+                .query_row(&vc_sql, params_from_iter(vc_params), |row| row.get(0))
+                .optional()?;
+            if ok.is_some() {
+                Some(cid.to_string())
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
 
     Ok(Some(AlbumSummary {
         id: album_id.to_string(),
         owner_user_id,
         title: new_title,
         description: new_desc,
-        cover_asset_id: new_cover,
+        cover_asset_id: visible_cover,
         sort_order: new_sort_order,
         asset_count: u64::try_from(asset_count).unwrap_or(0),
         created_at_ms,
@@ -559,11 +584,12 @@ pub fn add_album_assets(
     })
 }
 
-/// Removes assets from an album and returns the number of removed rows.
+/// Removes RBAC-visible assets from an album and returns the number of removed rows.
 pub fn remove_album_assets(
     conn: &Connection,
     album_id: &str,
     asset_ids: &[String],
+    scope: &RbacScope,
 ) -> DbResult<usize> {
     if asset_ids.is_empty() {
         return Ok(0);
@@ -594,10 +620,14 @@ pub fn remove_album_assets(
         return Ok(0);
     }
 
+    let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
     let ts = now_ms();
     with_savepoint(conn, "remove_album_assets", || {
         let del_sql = format!(
-            "DELETE FROM album_assets WHERE album_id = ?1 AND asset_id IN ({})",
+            "DELETE FROM album_assets
+             WHERE album_id = ?1
+               AND asset_id IN ({})
+               AND EXISTS (SELECT 1 FROM assets a WHERE a.id = album_assets.asset_id AND {rbac_clause})",
             placeholders.join(", ")
         );
         let removed = conn.execute(&del_sql, params_from_iter(params))?;

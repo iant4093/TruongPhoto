@@ -2,6 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { Check, ChevronDown } from 'lucide-react';
+import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
 
 type Option<T> = readonly [value: T, label: string];
 
@@ -75,6 +76,7 @@ export function Dropdown<T extends string | number>({
 
   useEffect(() => {
     if (!open) return;
+    const layer = pushEscapeLayer();
     const dismiss = (event: Event) => {
       if (
         event.target instanceof Node &&
@@ -84,11 +86,22 @@ export function Dropdown<T extends string | number>({
         setOpen(false);
       }
     };
+    const onDocKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape' && isTopEscapeLayer(layer)) {
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(false);
+        trigger.current?.focus();
+      }
+    };
     document.addEventListener('pointerdown', dismiss);
     document.addEventListener('focusin', dismiss);
+    document.addEventListener('keydown', onDocKeyDown);
     return () => {
       document.removeEventListener('pointerdown', dismiss);
       document.removeEventListener('focusin', dismiss);
+      document.removeEventListener('keydown', onDocKeyDown);
+      popEscapeLayer(layer);
     };
   }, [open]);
 

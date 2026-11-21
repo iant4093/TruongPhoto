@@ -40,6 +40,7 @@ export const Lightbox: React.FC = () => {
   const lightboxInitialTimestampSec = useAppStore((s) => s.lightboxInitialTimestampSec);
   const closeLightbox = useAppStore((s) => s.closeLightbox);
   const setLightboxAsset = useAppStore((s) => s.setLightboxAsset);
+  const removeLightboxAsset = useAppStore((s) => s.removeLightboxAsset);
   const bumpLibraryRevision = useAppStore((s) => s.bumpLibraryRevision);
   const user = useAppStore((s) => s.user);
 
@@ -171,21 +172,16 @@ export const Lightbox: React.FC = () => {
 
   const handleMoveToTrash = useCallback(async () => {
     if (!canMutate || !lightboxAssetId) return;
+    const trashedId = lightboxAssetId;
     try {
-      await trashAssets([lightboxAssetId]);
+      await trashAssets([trashedId]);
       bumpLibraryRevision();
       notifySuccess('Moved item to Trash');
-      if (hasNext) {
-        goNext();
-      } else if (hasPrev) {
-        goPrev();
-      } else {
-        closeLightbox();
-      }
+      removeLightboxAsset(trashedId);
     } catch (err) {
       notifyError(err, 'Could not move item to Trash');
     }
-  }, [bumpLibraryRevision, canMutate, closeLightbox, goNext, goPrev, hasNext, hasPrev, lightboxAssetId]);
+  }, [bumpLibraryRevision, canMutate, lightboxAssetId, removeLightboxAsset]);
 
   const togglePixelPeepZoom = useCallback(() => {
     setZoom((prev) => {
@@ -698,8 +694,6 @@ export const Lightbox: React.FC = () => {
               type="button"
               className={`lightbox-live-badge${livePlaying ? ' is-playing' : ''}`}
               aria-pressed={livePlaying}
-              onMouseEnter={() => setLivePlaying(true)}
-              onMouseLeave={() => setLivePlaying(false)}
               onClick={() => setLivePlaying((prev) => !prev)}
             >
               <Play size={11} fill="currentColor" />

@@ -55,6 +55,7 @@ export const App: React.FC = () => {
   const searchQuery = useAppStore((s) => s.searchQuery);
   const searchActive = useAppStore((s) => s.searchActive);
   const uploadModalOpen = useAppStore((s) => s.uploadModalOpen);
+  const lightboxAssetId = useAppStore((s) => s.lightboxAssetId);
   const chatDrawerOpen = useAppStore((s) => s.chatDrawerOpen);
   const wsConnected = useAppStore((s) => s.wsConnected);
   const activeJobs = useAppStore((s) => s.activeJobs);
@@ -79,7 +80,21 @@ export const App: React.FC = () => {
 
   const [windowDragActive, setWindowDragActive] = useState(false);
   const [droppedFiles, setDroppedFiles] = useState<File[]>([]);
+  const [isMobileViewport, setIsMobileViewport] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 767px)').matches
+      : false,
+  );
   const dragDepthRef = useRef(0);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 767px)');
+    const onChange = (e: MediaQueryListEvent) => setIsMobileViewport(e.matches);
+    setIsMobileViewport(mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
 
   const searchInputRef = useRef<HTMLInputElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
@@ -96,9 +111,11 @@ export const App: React.FC = () => {
       prevNavRef.current = activeNav;
       if (searchActive) {
         clearSearch();
+      } else if (searchQuery) {
+        setSearchQuery('');
       }
     }
-  }, [activeNav, clearSearch, searchActive]);
+  }, [activeNav, clearSearch, searchActive, searchQuery, setSearchQuery]);
 
   useEffect(() => {
     void bootstrap();
@@ -244,23 +261,23 @@ export const App: React.FC = () => {
     <div
       className={`app-window-frame studio-shell${macDesktop ? ' native-titlebar' : ''}${isTauri() && windowsCaption ? ' windows-caption' : ''}`}
       onDragEnter={(e) => {
-        if (!canUpload || !hasFileDrag(e)) return;
+        if (!canUpload || uploadModalOpen || !hasFileDrag(e)) return;
         dragDepthRef.current += 1;
         setWindowDragActive(true);
       }}
       onDragOver={(e) => {
-        if (!canUpload || !hasFileDrag(e)) return;
+        if (!canUpload || uploadModalOpen || !hasFileDrag(e)) return;
         e.preventDefault();
       }}
       onDragLeave={(e) => {
-        if (!canUpload || !hasFileDrag(e)) return;
+        if (!canUpload || uploadModalOpen || !hasFileDrag(e)) return;
         dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
         if (dragDepthRef.current === 0) {
           setWindowDragActive(false);
         }
       }}
       onDrop={(e) => {
-        if (!canUpload || !hasFileDrag(e)) return;
+        if (!canUpload || uploadModalOpen || !hasFileDrag(e)) return;
         e.preventDefault();
         dragDepthRef.current = 0;
         setWindowDragActive(false);
@@ -271,7 +288,7 @@ export const App: React.FC = () => {
         }
       }}
     >
-      <FeedbackHost floatingToasts={false} />
+      <FeedbackHost floatingToasts={isMobileViewport || lightboxAssetId !== null} />
       <ContextMenuHost />
       <Lightbox />
       <UploadModal

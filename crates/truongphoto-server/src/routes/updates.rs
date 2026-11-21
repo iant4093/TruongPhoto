@@ -42,14 +42,18 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
-fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
+fn parse_semver(raw: &str) -> Option<(u64, u64, u64, bool)> {
     let cleaned = raw.trim().trim_start_matches(['v', 'V']);
-    let core = cleaned.split(['-', '+']).next()?;
+    let without_build = cleaned.split('+').next()?;
+    let (core, is_stable) = match without_build.split_once('-') {
+        Some((c, _pre)) => (c, false),
+        None => (without_build, true),
+    };
     let mut parts = core.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
     let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
-    Some((major, minor, patch))
+    Some((major, minor, patch, is_stable))
 }
 
 fn is_newer_version(current: &str, latest: &str) -> bool {
@@ -63,13 +67,36 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
+fn arch_matches_asset(name_lower: &str, arch: &str) -> bool {
+    let has_arm = name_lower.contains("aarch64") || name_lower.contains("arm64");
+    let has_x64 =
+        name_lower.contains("x86_64") || name_lower.contains("x64") || name_lower.contains("amd64");
+    if !has_arm && !has_x64 {
+        return true; // Universal or arch-neutral package
+    }
+    match arch {
+        "aarch64" => has_arm,
+        "x86_64" => has_x64,
+        _ => true,
+    }
+}
+
 fn pick_platform_asset<'a>(assets: &'a [GithubAsset], os: &str) -> Option<&'a GithubAsset> {
+    let arch = std::env::consts::ARCH;
     let preferred_exts: &[&str] = match os {
         "macos" => &[".dmg", ".app.tar.gz", ".zip"],
         "windows" => &[".msi", "-setup.exe", ".exe", ".zip"],
         _ => &[".appimage", ".deb", ".tar.gz"],
     };
 
+    for ext in preferred_exts {
+        if let Some(found) = assets.iter().find(|a| {
+            let lower = a.name.to_ascii_lowercase();
+            lower.ends_with(ext) && arch_matches_asset(&lower, arch)
+        }) {
+            return Some(found);
+        }
+    }
     for ext in preferred_exts {
         if let Some(found) = assets
             .iter()
@@ -78,7 +105,7 @@ fn pick_platform_asset<'a>(assets: &'a [GithubAsset], os: &str) -> Option<&'a Gi
             return Some(found);
         }
     }
-    assets.first()
+    None
 }
 
 /// `GET /api/admin/updates/check` — checks GitHub Releases for a newer TruongPhoto release.

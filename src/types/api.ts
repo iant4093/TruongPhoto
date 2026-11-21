@@ -632,9 +632,11 @@ export type PlannerMode = 'exact_simd' | 'hnsw' | 'sql_only';
 
 export interface SearchRequest {
   query?: string | null;
+  ocr_query?: string | null;
   mode?: SearchMode;
   folder_id?: string | null;
   person_ids?: string[] | null;
+  has_people?: boolean | null;
   tags?: string[] | null;
   camera_model?: string | null;
   lens_model?: string | null;
@@ -647,6 +649,7 @@ export interface SearchRequest {
   shutter_speed_min_sec?: number | null;
   shutter_speed_max_sec?: number | null;
   orientation?: 'portrait' | 'landscape' | 'square' | string | null;
+  sort_by?: string | null;
   geo_query?: string | null;
   kind?: AssetKind | null;
   favorite?: boolean | null;
@@ -796,6 +799,8 @@ export interface RouterPlan {
   shutter_speed_min_sec?: number | null;
   shutter_speed_max_sec?: number | null;
   orientation?: 'portrait' | 'landscape' | 'square' | string | null;
+  has_people?: boolean | null;
+  sort_by?: string | null;
   tags: string[];
   kind: AssetKind | null;
   favorite: boolean | null;

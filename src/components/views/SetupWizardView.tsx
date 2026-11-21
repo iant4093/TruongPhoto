@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { ChevronDown, ChevronUp, FolderOpen, Sparkles } from 'lucide-react';
-import { downloadAiModel, scanFolder, setAiVisionTier } from '../../lib/api';
+import { downloadAiModel, scanFolder, setAiChatTier, setAiVisionTier } from '../../lib/api';
 import { formatBytes } from '../../lib/format';
 import { isTauri, pickFolderDialog } from '../../lib/tauri';
 import { errorMessage, useAppStore } from '../../store/useAppStore';
@@ -187,6 +187,15 @@ export const SetupWizardView: React.FC = () => {
         await setAiVisionTier(selectedVisionTier);
       } catch {
         // Ignore tier switch failure during bootstrap
+      }
+      if (includeChatModel) {
+        const targetChatTier =
+          setupStatus.hardware.recommended_chat_tier === 'tier1' ? 'tier1' : 'tier2';
+        try {
+          await setAiChatTier({ tier: targetChatTier });
+        } catch {
+          // Ignore chat tier switch failure during bootstrap
+        }
       }
       for (const modelId of modelsToDownload) {
         try {

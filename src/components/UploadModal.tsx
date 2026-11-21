@@ -23,6 +23,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const refreshSystemInfo = useAppStore((s) => s.refreshSystemInfo);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadingRef = useRef(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -32,7 +33,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
   const runUpload = useCallback(
     async (files: File[]) => {
-      if (files.length === 0) return;
+      if (files.length === 0 || uploadingRef.current) return;
+      uploadingRef.current = true;
       setUploading(true);
       setProgress(0);
       setSelectedCount(files.length);
@@ -61,6 +63,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         setError(msg);
         notifyError(err, 'Upload failed');
       } finally {
+        uploadingRef.current = false;
         setUploading(false);
       }
     },
@@ -141,15 +144,25 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               fileInputRef.current?.click();
             }
           }}
-          onDragOver={(e) => {
+          onDragEnter={(e) => {
             e.preventDefault();
+            e.stopPropagation();
             setDragOver(true);
           }}
-          onDragLeave={() => setDragOver(false)}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setDragOver(true);
+          }}
+          onDragLeave={(e) => {
+            e.stopPropagation();
+            setDragOver(false);
+          }}
           onDrop={(e) => {
             e.preventDefault();
+            e.stopPropagation();
             setDragOver(false);
-            if (uploading) return;
+            if (uploadingRef.current) return;
             const dropped = Array.from(e.dataTransfer.files);
             void runUpload(dropped);
           }}

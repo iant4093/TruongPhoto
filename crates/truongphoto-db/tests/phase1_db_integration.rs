@@ -676,6 +676,7 @@ async fn albums_crud_share_rbac_and_tags_and_trash_purge() {
             None,
             Some(&a1),
             Some(AlbumSortOrder::Custom),
+            &RbacScope::AdminAll,
         )?
         .expect("updated album");
         assert_eq!(updated_album.title, "Holiday 2026");

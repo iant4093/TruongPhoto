@@ -118,10 +118,12 @@ export interface AppState {
   openLightbox: (assetId: string, assetIds: string[], initialTimestampSec?: number | null) => void;
   closeLightbox: () => void;
   setLightboxAsset: (assetId: string) => void;
+  removeLightboxAsset: (assetId: string) => void;
   setUploadModalOpen: (open: boolean) => void;
   bumpLibraryRevision: () => void;
 
   runSearch: (partial?: Partial<SearchRequest>) => Promise<void>;
+  loadMoreSearch: () => Promise<void>;
   setSearchFilters: (partial: Partial<SearchRequest>) => void;
   clearSearch: () => void;
   refreshAiDashboard: () => Promise<void>;
@@ -296,6 +298,27 @@ export const useAppStore = create<AppState>((set, get) => {
         lightboxInitialTimestampSec: null,
         selectedAssetId: assetId,
       }),
+    removeLightboxAsset: (assetId) =>
+      set((state) => {
+        const idx = state.lightboxAssetIds.indexOf(assetId);
+        const nextIds = state.lightboxAssetIds.filter((id) => id !== assetId);
+        if (nextIds.length === 0) {
+          return {
+            lightboxAssetId: null,
+            lightboxAssetIds: [],
+            lightboxInitialTimestampSec: null,
+            selectedAssetId: null,
+          };
+        }
+        const nextIdx = idx < 0 ? 0 : Math.min(idx, nextIds.length - 1);
+        const nextId = nextIds[nextIdx];
+        return {
+          lightboxAssetId: nextId,
+          lightboxAssetIds: nextIds,
+          lightboxInitialTimestampSec: null,
+          selectedAssetId: nextId,
+        };
+      }),
     setUploadModalOpen: (open) => set({ uploadModalOpen: open }),
     bumpLibraryRevision: () => set((s) => ({ libraryRevision: s.libraryRevision + 1 })),
 
@@ -324,6 +347,44 @@ export const useAppStore = create<AppState>((set, get) => {
         const res = await searchLibrary(merged);
         if (seq === searchSeq) {
           set({ searchResponse: res, searchLoading: false });
+        }
+      } catch (err) {
+        if (seq === searchSeq) {
+          set({ searchLoading: false });
+        }
+        throw err;
+      }
+    },
+
+    loadMoreSearch: async () => {
+      const state = get();
+      if (state.searchLoading || !state.searchResponse) return;
+      const loadedCount = state.searchResponse.items.length;
+      if (loadedCount >= state.searchResponse.total_count) return;
+      const seq = searchSeq;
+      const nextReq: SearchRequest = {
+        ...state.searchRequest,
+        offset: loadedCount,
+      };
+      set({ searchLoading: true, searchRequest: nextReq });
+      try {
+        const res = await searchLibrary(nextReq);
+        if (seq === searchSeq) {
+          set((cur) => {
+            const existing = cur.searchResponse?.items ?? [];
+            const seen = new Set(existing.map((h) => `${h.asset.id}:${h.timestamp_sec ?? ''}`));
+            const extra = res.items.filter(
+              (h) => !seen.has(`${h.asset.id}:${h.timestamp_sec ?? ''}`),
+            );
+            return {
+              searchResponse: {
+                ...res,
+                items: [...existing, ...extra],
+                total_count: Math.max(res.total_count, existing.length + extra.length),
+              },
+              searchLoading: false,
+            };
+          });
         }
       } catch (err) {
         if (seq === searchSeq) {
@@ -379,6 +440,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     createNewChatSession: async (title) => {
       const seq = ++chatSeq;
+      set({ chatSending: false, chatPendingStartedAt: null });
       const session = await createChatSession(title);
       if (seq === chatSeq) {
         set((state) => ({
@@ -387,6 +449,8 @@ export const useAppStore = create<AppState>((set, get) => {
           chatMessages: [],
           chatActiveFilters: null,
           chatLastReranked: false,
+          chatSending: false,
+          chatPendingStartedAt: null,
         }));
       }
       return session;
@@ -394,6 +458,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     selectChatSession: async (sessionId) => {
       const seq = ++chatSeq;
+      set({ chatSending: false, chatPendingStartedAt: null });
       const detail = await getChatSession(sessionId);
       if (seq !== chatSeq) return;
       const lastAssistant = [...detail.messages]
@@ -404,10 +469,16 @@ export const useAppStore = create<AppState>((set, get) => {
         chatMessages: detail.messages,
         chatActiveFilters: detail.session.active_filters,
         chatLastReranked: Boolean(lastAssistant?.reranked),
+        chatSending: false,
+        chatPendingStartedAt: null,
       });
     },
 
     removeChatSession: async (sessionId) => {
+      const removingActive = get().activeChatSessionId === sessionId;
+      if (removingActive) {
+        chatSeq += 1;
+      }
       await deleteChatSession(sessionId);
       set((state) => {
         const remaining = state.chatSessions.filter((s) => s.id !== sessionId);
@@ -420,6 +491,8 @@ export const useAppStore = create<AppState>((set, get) => {
                 chatMessages: [],
                 chatActiveFilters: null,
                 chatLastReranked: false,
+                chatSending: false,
+                chatPendingStartedAt: null,
               }
             : {}),
         };

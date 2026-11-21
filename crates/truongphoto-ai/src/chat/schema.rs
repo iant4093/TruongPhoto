@@ -28,6 +28,8 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     "shutter_speed_min_sec",
     "shutter_speed_max_sec",
     "orientation",
+    "has_people",
+    "sort_by",
     "tags",
     "kind",
     "favorite",
@@ -58,6 +60,21 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     "orientation": {
       "type": ["string", "null"],
       "enum": ["portrait", "landscape", "square", null]
+    },
+    "has_people": { "type": ["boolean", "null"] },
+    "sort_by": {
+      "type": ["string", "null"],
+      "enum": [
+        "capture_desc",
+        "capture_asc",
+        "focal_asc",
+        "focal_desc",
+        "iso_desc",
+        "aperture_asc",
+        "shutter_asc",
+        "shutter_desc",
+        null
+      ]
     },
     "tags": {
       "type": "array",
@@ -95,6 +112,8 @@ const ALLOWED_ROUTER_PLAN_KEYS: &[&str] = &[
     "shutter_speed_min_sec",
     "shutter_speed_max_sec",
     "orientation",
+    "has_people",
+    "sort_by",
     "tags",
     "kind",
     "favorite",
@@ -227,14 +246,18 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
 
     if let Some(raw) = iso_from {
         if let Some(ms) = parse_iso_date_to_ms(&raw, false) {
-            obj.entry("date_from_ms".to_string())
-                .or_insert_with(|| Value::from(ms));
+            let needs_insert = obj.get("date_from_ms").is_none_or(|v| v.is_null());
+            if needs_insert {
+                obj.insert("date_from_ms".to_string(), Value::from(ms));
+            }
         }
     }
     if let Some(raw) = iso_to {
         if let Some(ms) = parse_iso_date_to_ms(&raw, true) {
-            obj.entry("date_to_ms".to_string())
-                .or_insert_with(|| Value::from(ms));
+            let needs_insert = obj.get("date_to_ms").is_none_or(|v| v.is_null());
+            if needs_insert {
+                obj.insert("date_to_ms".to_string(), Value::from(ms));
+            }
         }
     }
 
@@ -246,6 +269,41 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
             return Err(AiError::InvalidInput(format!(
                 "invalid date range: date_from_ms ({from_ms}) > date_to_ms ({to_ms})"
             )));
+        }
+    }
+
+    // Sanitize numeric EXIF bounds: discard non-finite / non-positive values and swap inverted pairs
+    // (common when LLMs parse "1/1000 to 1/2000" as min=0.001, max=0.0005).
+    fn sanitize_pos_f64_pair(lo: &mut Option<f64>, hi: &mut Option<f64>) {
+        if lo.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+            *lo = None;
+        }
+        if hi.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+            *hi = None;
+        }
+        if let (Some(a), Some(b)) = (*lo, *hi) {
+            if a > b {
+                *lo = Some(b);
+                *hi = Some(a);
+            }
+        }
+    }
+    sanitize_pos_f64_pair(&mut plan.focal_length_min_mm, &mut plan.focal_length_max_mm);
+    sanitize_pos_f64_pair(&mut plan.aperture_min_f, &mut plan.aperture_max_f);
+    sanitize_pos_f64_pair(
+        &mut plan.shutter_speed_min_sec,
+        &mut plan.shutter_speed_max_sec,
+    );
+    if plan.iso_min == Some(0) {
+        plan.iso_min = None;
+    }
+    if plan.iso_max == Some(0) {
+        plan.iso_max = None;
+    }
+    if let (Some(a), Some(b)) = (plan.iso_min, plan.iso_max) {
+        if a > b {
+            plan.iso_min = Some(b);
+            plan.iso_max = Some(a);
         }
     }
 
@@ -262,6 +320,12 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
             _ => None,
         }
     });
+    plan.sort_by =
+        normalize_opt_string(plan.sort_by).and_then(|s| match s.to_ascii_lowercase().as_str() {
+            "capture_desc" | "capture_asc" | "focal_asc" | "focal_desc" | "iso_desc"
+            | "aperture_asc" | "shutter_asc" | "shutter_desc" => Some(s.to_ascii_lowercase()),
+            _ => None,
+        });
     plan.person_names = normalize_string_vec(plan.person_names);
     plan.tags = normalize_string_vec(plan.tags);
     plan.assistant_reply = plan.assistant_reply.trim().to_string();
@@ -312,6 +376,8 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
             shutter_speed_min_sec: next.shutter_speed_min_sec,
             shutter_speed_max_sec: next.shutter_speed_max_sec,
             orientation: normalize_opt_string(next.orientation.clone()),
+            has_people: next.has_people,
+            sort_by: normalize_opt_string(next.sort_by.clone()),
             tags: normalize_string_vec(next.tags.clone()),
             kind: next.kind,
             favorite: next.favorite,
@@ -323,34 +389,58 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         };
     }
 
-    let (date_from_ms, date_to_ms) = if next.date_from_ms.is_some() || next.date_to_ms.is_some() {
-        (next.date_from_ms, next.date_to_ms)
-    } else {
-        (prior.date_from_ms, prior.date_to_ms)
-    };
-    let (focal_length_min_mm, focal_length_max_mm) =
-        if next.focal_length_min_mm.is_some() || next.focal_length_max_mm.is_some() {
-            (next.focal_length_min_mm, next.focal_length_max_mm)
-        } else {
-            (prior.focal_length_min_mm, prior.focal_length_max_mm)
-        };
-    let (aperture_min_f, aperture_max_f) =
-        if next.aperture_min_f.is_some() || next.aperture_max_f.is_some() {
-            (next.aperture_min_f, next.aperture_max_f)
-        } else {
-            (prior.aperture_min_f, prior.aperture_max_f)
-        };
-    let (iso_min, iso_max) = if next.iso_min.is_some() || next.iso_max.is_some() {
-        (next.iso_min, next.iso_max)
-    } else {
-        (prior.iso_min, prior.iso_max)
-    };
-    let (shutter_speed_min_sec, shutter_speed_max_sec) =
-        if next.shutter_speed_min_sec.is_some() || next.shutter_speed_max_sec.is_some() {
-            (next.shutter_speed_min_sec, next.shutter_speed_max_sec)
-        } else {
-            (prior.shutter_speed_min_sec, prior.shutter_speed_max_sec)
-        };
+    fn merge_ord_range<T: Copy + PartialOrd>(
+        p_lo: Option<T>,
+        p_hi: Option<T>,
+        n_lo: Option<T>,
+        n_hi: Option<T>,
+    ) -> (Option<T>, Option<T>) {
+        match (n_lo, n_hi) {
+            (None, None) => (p_lo, p_hi),
+            (Some(a), Some(b)) => (Some(a), Some(b)),
+            (Some(a), None) => {
+                if p_hi.is_some_and(|b| a <= b) {
+                    (Some(a), p_hi)
+                } else {
+                    (Some(a), None)
+                }
+            }
+            (None, Some(b)) => {
+                if p_lo.is_some_and(|a| a <= b) {
+                    (p_lo, Some(b))
+                } else {
+                    (None, Some(b))
+                }
+            }
+        }
+    }
+
+    let (date_from_ms, date_to_ms) = merge_ord_range(
+        prior.date_from_ms,
+        prior.date_to_ms,
+        next.date_from_ms,
+        next.date_to_ms,
+    );
+    let (focal_length_min_mm, focal_length_max_mm) = merge_ord_range(
+        prior.focal_length_min_mm,
+        prior.focal_length_max_mm,
+        next.focal_length_min_mm,
+        next.focal_length_max_mm,
+    );
+    let (aperture_min_f, aperture_max_f) = merge_ord_range(
+        prior.aperture_min_f,
+        prior.aperture_max_f,
+        next.aperture_min_f,
+        next.aperture_max_f,
+    );
+    let (iso_min, iso_max) =
+        merge_ord_range(prior.iso_min, prior.iso_max, next.iso_min, next.iso_max);
+    let (shutter_speed_min_sec, shutter_speed_max_sec) = merge_ord_range(
+        prior.shutter_speed_min_sec,
+        prior.shutter_speed_max_sec,
+        next.shutter_speed_min_sec,
+        next.shutter_speed_max_sec,
+    );
 
     RouterPlan {
         semantic_query: normalize_opt_string(next.semantic_query.clone())
@@ -374,6 +464,9 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         shutter_speed_max_sec,
         orientation: normalize_opt_string(next.orientation.clone())
             .or_else(|| normalize_opt_string(prior.orientation.clone())),
+        has_people: next.has_people.or(prior.has_people),
+        sort_by: normalize_opt_string(next.sort_by.clone())
+            .or_else(|| normalize_opt_string(prior.sort_by.clone())),
         tags: merge_string_lists(&prior.tags, &next.tags),
         kind: next.kind.or(prior.kind),
         favorite: next.favorite.or(prior.favorite),

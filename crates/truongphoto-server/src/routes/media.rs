@@ -604,13 +604,11 @@ pub async fn get_original(
             .map_err(|e| AppError::internal(format!("Failed to stat demosaiced JPEG: {e}")))?;
         let etag = format!("\"{asset_id}-raw-{}\"", meta.len());
         let dl_name = if want_download {
-            Some(format!(
-                "{}.jpg",
-                Path::new(&raw_file.rel_path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("raw")
-            ))
+            let raw_stem = Path::new(&raw_file.rel_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("raw");
+            Some(sanitize_download_filename(&format!("{raw_stem}.jpg")))
         } else {
             None
         };

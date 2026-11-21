@@ -470,7 +470,7 @@ describe('MobileTabBar', () => {
     useAppStore.setState({ activeNav: 'timeline' });
     render(<MobileTabBar />);
 
-    const expectedTabs = ['Timeline', 'Ask AI', 'People', 'Albums', 'Settings'];
+    const expectedTabs = ['Timeline', 'Ask AI', 'People', 'Albums', 'More'];
     for (const label of expectedTabs) {
       expect(screen.getByRole('button', { name: label })).toBeTruthy();
     }
@@ -487,5 +487,13 @@ describe('MobileTabBar', () => {
     expect(
       screen.getByRole('button', { name: 'Timeline' }).getAttribute('aria-current'),
     ).toBeNull();
+
+    // Open More sheet to verify Favorites, Map, Trash, and Settings are reachable on mobile
+    fireEvent.click(screen.getByRole('button', { name: 'More' }));
+    for (const label of ['Favorites', 'Map', 'Trash', 'Settings']) {
+      expect(screen.getByRole('menuitem', { name: label })).toBeTruthy();
+    }
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Favorites' }));
+    expect(useAppStore.getState().activeNav).toBe('favorites');
   });
 });

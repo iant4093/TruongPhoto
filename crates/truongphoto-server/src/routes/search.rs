@@ -87,18 +87,83 @@ pub async fn search_library(
     Ok(Json(resp))
 }
 
+const MAX_OFFSET: usize = 5_000;
+
+fn validate_search_request(req: &SearchRequest) -> Result<(), AppError> {
+    for (name, val) in [
+        ("focal_length_min_mm", req.focal_length_min_mm),
+        ("focal_length_max_mm", req.focal_length_max_mm),
+        ("aperture_min_f", req.aperture_min_f),
+        ("aperture_max_f", req.aperture_max_f),
+        ("shutter_speed_min_sec", req.shutter_speed_min_sec),
+        ("shutter_speed_max_sec", req.shutter_speed_max_sec),
+    ] {
+        if let Some(v) = val {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(AppError::validation(format!(
+                    "{name} must be a finite positive number."
+                )));
+            }
+        }
+    }
+    if let Some(orient) = req
+        .orientation
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !matches!(
+            orient.to_ascii_lowercase().as_str(),
+            "portrait" | "vertical" | "landscape" | "horizontal" | "square"
+        ) {
+            return Err(AppError::validation(
+                "orientation must be portrait, landscape, or square.",
+            ));
+        }
+    }
+    if let Some(sort) = req
+        .sort_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !matches!(
+            sort.to_ascii_lowercase().as_str(),
+            "capture_desc"
+                | "capture_asc"
+                | "focal_asc"
+                | "focal_desc"
+                | "iso_desc"
+                | "aperture_asc"
+                | "shutter_asc"
+                | "shutter_desc"
+        ) {
+            return Err(AppError::validation("unsupported sort_by value."));
+        }
+    }
+    Ok(())
+}
+
 /// Shared RBAC-enforced Hybrid Search engine used by both `POST /api/search` and
 /// `POST /api/chat/sessions/{id}/messages`.
 pub(crate) async fn execute_hybrid_search(
     state: &Arc<AppState>,
     rbac: &RbacContext,
-    req: SearchRequest,
+    mut req: SearchRequest,
 ) -> Result<SearchResponse, AppError> {
+    validate_search_request(&req)?;
     let started = Instant::now();
     let limit = (req.limit.unwrap_or(DEFAULT_LIMIT as u32) as usize).clamp(1, MAX_LIMIT);
-    let offset = req.offset.unwrap_or(0) as usize;
+    let offset = (req.offset.unwrap_or(0) as usize).min(MAX_OFFSET);
+    req.offset = Some(offset as u32);
     let trimmed_query = req
         .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let trimmed_ocr_query = req
+        .ocr_query
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -161,6 +226,7 @@ pub(crate) async fn execute_hybrid_search(
     let scope = rbac.scope.clone();
     let req_clone = req.clone();
     let q_clone = query_str.clone();
+    let ocr_q_clone = trimmed_ocr_query.unwrap_or_else(|| query_str.clone());
     let want_ocr = req.mode == SearchMode::Hybrid;
 
     let (active_tier, candidates, ocr_hits, metadata_hits) = state
@@ -173,7 +239,7 @@ pub(crate) async fn execute_hybrid_search(
                 repo::search::search_ocr_fts(
                     conn,
                     &scope,
-                    &q_clone,
+                    &ocr_q_clone,
                     Some(&cands.asset_ids),
                     MAX_LIMIT,
                 )?

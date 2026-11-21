@@ -97,12 +97,17 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     );
   }, []);
 
+  const lastSyncedAssetIdRef = React.useRef<string | null>(null);
+
   useEffect(() => {
     if (initialDetail && initialDetail.summary.id === assetId) {
       setDetail(initialDetail);
       setLoading(false);
       setError(null);
-      syncFormFromDetail(initialDetail);
+      if (lastSyncedAssetIdRef.current !== assetId) {
+        lastSyncedAssetIdRef.current = assetId;
+        syncFormFromDetail(initialDetail);
+      }
       return;
     }
 
@@ -114,6 +119,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
       .then((res) => {
         if (!active) return;
         setDetail(res);
+        lastSyncedAssetIdRef.current = assetId;
         syncFormFromDetail(res);
         setLoading(false);
       })

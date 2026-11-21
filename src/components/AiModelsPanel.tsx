@@ -27,7 +27,7 @@ import {
   updateAiSettings,
 } from '../lib/api';
 import { formatBytes } from '../lib/format';
-import { notifyError, notifySuccess } from '../store/feedback';
+import { confirmAction, notifyError, notifySuccess } from '../store/feedback';
 import { errorMessage, useAppStore } from '../store/useAppStore';
 import type { AiModelStatus, AiModelView, AiTier, ChatTier } from '../types/api';
 import { Dropdown } from './Dropdown';
@@ -275,6 +275,12 @@ export const AiModelsPanel: React.FC = () => {
   };
 
   const handleDeleteModel = async (id: string, name: string) => {
+    const confirmed = await confirmAction(
+      `Remove ${name}?`,
+      'Remove Model',
+      'This deletes the downloaded model weights from disk. You can re-download them anytime.',
+    );
+    if (!confirmed) return;
     setModelBusy(id, true);
     try {
       await deleteAiModel(id);
@@ -288,7 +294,9 @@ export const AiModelsPanel: React.FC = () => {
   };
 
   const handleSetTier = async (tier: AiTier) => {
-    if (!aiDashboard || aiDashboard.state.active_vision_tier === tier) return;
+    const currentEffectiveTier =
+      aiDashboard?.state.staging_vision_tier ?? aiDashboard?.state.active_vision_tier;
+    if (!aiDashboard || currentEffectiveTier === tier) return;
     setBusyControl('tier');
     try {
       await setAiVisionTier(tier);

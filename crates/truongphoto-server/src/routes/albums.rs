@@ -150,13 +150,14 @@ pub async fn get_album(
 
 /// `PATCH /api/albums/{id}` (Album Owner or Admin).
 pub async fn update_album(
-    auth: AuthSession,
+    rbac: RbacContext,
     State(state): State<Arc<AppState>>,
     AxumPath(album_id): AxumPath<String>,
     ApiJson(req): ApiJson<UpdateAlbumRequest>,
 ) -> Result<Json<AlbumResponse>, AppError> {
-    let user_id = auth.user.id;
-    let role = auth.user.role;
+    let user_id = rbac.auth.user.id;
+    let role = rbac.auth.user.role;
+    let scope = rbac.scope;
     let album = state
         .db
         .write(move |conn| {
@@ -172,6 +173,7 @@ pub async fn update_album(
                 req.description.as_deref(),
                 req.cover_asset_id.as_deref(),
                 req.sort_order,
+                &scope,
             )?
             .ok_or_else(|| DbError::NotFound("Album not found.".to_string()))?;
             Ok(updated)
@@ -262,6 +264,7 @@ pub async fn remove_album_assets(
     ensure_contributor(&rbac)?;
     let user_id = rbac.auth.user.id;
     let role = rbac.auth.user.role;
+    let scope = rbac.scope;
     let removed_count = state
         .db
         .write(move |conn| {
@@ -270,7 +273,7 @@ pub async fn remove_album_assets(
             if !perm.can_contribute() {
                 return Err(DbError::InvalidArgument("__FORBIDDEN__".to_string()));
             }
-            repo::albums::remove_album_assets(conn, &album_id, &req.asset_ids)
+            repo::albums::remove_album_assets(conn, &album_id, &req.asset_ids, &scope)
         })
         .await
         .map_err(|e| match e {

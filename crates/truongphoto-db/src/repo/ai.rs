@@ -648,6 +648,11 @@ pub fn get_face_with_asset_for_thumb(
 ) -> DbResult<Option<FaceThumbSource>> {
     let mut params: Vec<Value> = vec![Value::Text(face_id.to_string())];
     let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
+    let hidden_person_clause = if matches!(scope, RbacScope::AdminAll) {
+        "1 = 1"
+    } else {
+        "(f.person_id IS NULL OR NOT EXISTS (SELECT 1 FROM people ph WHERE ph.id = f.person_id AND ph.is_hidden = 1))"
+    };
 
     let sql = format!(
         "SELECT
@@ -658,8 +663,8 @@ pub fn get_face_with_asset_for_thumb(
                 SELECT af.rel_path
                 FROM asset_files af
                 WHERE af.asset_id = a.id
-                ORDER BY af.is_missing ASC,
-                         CASE WHEN af.id = a.primary_file_id THEN 0
+                  AND af.is_missing = 0
+                ORDER BY CASE WHEN af.id = a.primary_file_id THEN 0
                               WHEN af.file_role = 'primary' THEN 1
                               ELSE 2 END,
                          af.rel_path ASC
@@ -675,6 +680,8 @@ pub fn get_face_with_asset_for_thumb(
          WHERE f.id = ?1
            AND a.deleted_at_ms IS NULL
            AND a.is_hidden = 0
+           AND fl.is_offline = 0
+           AND {hidden_person_clause}
            AND {rbac_clause}
          LIMIT 1"
     );

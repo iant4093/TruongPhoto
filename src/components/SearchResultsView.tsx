@@ -104,10 +104,13 @@ export const SearchResultsView: React.FC = () => {
   const searchQuery = useAppStore((s) => s.searchQuery);
   const searchResponse = useAppStore((s) => s.searchResponse);
   const searchLoading = useAppStore((s) => s.searchLoading);
+  const loadMoreSearch = useAppStore((s) => s.loadMoreSearch);
   const clearSearch = useAppStore((s) => s.clearSearch);
   const openLightbox = useAppStore((s) => s.openLightbox);
 
   const hits = searchResponse?.items ?? [];
+  const totalCount = searchResponse?.total_count ?? 0;
+  const hasMore = hits.length < totalCount;
   const allHitIds = useMemo(() => hits.map((h) => h.asset.id), [hits]);
 
   const telemetryText = searchResponse
@@ -143,15 +146,31 @@ export const SearchResultsView: React.FC = () => {
           Searching library…
         </div>
       ) : hits.length > 0 ? (
-        <div className="search-hit-grid">
-          {hits.map((hit) => (
-            <SearchHitCard
-              key={`${hit.asset.id}-${hit.timestamp_sec ?? 'photo'}`}
-              hit={hit}
-              onOpen={handleOpenHit}
-            />
-          ))}
-        </div>
+        <>
+          <div className="search-hit-grid">
+            {hits.map((hit) => (
+              <SearchHitCard
+                key={`${hit.asset.id}-${hit.timestamp_sec ?? 'photo'}`}
+                hit={hit}
+                onOpen={handleOpenHit}
+              />
+            ))}
+          </div>
+          {hasMore && (
+            <div style={{ display: 'flex', justifyContent: 'center', marginTop: 18 }}>
+              <button
+                type="button"
+                className="button"
+                disabled={searchLoading}
+                onClick={() => void loadMoreSearch()}
+              >
+                {searchLoading
+                  ? 'Loading more…'
+                  : `Load More (${hits.length} of ${totalCount.toLocaleString()})`}
+              </button>
+            </div>
+          )}
+        </>
       ) : (
         <EmptyState
           icon={<Search size={28} strokeWidth={1.3} />}

@@ -271,7 +271,8 @@ impl HybridVectorIndex {
         }
 
         let delta_ids = self.delta_ids.read().clone();
-        let mut merged: HashMap<u32, f32> = HashMap::with_capacity(k * 2);
+        let cap = k.min(effective.len() as usize).saturating_mul(2);
+        let mut merged: HashMap<u32, f32> = HashMap::with_capacity(cap);
 
         {
             let base_guard = self.base.read();

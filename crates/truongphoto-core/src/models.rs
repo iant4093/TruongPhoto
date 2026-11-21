@@ -1081,9 +1081,13 @@ impl FromStr for PlannerMode {
 #[serde(default)]
 pub struct SearchRequest {
     pub query: Option<String>,
+    #[serde(default)]
+    pub ocr_query: Option<String>,
     pub mode: SearchMode,
     pub folder_id: Option<String>,
     pub person_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub has_people: Option<bool>,
     pub tags: Option<Vec<String>>,
     pub camera_model: Option<String>,
     #[serde(default)]
@@ -1106,6 +1110,8 @@ pub struct SearchRequest {
     pub shutter_speed_max_sec: Option<f64>,
     #[serde(default)]
     pub orientation: Option<String>,
+    #[serde(default)]
+    pub sort_by: Option<String>,
     pub geo_query: Option<String>,
     pub kind: Option<AssetKind>,
     pub favorite: Option<bool>,
@@ -1434,6 +1440,10 @@ pub struct RouterPlan {
     pub shutter_speed_max_sec: Option<f64>,
     #[serde(default)]
     pub orientation: Option<String>,
+    #[serde(default)]
+    pub has_people: Option<bool>,
+    #[serde(default)]
+    pub sort_by: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub kind: Option<AssetKind>,

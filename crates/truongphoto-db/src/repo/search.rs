@@ -33,10 +33,23 @@ fn escape_like_lower(raw: &str) -> String {
 
 fn tokenize_search_words(raw: &str) -> Vec<String> {
     raw.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .map(str::trim)
+        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '-' && c != '.'))
+        .map(|s| s.trim_end_matches('.'))
         .filter(|s| !s.is_empty())
         .map(|s| s.to_ascii_lowercase())
         .collect()
+}
+
+fn geo_synonym_variant(tok: &str) -> Option<&'static str> {
+    match tok {
+        "mount" => Some("mt"),
+        "mt" => Some("mount"),
+        "saint" => Some("st"),
+        "st" => Some("saint"),
+        "fort" => Some("ft"),
+        "ft" => Some("fort"),
+        _ => None,
+    }
 }
 
 fn parse_focal_mm_token(tok: &str) -> Option<f64> {
@@ -82,6 +95,7 @@ fn parse_iso_token(tok: &str) -> Option<i64> {
 
 fn parse_shutter_speed_token(tok: &str) -> Option<f64> {
     let lower = tok.trim().to_ascii_lowercase();
+    let has_unit = lower.ends_with("sec") || lower.ends_with('s');
     let stripped = lower
         .strip_suffix("sec")
         .or_else(|| lower.strip_suffix('s'))
@@ -91,6 +105,11 @@ fn parse_shutter_speed_token(tok: &str) -> Option<f64> {
         let d = den.parse::<f64>().ok()?;
         if n > 0.0 && d >= 1.0 && n / d <= 3600.0 {
             return Some(n / d);
+        }
+    } else if has_unit && !stripped.is_empty() {
+        let val = stripped.parse::<f64>().ok()?;
+        if val.is_finite() && val > 0.0 && val <= 3600.0 {
+            return Some(val);
         }
     }
     None
@@ -115,6 +134,7 @@ fn append_deterministic_filters(
     where_clauses.push("v.is_hidden = 0".to_string());
     where_clauses.push(rbac_sql::folder_clause("v", scope, params));
 
+    let is_admin = matches!(scope, RbacScope::AdminAll);
     if let Some(person_ids) = req.person_ids.as_ref() {
         let mut seen = HashSet::new();
         for pid in person_ids {
@@ -124,9 +144,26 @@ fn append_deterministic_filters(
             }
             let idx = params.len() + 1;
             params.push(Value::Text(trimmed.to_string()));
-            where_clauses.push(format!(
-                "EXISTS (SELECT 1 FROM faces f WHERE f.asset_id = v.id AND f.person_id = ?{idx})"
-            ));
+            if is_admin {
+                where_clauses.push(format!(
+                    "EXISTS (SELECT 1 FROM faces f WHERE f.asset_id = v.id AND f.person_id = ?{idx})"
+                ));
+            } else {
+                where_clauses.push(format!(
+                    "EXISTS (SELECT 1 FROM faces f JOIN people p ON p.id = f.person_id WHERE f.asset_id = v.id AND f.person_id = ?{idx} AND p.is_hidden = 0)"
+                ));
+            }
+        }
+    }
+
+    if let Some(has_people) = req.has_people {
+        if has_people {
+            where_clauses
+                .push("EXISTS (SELECT 1 FROM faces f_hp WHERE f_hp.asset_id = v.id)".to_string());
+        } else {
+            where_clauses.push(
+                "NOT EXISTS (SELECT 1 FROM faces f_np WHERE f_np.asset_id = v.id)".to_string(),
+            );
         }
     }
 
@@ -238,6 +275,8 @@ fn append_deterministic_filters(
             (Some(lo), Some(hi)) if lo > 0.0 && ((hi - lo).abs() / lo) < 0.05 => {
                 (Some(lo * 0.85), Some(hi * 1.15))
             }
+            (Some(lo), None) => (Some(lo * 0.97), None),
+            (None, Some(hi)) => (None, Some(hi * 1.03)),
             pair => pair,
         };
         if let Some(lo) = sh_min {
@@ -262,22 +301,16 @@ fn append_deterministic_filters(
     if let Some(orientation) = req.orientation.as_deref().map(str::trim) {
         match orientation.to_ascii_lowercase().as_str() {
             "portrait" | "vertical" => {
-                where_clauses.push(
-                    "(v.width IS NOT NULL AND v.height IS NOT NULL AND v.height > v.width)"
-                        .to_string(),
-                );
+                where_clauses
+                    .push("(v.width > 0 AND v.height > 0 AND v.height > v.width)".to_string());
             }
             "landscape" | "horizontal" => {
-                where_clauses.push(
-                    "(v.width IS NOT NULL AND v.height IS NOT NULL AND v.width > v.height)"
-                        .to_string(),
-                );
+                where_clauses
+                    .push("(v.width > 0 AND v.height > 0 AND v.width > v.height)".to_string());
             }
             "square" => {
-                where_clauses.push(
-                    "(v.width IS NOT NULL AND v.height IS NOT NULL AND v.width = v.height)"
-                        .to_string(),
-                );
+                where_clauses
+                    .push("(v.width > 0 AND v.height > 0 AND v.width = v.height)".to_string());
             }
             _ => {}
         }
@@ -288,37 +321,41 @@ fn append_deterministic_filters(
         if !tokens.is_empty() {
             let mut geo_token_checks = Vec::with_capacity(tokens.len());
             for tok in tokens {
-                // Normalize "mount" <-> "mt" so "Mount Saint Helens" matches "Mt. Saint Helens".
-                let normalized = if tok == "mount" {
-                    "mt".to_string()
-                } else {
-                    tok.clone()
-                };
                 let idx = params.len() + 1;
                 params.push(Value::Text(format!("%{}%", escape_like_lower(&tok))));
-                if normalized != tok {
+                let mut per_tok = vec![
+                    format!("LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'"),
+                    format!("LOWER(COALESCE(v.effective_geo_admin1, '')) LIKE ?{idx} ESCAPE '\\'"),
+                    format!("LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'"),
+                    format!(
+                        "LOWER(COALESCE(v.effective_geo_country_code, '')) LIKE ?{idx} ESCAPE '\\'"
+                    ),
+                    format!("LOWER(COALESCE(v.effective_title, '')) LIKE ?{idx} ESCAPE '\\'"),
+                    format!("LOWER(COALESCE(v.effective_description, '')) LIKE ?{idx} ESCAPE '\\'"),
+                    format!(
+                        "EXISTS (SELECT 1 FROM asset_files af_g WHERE af_g.asset_id = v.id AND LOWER(af_g.rel_path) LIKE ?{idx} ESCAPE '\\')"
+                    ),
+                ];
+                if let Some(alt) = geo_synonym_variant(&tok) {
                     let alt_idx = params.len() + 1;
-                    params.push(Value::Text(format!("%{}%", escape_like_lower(&normalized))));
-                    geo_token_checks.push(format!(
-                        "(LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_geo_admin1, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_geo_country_code, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_title, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_description, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR EXISTS (SELECT 1 FROM asset_files af_g WHERE af_g.asset_id = v.id AND (LOWER(af_g.rel_path) LIKE ?{idx} ESCAPE '\\' OR LOWER(af_g.rel_path) LIKE ?{alt_idx} ESCAPE '\\')))"
+                    params.push(Value::Text(format!("%{}%", escape_like_lower(alt))));
+                    per_tok.push(format!(
+                        "LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{alt_idx} ESCAPE '\\'"
                     ));
-                } else {
-                    geo_token_checks.push(format!(
-                        "(LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_geo_admin1, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_geo_country_code, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_title, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR LOWER(COALESCE(v.effective_description, '')) LIKE ?{idx} ESCAPE '\\'
-                          OR EXISTS (SELECT 1 FROM asset_files af_g WHERE af_g.asset_id = v.id AND LOWER(af_g.rel_path) LIKE ?{idx} ESCAPE '\\'))"
+                    per_tok.push(format!(
+                        "LOWER(COALESCE(v.effective_geo_admin1, '')) LIKE ?{alt_idx} ESCAPE '\\'"
+                    ));
+                    per_tok.push(format!(
+                        "LOWER(COALESCE(v.effective_title, '')) LIKE ?{alt_idx} ESCAPE '\\'"
+                    ));
+                    per_tok.push(format!(
+                        "LOWER(COALESCE(v.effective_description, '')) LIKE ?{alt_idx} ESCAPE '\\'"
+                    ));
+                    per_tok.push(format!(
+                        "EXISTS (SELECT 1 FROM asset_files af_ga WHERE af_ga.asset_id = v.id AND LOWER(af_ga.rel_path) LIKE ?{alt_idx} ESCAPE '\\')"
                     ));
                 }
+                geo_token_checks.push(format!("({})", per_tok.join(" OR ")));
             }
             where_clauses.push(format!("({})", geo_token_checks.join(" AND ")));
         }
@@ -568,7 +605,13 @@ fn append_free_text_metadata_clauses(
             "LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'"
         ));
         ors.push(format!(
+            "LOWER(COALESCE(v.effective_geo_admin1, '')) LIKE ?{idx} ESCAPE '\\'"
+        ));
+        ors.push(format!(
             "LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'"
+        ));
+        ors.push(format!(
+            "LOWER(COALESCE(v.effective_geo_country_code, '')) LIKE ?{idx} ESCAPE '\\'"
         ));
         ors.push(format!(
             "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_t WHERE dpm_t.asset_id = v.id AND (LOWER(COALESCE(dpm_t.camera_make, '')) LIKE ?{idx} ESCAPE '\\' OR LOWER(COALESCE(dpm_t.lens_model, '')) LIKE ?{idx} ESCAPE '\\'))"
@@ -576,6 +619,13 @@ fn append_free_text_metadata_clauses(
         ors.push(format!(
             "EXISTS (SELECT 1 FROM asset_files afq WHERE afq.asset_id = v.id AND LOWER(afq.rel_path) LIKE ?{idx} ESCAPE '\\')"
         ));
+        if let Some(alt) = geo_synonym_variant(&tok) {
+            let alt_idx = params.len() + 1;
+            params.push(Value::Text(format!("%{}%", escape_like_lower(alt))));
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM asset_files afqa WHERE afqa.asset_id = v.id AND LOWER(afqa.rel_path) LIKE ?{alt_idx} ESCAPE '\\')"
+            ));
+        }
         ors.push(format!(
             "EXISTS (SELECT 1 FROM media_tags mtq WHERE mtq.asset_id = v.id AND mtq.state = 'active' AND LOWER(mtq.tag) LIKE ?{idx} ESCAPE '\\')"
         ));
@@ -638,7 +688,7 @@ pub fn list_distinct_gear(
     let mut params_c: Vec<Value> = Vec::new();
     let folder_c = rbac_sql::folder_clause("a", scope, &mut params_c);
     let cam_sql = format!(
-        "SELECT DISTINCT TRIM(dpm.camera_model) AS cam
+        "SELECT TRIM(dpm.camera_model) AS cam
          FROM deterministic_photo_meta dpm
          JOIN assets a ON a.id = dpm.asset_id
          WHERE a.deleted_at_ms IS NULL
@@ -646,7 +696,8 @@ pub fn list_distinct_gear(
            AND {folder_c}
            AND dpm.camera_model IS NOT NULL
            AND TRIM(dpm.camera_model) != ''
-         ORDER BY cam ASC
+         GROUP BY cam
+         ORDER BY COUNT(*) DESC, cam ASC
          LIMIT 25"
     );
     let mut cam_stmt = conn.prepare(&cam_sql)?;
@@ -657,7 +708,7 @@ pub fn list_distinct_gear(
     let mut params_l: Vec<Value> = Vec::new();
     let folder_l = rbac_sql::folder_clause("a", scope, &mut params_l);
     let lens_sql = format!(
-        "SELECT DISTINCT TRIM(dpm.lens_model) AS lens
+        "SELECT TRIM(dpm.lens_model) AS lens
          FROM deterministic_photo_meta dpm
          JOIN assets a ON a.id = dpm.asset_id
          WHERE a.deleted_at_ms IS NULL
@@ -665,7 +716,8 @@ pub fn list_distinct_gear(
            AND {folder_l}
            AND dpm.lens_model IS NOT NULL
            AND TRIM(dpm.lens_model) != ''
-         ORDER BY lens ASC
+         GROUP BY lens
+         ORDER BY COUNT(*) DESC, lens ASC
          LIMIT 30"
     );
     let mut lens_stmt = conn.prepare(&lens_sql)?;
@@ -718,11 +770,41 @@ pub fn list_sql_filtered_assets(
     let offset_idx = params.len() + 1;
     params.push(Value::Integer(i64::from(offset)));
 
+    let order_clause = match req
+        .sort_by
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("capture_asc") => "v.effective_capture_at_ms ASC, v.id ASC",
+        Some("focal_asc") => {
+            "CASE WHEN dpm_s.focal_length_mm IS NULL THEN 1 ELSE 0 END ASC, dpm_s.focal_length_mm ASC, v.effective_capture_at_ms DESC"
+        }
+        Some("focal_desc") => {
+            "CASE WHEN dpm_s.focal_length_mm IS NULL THEN 1 ELSE 0 END ASC, dpm_s.focal_length_mm DESC, v.effective_capture_at_ms DESC"
+        }
+        Some("iso_desc") => {
+            "CASE WHEN dpm_s.iso IS NULL THEN 1 ELSE 0 END ASC, dpm_s.iso DESC, v.effective_capture_at_ms DESC"
+        }
+        Some("aperture_asc") => {
+            "CASE WHEN dpm_s.aperture_f IS NULL THEN 1 ELSE 0 END ASC, dpm_s.aperture_f ASC, v.effective_capture_at_ms DESC"
+        }
+        Some("shutter_asc") => {
+            "CASE WHEN dpm_s.shutter_speed_sec IS NULL THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec ASC, v.effective_capture_at_ms DESC"
+        }
+        Some("shutter_desc") => {
+            "CASE WHEN dpm_s.shutter_speed_sec IS NULL THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec DESC, v.effective_capture_at_ms DESC"
+        }
+        _ => "v.effective_capture_at_ms DESC, v.id DESC",
+    };
+
     let list_sql = format!(
         "SELECT {ASSET_SUMMARY_COLUMNS}
          FROM v_assets_effective v
+         LEFT JOIN deterministic_photo_meta dpm_s ON dpm_s.asset_id = v.id
          WHERE {where_sql}
-         ORDER BY v.effective_capture_at_ms DESC, v.id DESC
+         ORDER BY {order_clause}
          LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
     );
 

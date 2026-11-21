@@ -141,10 +141,12 @@ fn build_search_request_from_plan(
     };
 
     SearchRequest {
-        query: semantic.or(ocr),
+        query: semantic.clone().or_else(|| ocr.clone()),
+        ocr_query: if semantic.is_some() { ocr } else { None },
         mode,
         folder_id: None,
         person_ids,
+        has_people: plan.has_people,
         tags,
         camera_model: plan.camera_model.clone(),
         lens_model: plan.lens_model.clone(),
@@ -157,6 +159,7 @@ fn build_search_request_from_plan(
         shutter_speed_min_sec: plan.shutter_speed_min_sec,
         shutter_speed_max_sec: plan.shutter_speed_max_sec,
         orientation: plan.orientation.clone(),
+        sort_by: plan.sort_by.clone(),
         geo_query: plan.location_query.clone(),
         kind: plan.kind,
         favorite: plan.favorite,
@@ -230,6 +233,7 @@ fn apply_vlm_rerank_order(hits: &mut Vec<SearchHit>, ordered_ids: &[(String, f32
     }
 
     let tail = hits.split_off(top_count);
+    let original_order: Vec<String> = hits.iter().map(|h| h.asset.id.clone()).collect();
     let mut by_id: HashMap<String, SearchHit> =
         hits.drain(..).map(|h| (h.asset.id.clone(), h)).collect();
 
@@ -241,9 +245,11 @@ fn apply_vlm_rerank_order(hits: &mut Vec<SearchHit>, ordered_ids: &[(String, f32
             reordered.push(hit);
         }
     }
-    // Preserve any remaining candidates not explicitly ordered by the reranker.
-    for (_, hit) in by_id {
-        reordered.push(hit);
+    // Preserve original hybrid order for any remaining candidates not returned by the reranker.
+    for asset_id in original_order {
+        if let Some(hit) = by_id.remove(&asset_id) {
+            reordered.push(hit);
+        }
     }
     reordered.extend(tail);
     *hits = reordered;
@@ -451,7 +457,9 @@ pub async fn send_message(
     let search_req = build_search_request_from_plan(&plan, person_ids, search_limit);
 
     let has_any_search_criteria = search_req.query.is_some()
+        || search_req.ocr_query.is_some()
         || search_req.person_ids.is_some()
+        || search_req.has_people.is_some()
         || search_req.tags.is_some()
         || search_req.camera_model.is_some()
         || search_req.lens_model.is_some()
@@ -464,6 +472,7 @@ pub async fn send_message(
         || search_req.shutter_speed_min_sec.is_some()
         || search_req.shutter_speed_max_sec.is_some()
         || search_req.orientation.is_some()
+        || search_req.sort_by.is_some()
         || search_req.geo_query.is_some()
         || search_req.kind.is_some()
         || search_req.favorite.is_some()
@@ -587,11 +596,28 @@ pub async fn send_message(
         None
     };
 
+    let lower_prompt = content.to_ascii_lowercase();
+    let explicit_reset = [
+        "start over",
+        "reset",
+        "clear filter",
+        "clear all",
+        "new search",
+    ]
+    .iter()
+    .any(|kw| lower_prompt.contains(kw));
+    let persisted_filters = if !has_any_search_criteria && !explicit_reset {
+        session.active_filters.clone()
+    } else {
+        plan.clone()
+    };
+
     let user_id_write = rbac.auth.user.id.clone();
     let sid_write = session_id.clone();
     let user_content_write = content.clone();
     let asst_content_write = plan.assistant_reply.clone();
     let plan_write = plan.clone();
+    let persisted_filters_write = persisted_filters.clone();
     let planner_mode = search_resp.planner_mode;
 
     let (stored_user, stored_asst) = state
@@ -626,7 +652,7 @@ pub async fn send_message(
                 &tx,
                 &user_id_write,
                 &sid_write,
-                &plan_write,
+                &persisted_filters_write,
                 updated_title.as_deref(),
                 asst_ts_ms,
             )?;

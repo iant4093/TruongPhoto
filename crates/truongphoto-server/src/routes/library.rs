@@ -154,9 +154,13 @@ pub async fn get_asset_detail(
     AxumPath(asset_id): AxumPath<String>,
 ) -> Result<Json<AssetDetail>, AppError> {
     let scope = rbac.scope;
+    let user_id = rbac.auth.user.id;
+    let role = rbac.auth.user.role;
     let detail = state
         .db
-        .read(move |conn| repo::assets::get_asset_detail(conn, &scope, &asset_id))
+        .read(move |conn| {
+            repo::assets::get_asset_detail_for_user(conn, &scope, &asset_id, Some((&user_id, role)))
+        })
         .await?
         .ok_or_else(|| AppError::not_found("Asset not found."))?;
     Ok(Json(detail))
@@ -214,6 +218,7 @@ pub async fn update_overrides(
 
     let scope = rbac.scope;
     let actor_id = rbac.auth.user.id;
+    let role = rbac.auth.user.role;
     let detail = state
         .db
         .write(move |conn| {
@@ -223,8 +228,13 @@ pub async fn update_overrides(
             if updated.is_none() {
                 return Err(DbError::NotFound("Asset not found.".to_string()));
             }
-            let detail = repo::assets::get_asset_detail(&tx, &scope, &asset_id)?
-                .ok_or_else(|| DbError::NotFound("Asset not found.".to_string()))?;
+            let detail = repo::assets::get_asset_detail_for_user(
+                &tx,
+                &scope,
+                &asset_id,
+                Some((&actor_id, role)),
+            )?
+            .ok_or_else(|| DbError::NotFound("Asset not found.".to_string()))?;
             tx.commit()?;
             Ok(detail)
         })

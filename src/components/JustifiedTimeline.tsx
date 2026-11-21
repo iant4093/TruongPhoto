@@ -121,7 +121,8 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
   }, [assets]);
 
   const targetRowHeight = containerWidth < 768 ? 130 : 210;
-  const effectiveGridWidth = Math.max(240, containerWidth - 26);
+  // ResizeObserver contentRect.width already excludes .justified-timeline's right padding.
+  const effectiveGridWidth = Math.max(240, containerWidth);
 
   const rows: JustifiedRow[] = useMemo(
     () => computeJustifiedRows(assets, effectiveGridWidth, targetRowHeight, ROW_GAP),

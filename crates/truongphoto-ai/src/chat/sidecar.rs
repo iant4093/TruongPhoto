@@ -214,7 +214,7 @@ impl ChatRouterBackend for SidecarLlamaRouter {
 
         match parse_and_validate_router_plan(&content) {
             Ok(mut parsed) => {
-                sanitize_sidecar_plan(&input.user_message, &mut parsed);
+                sanitize_sidecar_plan(&input.user_message, &input.prior_filters, &mut parsed);
                 Ok(merge_router_plan(&input.prior_filters, &parsed))
             }
             Err(err) => {
@@ -243,12 +243,20 @@ impl ChatRouterBackend for SidecarLlamaRouter {
             return Ok(None);
         };
 
+        let valid_candidates: Vec<&RerankCandidate> = candidates
+            .iter()
+            .filter(|c| !c.thumb_bytes.is_empty())
+            .collect();
+        if valid_candidates.is_empty() {
+            return Ok(None);
+        }
+
         let mut user_parts = vec![json!({
             "type": "text",
             "text": format!(
                 "Score each candidate photo/video frame (0.0 to 1.0) for relevance to: \"{}\". Candidate IDs in order: {}",
                 user_message.trim(),
-                candidates
+                valid_candidates
                     .iter()
                     .map(|c| c.asset_id.as_str())
                     .collect::<Vec<_>>()
@@ -256,10 +264,7 @@ impl ChatRouterBackend for SidecarLlamaRouter {
             )
         })];
 
-        for c in candidates {
-            if c.thumb_bytes.is_empty() {
-                continue;
-            }
+        for c in &valid_candidates {
             let encoded = encode_base64(&c.thumb_bytes);
             user_parts.push(json!({
                 "type": "image_url",
@@ -505,18 +510,26 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
          - Prior active filters JSON: {}\n\
          Rules:\n\
          - Informational questions about the library itself (e.g. \"what cameras or lenses do I have?\", \"who are the people you know in my photos?\", \"hi\", \"what can you do?\"): answer directly and helpfully in \"assistant_reply\" using Library Context above, set clear_prior_filters=true, and leave ALL filter fields null / [] so no search runs!\n\
-         - Put ONLY actual visual subjects, animals, objects, scenes, or moods into \"semantic_query\" (e.g. \"waterfall in forest\", \"ape or monkey behind a fence\", \"mountain\", \"Eiffel Tower\", \"mountain sunrise\"). Generic terrain/nature words like \"mountain\", \"beach\", \"forest\", \"lake\", \"waterfall\", \"sunset\" belong in \"semantic_query\", NOT \"location_query\"! Do NOT put technical EXIF adjectives like \"low light\", \"high ISO\", \"crisp\", \"sharp\", \"wide open\", or \"telephoto\" into \"semantic_query\" when filtering by EXIF numbers.\n\
+         - Put ONLY positive visual subjects, animals, objects, scenes, or moods into \"semantic_query\" (e.g. \"waterfall in forest\", \"ape or monkey behind a fence\", \"mountain\", \"Eiffel Tower\", \"mountain sunrise\"). NEVER put negations like \"not graduation\" or \"without people\" into \"semantic_query\", and NEVER put generic terrain like \"mountain\", \"beach\", \"forest\", \"lake\", \"waterfall\", \"sunset\" into \"location_query\"! Do NOT put technical EXIF adjectives (\"low light\", \"high ISO\", \"crisp\", \"sharp\", \"wide open\", \"telephoto\") into \"semantic_query\" when filtering by EXIF numbers.\n\
          - Reserve \"location_query\" strictly for proper named places, cities, countries, parks, zoos, or specific landmarks (e.g. \"Multnomah Falls\", \"Portland Zoo\", \"Mount Saint Helens\", \"Bald Mountain\", \"Tokyo\", \"Antarctica\"). When filtering by a named place, leave \"semantic_query\": null UNLESS they also asked for a specific visual subject there (e.g. \"monkeys at Portland Zoo\" -> location_query: \"Portland Zoo\", semantic_query: \"monkey\").\n\
          - Put specific words/phrases that literally appear inside an image (e.g. \"receipt saying Target\", \"sign with Oregon\") into \"ocr_terms\". If the user asks generally for \"photos with signs or readable text\" without specifying a word, put \"sign or banner with readable text\" into \"semantic_query\" and leave \"ocr_terms\": null.\n\
-         - Match people (including typos/first names) against Known RBAC-visible person names into \"person_names\".\n\
+         - Match people (including typos/first names) against Known RBAC-visible person names into \"person_names\". For \"without people\" / \"no people\" / \"empty landscapes\", set \"has_people\": false (and leave \"person_names\": []).\n\
+         - Superlatives & sorting (\"sort_by\"): NEVER leave all filters and sort_by null for superlative requests!\n\
+           * \"widest angle / widest shots\" -> sort_by: \"focal_asc\" (leave semantic_query null unless a subject was also asked).\n\
+           * \"most zoomed in / longest focal length / telephoto extremes\" -> sort_by: \"focal_desc\".\n\
+           * \"highest ISO / grainiest / most sensitive\" -> sort_by: \"iso_desc\".\n\
+           * \"widest aperture / shallowest depth of field\" -> sort_by: \"aperture_asc\".\n\
+           * \"fastest shutter speed\" -> sort_by: \"shutter_asc\".\n\
+           * \"longest exposure / slowest shutter\" -> sort_by: \"shutter_desc\".\n\
+           * \"oldest photos\" -> sort_by: \"capture_asc\"; \"newest / most recent\" -> sort_by: \"capture_desc\".\n\
          - Camera, Orientation & EXIF fields (NEVER invent EXIF or orientation filters unless the user explicitly mentioned them; NEVER put focal length/lens/aperture/ISO/shutter into \"camera_model\"; framing words like \"close up\" are NOT apertures):\n\
            * \"camera_model\": camera body only (match Known camera bodies, e.g. \"Canon R7\" / \"cannon r7\" -> \"Canon EOS R7\").\n\
            * \"lens_model\": lens name only (match Known lenses, e.g. \"17-40 Art\" -> \"17-40mm F1.8 DC | Art 025\", \"100-400\" -> \"RF100-400mm F5.6-8 IS USM\").\n\
-           * \"focal_length_min_mm\" / \"focal_length_max_mm\": numeric mm range. For an EXACT focal length like \"at 12mm\" or \"56mm shots\", you MUST set BOTH min AND max to that exact number (e.g. \"12mm\" -> min: 12, max: 12). Only leave one side null for explicit bounds (\"under 15mm\" -> max: 15; \"over 300mm\" -> min: 300).\n\
-           * \"aperture_min_f\" / \"aperture_max_f\": numeric f-stop range. For an EXACT f-stop like \"f/1.4\" or \"narrow aperture f/8\", set BOTH min AND max to that exact number (e.g. \"f/8\" -> min: 8.0, max: 8.0). For \"wide open / bokeh / shallow depth of field\" -> max: 2.0; for \"f/8 or narrower\" -> min: 8.0.\n\
-           * \"iso_min\" / \"iso_max\": integer ISO range (exact \"ISO 100\" -> min: 100, max: 100; \"above 3200 / ISO 3200+\" -> min: 3200).\n\
-           * \"shutter_speed_min_sec\" / \"shutter_speed_max_sec\": decimal seconds! Faster shutter = SMALLER number (e.g. \"1/1000s or faster\" -> shutter_speed_max_sec: 0.001; \"1/500s or faster\" -> max: 0.002). Slower / long exposure = LARGER number (e.g. \"long exposure / slow shutter / silky water\" -> shutter_speed_min_sec: 0.05; \"1 second or longer\" -> min: 1.0).\n\
-           * \"orientation\": \"portrait\" (for vertical / tall / phone wallpaper), \"landscape\" (for horizontal / wide / desktop wallpaper), \"square\", or null.\n\
+           * \"focal_length_min_mm\" / \"focal_length_max_mm\": numeric mm range. For an EXACT focal length like \"at 12mm\" or \"56mm shots\", set BOTH min AND max to that exact number (e.g. \"12mm\" -> min: 12, max: 12). For bounds: \"under 15mm\" -> max: 15 (min: null); \"over 300mm\" -> min: 300 (max: null).\n\
+           * \"aperture_min_f\" / \"aperture_max_f\": numeric f-stop range. For an EXACT f-stop like \"f/1.4\" or \"f/8\", set BOTH min AND max to that exact number. For \"wide open / bokeh / shallow depth of field\" WITHOUT a specific f-stop number, set aperture_min_f: null AND aperture_max_f: 2.0 (NEVER set min=2.0, max=2.0!). For \"f/8 or narrower\" -> min: 8.0, max: null.\n\
+           * \"iso_min\" / \"iso_max\": integer ISO range (exact \"ISO 100\" -> min: 100, max: 100; \"above 3200 / ISO 3200+\" -> min: 3200, max: null).\n\
+           * \"shutter_speed_min_sec\" / \"shutter_speed_max_sec\": decimal seconds! Faster shutter = SMALLER number (\"1/1000s or faster\" -> shutter_speed_min_sec: null, shutter_speed_max_sec: 0.001). Slower / long exposure = LARGER number (\"long exposure / slow shutter / silky water\" -> shutter_speed_min_sec: 0.05, shutter_speed_max_sec: null — NEVER set max=0.05!).\n\
+           * \"orientation\": \"portrait\" (for vertical / tall / phone wallpaper), \"landscape\" (for horizontal / desktop wallpaper), \"square\", or null.\n\
          - For dates, months, or years, output ISO strings in \"date_from\" and \"date_to\" (format \"YYYY-MM-DD\"). Use full calendar months for \"this month\", \"last month\", and \"two months ago\" matching the Calendar month reference above! Leave both null if no date was mentioned.\n\
          - Leave \"tags\": [] UNLESS the user explicitly asks for a tag (e.g. \"tagged X\" or \"#X\"). Never invent speculative tags.\n\
          - Leave \"kind\": null unless the user explicitly asks for only photos, only videos, raw files, or live photos.\n\
@@ -540,16 +553,21 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
 
 /// Deterministic post-parse safety net for small local LLMs:
 /// 1. Strips hallucinated EXIF/orientation bounds when the user never asked about them
-///    (e.g., preventing "close up of a monkey" from hallucinating `aperture_max_f: 2.0`).
-/// 2. Completes one-sided exact EXIF bounds when the user asked for an exact value like "at 12mm"
-///    or "f/8" or "ISO 100" without explicit range/bound phrasing ("over", "under", "wider", etc.).
-fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
+///    (while preserving filters carried forward from `prior` on filter-removal turns).
+/// 2. Fixes common small-LLM exact-equality slips on open-ended bounds ("wide open" -> `<= 2.0`,
+///    "long exposure" -> `>= 0.05s`) and completes one-sided exact EXIF bounds ("at 12mm" -> `12..12`).
+/// 3. Ensures superlative queries ("widest angle", "most zoomed in", "highest ISO", "fastest shutter")
+///    always populate `sort_by`, and prevents informational "who are the people" queries from running
+///    an impossible AND search across all people.
+fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut RouterPlan) {
     let lower = user_message.to_ascii_lowercase();
 
     let has_lower_bound_cue = [
         "over ",
-        "above ",
+        "above",
         "more than",
+        "or more",
+        "or higher",
         "at least",
         "longer than",
         "greater than",
@@ -558,24 +576,32 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
         "or narrower",
         "or slower",
         "or longer",
+        "slower than",
         "zoomed",
+        "highest",
         "beyond ",
         ">=",
         ">",
-        "+",
     ]
     .iter()
-    .any(|kw| lower.contains(kw));
+    .any(|kw| lower.contains(kw))
+        || lower.split_whitespace().any(|w| {
+            w.ends_with('+') && w.len() >= 2 && w[..w.len() - 1].chars().any(|c| c.is_ascii_digit())
+        });
 
     let has_upper_bound_cue = [
         "under ",
-        "below ",
+        "below",
         "less than",
+        "or less",
+        "or lower",
         "shorter than",
         "wider than",
         "or wider",
         "or faster",
+        "faster than",
         "lower than",
+        "lowest",
         "at most",
         "up to ",
         "<=",
@@ -584,15 +610,7 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
     .iter()
     .any(|kw| lower.contains(kw));
 
-    let has_aperture_cue = lower.contains("f/")
-        || lower.contains("aperture")
-        || lower.contains("wide open")
-        || lower.contains("wide-open")
-        || lower.contains("bokeh")
-        || lower.contains("shallow")
-        || lower.contains("f-stop")
-        || lower.contains("f stop")
-        || lower.contains("depth of field")
+    let has_explicit_fstop = lower.contains("f/")
         || lower
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
             .any(|tok| {
@@ -601,22 +619,36 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
                     && tok[1..].chars().all(|c| c.is_ascii_digit() || c == '.')
                     && tok[1..].chars().any(|c| c.is_ascii_digit())
             });
+    let has_wide_open_phrase = lower.contains("wide open")
+        || lower.contains("wide-open")
+        || lower.contains("bokeh")
+        || lower.contains("shallow");
+    let has_aperture_cue = has_explicit_fstop
+        || has_wide_open_phrase
+        || lower.contains("aperture")
+        || lower.contains("f-stop")
+        || lower.contains("f stop")
+        || lower.contains("depth of field");
+    let prior_had_aperture = prior.aperture_min_f.is_some() || prior.aperture_max_f.is_some();
 
-    if !has_aperture_cue {
+    if !has_aperture_cue && !prior_had_aperture {
         plan.aperture_min_f = None;
         plan.aperture_max_f = None;
-    } else if let (Some(lo), None) = (plan.aperture_min_f, plan.aperture_max_f) {
-        if !has_lower_bound_cue {
-            plan.aperture_max_f = Some(lo);
+    } else if has_wide_open_phrase && !has_explicit_fstop {
+        // "wide open" without an explicit f-stop means <= max (never exact f/2.0 == f/2.0!).
+        if let Some(hi) = plan.aperture_max_f.or(plan.aperture_min_f) {
+            plan.aperture_min_f = None;
+            plan.aperture_max_f = Some(hi);
         }
-    } else if let (None, Some(hi)) = (plan.aperture_min_f, plan.aperture_max_f) {
-        if !has_upper_bound_cue
-            && !lower.contains("wide open")
-            && !lower.contains("wide-open")
-            && !lower.contains("bokeh")
-            && !lower.contains("shallow")
-        {
-            plan.aperture_min_f = Some(hi);
+    } else if has_aperture_cue {
+        if let (Some(lo), None) = (plan.aperture_min_f, plan.aperture_max_f) {
+            if !has_lower_bound_cue {
+                plan.aperture_max_f = Some(lo);
+            }
+        } else if let (None, Some(hi)) = (plan.aperture_min_f, plan.aperture_max_f) {
+            if !has_upper_bound_cue && !has_wide_open_phrase {
+                plan.aperture_min_f = Some(hi);
+            }
         }
     }
 
@@ -624,78 +656,85 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
         || lower.contains("grain")
         || lower.contains("noisy")
         || lower.contains("noise");
+    let prior_had_iso = prior.iso_min.is_some() || prior.iso_max.is_some();
 
-    if !has_iso_cue {
+    if !has_iso_cue && !prior_had_iso {
         plan.iso_min = None;
         plan.iso_max = None;
-    } else if let (Some(lo), None) = (plan.iso_min, plan.iso_max) {
-        if !has_lower_bound_cue && !lower.contains("high iso") {
-            plan.iso_max = Some(lo);
-        }
-    } else if let (None, Some(hi)) = (plan.iso_min, plan.iso_max) {
-        if !has_upper_bound_cue && !lower.contains("low iso") {
-            plan.iso_min = Some(hi);
+    } else if has_iso_cue {
+        if let (Some(lo), None) = (plan.iso_min, plan.iso_max) {
+            if !has_lower_bound_cue && !lower.contains("high iso") {
+                plan.iso_max = Some(lo);
+            }
+        } else if let (None, Some(hi)) = (plan.iso_min, plan.iso_max) {
+            if !has_upper_bound_cue && !lower.contains("low iso") {
+                plan.iso_min = Some(hi);
+            }
         }
     }
 
-    let has_focal_cue = lower.contains("mm")
-        || lower.contains("focal")
-        || lower.contains("wide")
-        || lower.contains("telephoto")
-        || lower.contains("zoom")
-        || lower.contains("fisheye");
+    let lower_no_wide_open = lower.replace("wide open", "").replace("wide-open", "");
+    let has_focal_cue = lower_no_wide_open.contains("mm")
+        || lower_no_wide_open.contains("focal")
+        || lower_no_wide_open.contains("wide")
+        || lower_no_wide_open.contains("telephoto")
+        || lower_no_wide_open.contains("zoom")
+        || lower_no_wide_open.contains("fisheye");
+    let prior_had_focal =
+        prior.focal_length_min_mm.is_some() || prior.focal_length_max_mm.is_some();
 
-    if !has_focal_cue {
+    if !has_focal_cue && !prior_had_focal {
         plan.focal_length_min_mm = None;
         plan.focal_length_max_mm = None;
-    } else if let (Some(lo), None) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
-        if !has_lower_bound_cue && !lower.contains("telephoto") {
-            plan.focal_length_max_mm = Some(lo);
-        }
-    } else if let (None, Some(hi)) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
-        if !has_upper_bound_cue && !lower.contains("wide") && !lower.contains("fisheye") {
-            plan.focal_length_min_mm = Some(hi);
+    } else if has_focal_cue {
+        if let (Some(lo), None) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
+            if !has_lower_bound_cue && !lower_no_wide_open.contains("telephoto") {
+                plan.focal_length_max_mm = Some(lo);
+            }
+        } else if let (None, Some(hi)) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
+            if !has_upper_bound_cue
+                && !lower_no_wide_open.contains("wide")
+                && !lower_no_wide_open.contains("fisheye")
+            {
+                plan.focal_length_min_mm = Some(hi);
+            }
         }
     }
 
+    let has_long_exp_phrase = lower.contains("long exposure")
+        || lower.contains("slow shutter")
+        || lower.contains("silky")
+        || lower.contains("motion blur");
+    let has_explicit_shutter_frac = lower.contains("1/");
     let has_shutter_cue = lower.contains("shutter")
         || lower.contains("exposure")
-        || lower.contains("silky")
-        || lower.contains("motion blur")
+        || has_long_exp_phrase
         || lower.contains("freeze")
-        || lower.contains("1/")
+        || has_explicit_shutter_frac
         || lower.contains("sec");
+    let prior_had_shutter =
+        prior.shutter_speed_min_sec.is_some() || prior.shutter_speed_max_sec.is_some();
 
-    if !has_shutter_cue {
+    if !has_shutter_cue && !prior_had_shutter {
         plan.shutter_speed_min_sec = None;
         plan.shutter_speed_max_sec = None;
-    } else if let (None, Some(v)) = (plan.shutter_speed_min_sec, plan.shutter_speed_max_sec) {
-        if lower.contains("long exposure")
-            || lower.contains("slow shutter")
-            || lower.contains("silky")
-            || lower.contains("or slower")
-            || lower.contains("or longer")
-        {
-            plan.shutter_speed_min_sec = Some(v);
-            plan.shutter_speed_max_sec = None;
+    } else if has_shutter_cue {
+        if has_long_exp_phrase && !has_upper_bound_cue && !has_explicit_shutter_frac {
+            // "long exposure / silky" means >= min (never exact 0.05..0.05 or <= 0.05!).
+            if let Some(lo) = plan.shutter_speed_min_sec.or(plan.shutter_speed_max_sec) {
+                plan.shutter_speed_min_sec = Some(lo);
+                plan.shutter_speed_max_sec = None;
+            }
+        } else if let (Some(v), None) = (plan.shutter_speed_min_sec, plan.shutter_speed_max_sec) {
+            if lower.contains("fast shutter")
+                || lower.contains("fastest")
+                || lower.contains("or faster")
+                || lower.contains("freeze")
+            {
+                plan.shutter_speed_max_sec = Some(v);
+                plan.shutter_speed_min_sec = None;
+            }
         }
-    } else if let (Some(v), None) = (plan.shutter_speed_min_sec, plan.shutter_speed_max_sec) {
-        if lower.contains("fast shutter") || lower.contains("or faster") || lower.contains("freeze")
-        {
-            plan.shutter_speed_max_sec = Some(v);
-            plan.shutter_speed_min_sec = None;
-        }
-    }
-
-    let is_who_are_people_info_q = (lower.contains("who are the people")
-        || lower.contains("what people")
-        || lower.contains("which people")
-        || lower.contains("list the people")
-        || lower.contains("who do you know"))
-        && !lower.contains("show me")
-        && !lower.contains("find ");
-    if is_who_are_people_info_q && plan.person_names.len() >= 3 {
-        plan.person_names.clear();
     }
 
     let has_orientation_cue = lower.contains("vertical")
@@ -706,8 +745,56 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
         || lower.contains("landscape")
         || lower.contains("square");
 
-    if !has_orientation_cue {
+    if !has_orientation_cue && prior.orientation.is_none() {
         plan.orientation = None;
+    }
+
+    // Superlative safety net: ensure superlatives always populate `sort_by` so they never execute
+    // as empty queries.
+    if plan.sort_by.is_none() {
+        if lower.contains("widest angle")
+            || lower.contains("widest shot")
+            || lower.contains("widest photo")
+        {
+            plan.sort_by = Some("focal_asc".to_string());
+            if plan
+                .semantic_query
+                .as_deref()
+                .is_some_and(|s| s.to_ascii_lowercase().contains("wide"))
+            {
+                plan.semantic_query = None;
+            }
+        } else if lower.contains("most zoomed") || lower.contains("longest focal") {
+            plan.sort_by = Some("focal_desc".to_string());
+        } else if lower.contains("highest iso") {
+            plan.sort_by = Some("iso_desc".to_string());
+        } else if lower.contains("fastest shutter") {
+            plan.sort_by = Some("shutter_asc".to_string());
+        } else if lower.contains("longest exposure") || lower.contains("slowest shutter") {
+            plan.sort_by = Some("shutter_desc".to_string());
+        }
+    }
+
+    // Negation safety net: "without people" / "no people" -> has_people = Some(false).
+    if lower.contains("without people")
+        || lower.contains("without any people")
+        || lower.contains("no people")
+        || lower.contains("nobody in")
+    {
+        plan.has_people = Some(false);
+    }
+
+    // Informational "who are the people" guard: never run an AND-search over all people.
+    let is_who_are_people_info_q = (lower.contains("who are the people")
+        || lower.contains("what people")
+        || lower.contains("which people")
+        || lower.contains("list the people")
+        || lower.contains("who do you know"))
+        && !lower.contains("show me")
+        && !lower.contains("find ");
+    if is_who_are_people_info_q {
+        plan.person_names.clear();
+        plan.has_people = None;
     }
 }
 
