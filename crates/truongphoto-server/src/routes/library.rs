@@ -197,6 +197,20 @@ pub async fn update_overrides(
             return Err(AppError::validation("rating must be between 0 and 5."));
         }
     }
+    if let Some(lat) = req.gps_lat {
+        if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+            return Err(AppError::validation(
+                "gps_lat must be a finite number between -90 and 90.",
+            ));
+        }
+    }
+    if let Some(lon) = req.gps_lon {
+        if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+            return Err(AppError::validation(
+                "gps_lon must be a finite number between -180 and 180.",
+            ));
+        }
+    }
 
     let scope = rbac.scope;
     let actor_id = rbac.auth.user.id;

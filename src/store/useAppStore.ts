@@ -258,15 +258,11 @@ export const useAppStore = create<AppState>((set, get) => {
     ...initialDataState,
 
     setActiveNav: (nav) =>
-      set((s) => {
-        const supportsInspector =
-          nav === 'timeline' || nav === 'people' || nav === 'albums' || nav === 'favorites';
-        return {
-          activeNav: nav,
-          inspectorOpen: supportsInspector ? s.inspectorOpen : false,
-          ...(nav === 'chat' ? { chatDrawerOpen: false } : {}),
-        };
-      }),
+      set(() => ({
+        activeNav: nav,
+        selectedAssetId: null,
+        ...(nav === 'chat' ? { chatDrawerOpen: false } : {}),
+      })),
     toggleInspector: () =>
       set((s) => ({
         inspectorOpen: !s.inspectorOpen,
@@ -292,6 +288,7 @@ export const useAppStore = create<AppState>((set, get) => {
         lightboxAssetId: null,
         lightboxAssetIds: [],
         lightboxInitialTimestampSec: null,
+        selectedAssetId: null,
       }),
     setLightboxAsset: (assetId) =>
       set({

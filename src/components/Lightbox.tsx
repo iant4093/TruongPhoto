@@ -138,6 +138,20 @@ export const Lightbox: React.FC = () => {
     };
   }, [lightboxAssetId]);
 
+  // Preload adjacent prev/next photo previews in the background for instantaneous arrow navigation.
+  useEffect(() => {
+    if (!lightboxAssetId || currentIndex < 0) return;
+    const neighbors = [
+      lightboxAssetIds[currentIndex + 1],
+      lightboxAssetIds[currentIndex - 1],
+    ].filter((id): id is string => Boolean(id));
+    for (const id of neighbors) {
+      const img = new Image();
+      img.decoding = 'async';
+      img.src = mediaPreviewUrl(id);
+    }
+  }, [currentIndex, lightboxAssetId, lightboxAssetIds]);
+
   const handleToggleFavorite = useCallback(async () => {
     if (!canMutate || !lightboxAssetId || !detail) return;
     const nextFav = !detail.summary.is_favorite;

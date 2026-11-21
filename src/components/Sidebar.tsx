@@ -57,6 +57,9 @@ export const Sidebar: React.FC = () => {
   const wsConnected = useAppStore((s) => s.wsConnected);
   const throttleStatus = useAppStore((s) => s.throttleStatus);
   const activeJobs = useAppStore((s) => s.activeJobs);
+  const inspectorOpen = useAppStore((s) => s.inspectorOpen);
+  const toggleInspector = useAppStore((s) => s.toggleInspector);
+  const selectAsset = useAppStore((s) => s.selectAsset);
 
   const assetCount = systemInfo?.stats.asset_count ?? 0;
   const activeJobCount = Object.keys(activeJobs).length;
@@ -96,13 +99,22 @@ export const Sidebar: React.FC = () => {
         {PRIMARY_NAV_ITEMS.map(renderNavButton)}
         <div className="sidebar-spacer" />
         <StatusBanner />
-        <div className="sidebar-resources">
+        <button
+          type="button"
+          className={`sidebar-resources sidebar-status-trigger${inspectorOpen ? ' is-active' : ''}`}
+          aria-pressed={inspectorOpen}
+          title="Open Server Status & Activity"
+          onClick={() => {
+            selectAsset(null);
+            toggleInspector();
+          }}
+        >
           <div className="resource-row">
             <span>Photos</span>
             <span>{assetCount.toLocaleString()}</span>
           </div>
           <div className="resource-row">
-            <span>Status</span>
+            <span>Server</span>
             <span className="row" style={{ gap: 5 }}>
               <span
                 className={`ws-dot ${wsConnected ? 'is-connected' : ''}`}
@@ -116,7 +128,7 @@ export const Sidebar: React.FC = () => {
               {formatThrottlePillLabel(throttleStatus)}
             </div>
           )}
-        </div>
+        </button>
         {renderNavButton(SETTINGS_NAV_ITEM)}
       </nav>
     </aside>

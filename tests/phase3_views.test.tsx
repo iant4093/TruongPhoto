@@ -625,7 +625,8 @@ describe('MapView offline-first jsdom fallback & cluster strip', () => {
       </>,
     );
 
-    const statusPill = await screen.findByTestId('map-status-pill');
+    await screen.findByText(/14 geotagged/i);
+    const statusPill = screen.getByTestId('map-status-pill');
     expect(statusPill.textContent).toContain('Offline Map');
     expect(statusPill.textContent).toContain('14 geotagged');
     expect(screen.getByRole('button', { name: /Fit All/i })).toBeTruthy();

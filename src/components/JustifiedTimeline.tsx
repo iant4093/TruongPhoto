@@ -181,6 +181,19 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
     setAlbumPickerOpen(false);
   }, []);
 
+  // Pressing Escape clears active multi-selection cleanly when no modal/lightbox is on top.
+  useEffect(() => {
+    if (selectedIds.size === 0) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (useAppStore.getState().lightboxAssetId) return;
+      event.preventDefault();
+      clearSelection();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [clearSelection, selectedIds.size]);
+
   const toggleSelect = useCallback(
     (assetId: string, shiftKey: boolean) => {
       const idx = assetIndexById.get(assetId) ?? -1;

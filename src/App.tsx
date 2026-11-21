@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { LogOut, PanelRight, Search, Upload, UploadCloud, X } from 'lucide-react';
+import { LogOut, Search, Upload, UploadCloud, X } from 'lucide-react';
 import { ChatDrawer } from './components/ChatDrawer';
 import { ContextMenuHost } from './components/ContextMenu';
 import { FeedbackHost } from './components/Feedback';
@@ -56,10 +56,13 @@ export const App: React.FC = () => {
   const searchActive = useAppStore((s) => s.searchActive);
   const uploadModalOpen = useAppStore((s) => s.uploadModalOpen);
   const chatDrawerOpen = useAppStore((s) => s.chatDrawerOpen);
+  const wsConnected = useAppStore((s) => s.wsConnected);
+  const activeJobs = useAppStore((s) => s.activeJobs);
 
   const bootstrap = useAppStore((s) => s.bootstrap);
   const logout = useAppStore((s) => s.logout);
   const setActiveNav = useAppStore((s) => s.setActiveNav);
+  const selectAsset = useAppStore((s) => s.selectAsset);
   const setInspectorOpen = useAppStore((s) => s.setInspectorOpen);
   const toggleInspector = useAppStore((s) => s.toggleInspector);
   const setChatDrawerOpen = useAppStore((s) => s.setChatDrawerOpen);
@@ -70,9 +73,9 @@ export const App: React.FC = () => {
 
   const canUpload = user?.role === 'admin' || user?.role === 'contributor';
   const showSearchOmnibar = searchActive || MEDIA_GRID_TABS.has(activeNav);
-  const showInspectorControl = searchActive || MEDIA_GRID_TABS.has(activeNav);
   const showUploadControl = canUpload && (searchActive || UPLOAD_TABS.has(activeNav));
   const hideWorkspaceHeader = !searchActive && activeNav === 'chat';
+  const activeJobCount = Object.keys(activeJobs).length;
 
   const [windowDragActive, setWindowDragActive] = useState(false);
   const [droppedFiles, setDroppedFiles] = useState<File[]>([]);
@@ -143,9 +146,10 @@ export const App: React.FC = () => {
 
   const closeInspector = useCallback(() => {
     setInspectorOpen(false);
+    selectAsset(null);
     const opener = openerRef.current;
     if (opener?.isConnected) opener.focus();
-  }, [setInspectorOpen]);
+  }, [selectAsset, setInspectorOpen]);
 
   const handleCloseUploadModal = useCallback(() => {
     setUploadModalOpen(false);
@@ -369,27 +373,35 @@ export const App: React.FC = () => {
                 <span>Sign Out</span>
               </button>
 
-              {showInspectorControl && (
-                <button
-                  type="button"
-                  className={`button details-toggle ${inspectorOpen ? 'is-active' : ''}`}
-                  aria-pressed={inspectorOpen}
-                  onClick={(event) => {
-                    openerRef.current = event.currentTarget;
-                    toggleInspector();
-                  }}
-                >
-                  <PanelRight size={14} />
-                  <span className="header-btn-label">Inspector</span>
-                </button>
-              )}
+              <button
+                type="button"
+                className={`button details-toggle status-pill-btn ${inspectorOpen ? 'is-active' : ''}`}
+                aria-pressed={inspectorOpen}
+                aria-label="Server Status"
+                title="Server Status & Activity"
+                onClick={(event) => {
+                  openerRef.current = event.currentTarget;
+                  if (!inspectorOpen) {
+                    selectAsset(null);
+                  }
+                  toggleInspector();
+                }}
+              >
+                <span
+                  className={`status-live-dot${wsConnected ? ' is-online' : ' is-offline'}${activeJobCount > 0 ? ' is-busy' : ''}`}
+                  aria-hidden="true"
+                />
+                <span className="header-btn-label">
+                  {activeJobCount > 0 ? 'Indexing…' : 'Status'}
+                </span>
+              </button>
 
               {isTauri() && windowsCaption && <WindowsCaptionButtons />}
             </div>
           </header>
         )}
 
-        <div className={`workspace-body ${inspectorOpen && showInspectorControl ? 'with-inspector' : ''}`}>
+        <div className="workspace-body">
           <main className="content-viewport">
             {searchActive ? (
               <div key="search" className="view-content is-full-bleed">
@@ -411,9 +423,9 @@ export const App: React.FC = () => {
             )}
           </main>
 
-          {((inspectorOpen && showInspectorControl) || chatDrawerOpen) && (
+          {(inspectorOpen || chatDrawerOpen) && (
             <div
-              className="inspector-scrim"
+              className="status-drawer-scrim"
               aria-hidden="true"
               onClick={() => {
                 if (inspectorOpen) closeInspector();
@@ -422,19 +434,17 @@ export const App: React.FC = () => {
             />
           )}
 
-          {showInspectorControl && (
-            <div
-              className="inspector-slot"
-              inert={!inspectorOpen}
-              aria-hidden={!inspectorOpen}
-            >
-              <InspectorDrawer
-                open={inspectorOpen}
-                closeRef={closeButtonRef}
-                onClose={closeInspector}
-              />
-            </div>
-          )}
+          <div
+            className={`status-drawer-slot${inspectorOpen ? ' is-open' : ''}`}
+            inert={!inspectorOpen}
+            aria-hidden={!inspectorOpen}
+          >
+            <InspectorDrawer
+              open={inspectorOpen}
+              closeRef={closeButtonRef}
+              onClose={closeInspector}
+            />
+          </div>
 
           <ChatDrawer />
         </div>

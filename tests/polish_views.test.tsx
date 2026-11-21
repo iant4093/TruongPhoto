@@ -2,6 +2,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContextMenuHost } from '../src/components/ContextMenu';
+import { InspectorDrawer } from '../src/components/InspectorDrawer';
 import { Lightbox } from '../src/components/Lightbox';
 import { ChatView } from '../src/components/views/ChatView';
 import { useAppStore } from '../src/store/useAppStore';
@@ -222,5 +223,67 @@ describe('Polished Native UX Features', () => {
     expect(await screen.findByRole('menu', { name: 'Context actions' })).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: /Ask AI Assistant/i })).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: /Open Settings/i })).toBeTruthy();
+  });
+
+  it('defaults InspectorDrawer to Server Status when not in a photo and clears selection on Lightbox close', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/system/info') {
+          return jsonResponse({
+            version: '0.1.0',
+            platform: 'macos',
+            arch: 'aarch64',
+            hostname: 'ian-mac',
+            bind_host: '127.0.0.1',
+            port: 38420,
+            mdns_enabled: true,
+            mdns_active: true,
+            mdns_url: 'http://truongphoto.local:38420',
+            lan_urls: ['http://192.168.1.10:38420'],
+            tailscale_url: null,
+            desktop_pin_lock: false,
+            hardware: {
+              total_ram_bytes: 36 * 1024 ** 3,
+              cpu_cores: 14,
+              recommended_vision_tier: 'tier3',
+              recommended_chat_tier: 'tier3',
+            },
+            power: { sleeping: false, display_asleep: false, session_locked: false, on_battery: false },
+            throttle: null,
+            stats: { asset_count: 453, folder_count: 1, db_size_bytes: 12_000_000 },
+          });
+        }
+        if (url === '/api/admin/ai/models') {
+          return jsonResponse({ error: { code: 'FORBIDDEN', message: 'skip' } }, 403);
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      }),
+    );
+
+    useAppStore.getState().openLightbox('a-1', ['a-1']);
+    expect(useAppStore.getState().selectedAssetId).toBe('a-1');
+    useAppStore.getState().closeLightbox();
+    expect(useAppStore.getState().selectedAssetId).toBeNull();
+
+    useAppStore.setState({
+      authenticated: true,
+      wsConnected: true,
+      user: {
+        id: 'u-1',
+        username: 'ian',
+        display_name: 'Ian',
+        role: 'viewer',
+        avatar_color: '#4a4a4a',
+      },
+    });
+
+    const closeRef = { current: null };
+    render(<InspectorDrawer open={true} closeRef={closeRef} onClose={() => {}} />);
+
+    expect(await screen.findByText('Server Status')).toBeTruthy();
+    expect(await screen.findByText('ian-mac')).toBeTruthy();
+    expect(screen.getByText('Online')).toBeTruthy();
   });
 });
