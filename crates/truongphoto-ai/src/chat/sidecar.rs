@@ -462,17 +462,21 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
     format!(
         "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a strict RouterPlan JSON object.\n\
          Rules:\n\
-         - Current UTC date: {}\n\
+         - Current UTC date: {} (today is {})\n\
          - Known RBAC-visible person names: {:?}\n\
          - Prior active filters JSON: {}\n\
-         - Put visual concepts, subjects, scenes, or moods in \"semantic_query\" (e.g. \"cars at night\", \"portrait outdoors\", \"sunset beach\").\n\
+         - Put ANY visual subject, animal, landmark, scene, object, or mood into \"semantic_query\" (e.g. \"waterfall in forest\", \"chimpanzee or monkey\", \"Eiffel Tower\", \"mountain sunrise\"). Never leave \"semantic_query\" null when the user asks for a visual subject or landmark.\n\
+         - Put text that literally appears inside an image (signs, receipts, banners, words) into \"ocr_terms\".\n\
+         - Match people against Known RBAC-visible person names into \"person_names\".\n\
+         - For dates or months/years, output ISO strings in \"date_from\" and \"date_to\" (format \"YYYY-MM-DD\", e.g. November 2026 -> date_from: \"2026-11-01\", date_to: \"2026-11-30\"). Leave both null if no date was mentioned.\n\
          - Leave \"tags\": [] UNLESS the user explicitly asks for a tag (e.g. \"tagged X\" or \"#X\"). Never invent speculative tags.\n\
          - Leave \"kind\": null unless the user explicitly asks for only photos, only videos, raw files, or live photos.\n\
-         - If the user greets you (e.g. \"hi\", \"hello\", \"hey\", \"help\") or asks a general question without requesting photos, set clear_prior_filters=true, set all filter fields to null / [], and write a warm, concise assistant_reply suggesting example photo searches.\n\
-         - Set clear_prior_filters=true ONLY when the user resets/starts over or asks for an unrelated topic instead.\n\
-         - Never invent file paths or extra JSON keys.\n\
-         - Populate concise, helpful assistant_reply and 2-3 short follow_up_suggestions.",
+         - If the user greets you (e.g. \"hi\", \"hello\", \"thanks\") or asks what you can do without requesting photos, set clear_prior_filters=true, set all filter fields to null / [], and reply warmly and concisely.\n\
+         - Set clear_prior_filters=true when the user starts over or switches to an unrelated topic; set false when refining the previous search.\n\
+         - Write a crisp, natural 1-sentence \"assistant_reply\" in active voice (e.g. \"Here are your waterfall photos.\" or \"Showing photos with Sebastian and Carson.\"). Avoid repeating boilerplate like \"Would you like to narrow it down by location, time of day...\".\n\
+         - Provide 2-3 short, varied \"follow_up_suggestions\". Never invent file paths or extra JSON keys.",
         input.current_date_utc.to_rfc3339(),
+        input.current_date_utc.format("%Y-%m-%d"),
         input.known_person_names,
         prior_json,
     )

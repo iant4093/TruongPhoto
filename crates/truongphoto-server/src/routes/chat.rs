@@ -80,6 +80,21 @@ fn resolve_rbac_person_ids(
                     .as_deref()
                     .is_some_and(|n| n.trim().eq_ignore_ascii_case(trimmed))
             })
+            .or_else(|| {
+                // Fall back to unique first-name / word-token match (e.g. "Nate" -> "Nate Higgers").
+                let mut token_matches = visible_people.iter().filter(|p| {
+                    p.name.as_deref().is_some_and(|n| {
+                        n.split_whitespace()
+                            .any(|word| word.eq_ignore_ascii_case(trimmed))
+                    })
+                });
+                let first = token_matches.next();
+                if token_matches.next().is_none() {
+                    first
+                } else {
+                    None
+                }
+            })
             .map(|p| p.id.clone());
 
         let pid = matched_id.unwrap_or_else(|| UNMATCHED_PERSON_SENTINEL.to_string());
@@ -514,7 +529,20 @@ pub async fn send_message(
     }
 
     if plan.assistant_reply.trim().is_empty() {
-        plan.assistant_reply = format!("Found {} matching item(s).", search_resp.total_count);
+        plan.assistant_reply = if search_resp.items.is_empty() {
+            "No matching photos or videos found for those filters.".to_string()
+        } else {
+            format!("Found {} matching item(s).", search_resp.total_count)
+        };
+    } else if has_any_search_criteria && search_resp.items.is_empty() {
+        let lower = plan.assistant_reply.to_ascii_lowercase();
+        if !lower.contains("no match")
+            && !lower.contains("couldn't find")
+            && !lower.contains("didn't find")
+            && !lower.contains("none found")
+        {
+            plan.assistant_reply = "I searched your library, but didn't find any matching photos or videos. Try broadening the description or starting a new search.".to_string();
+        }
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;

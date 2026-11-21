@@ -162,7 +162,7 @@ impl OrtSiglip2Backend {
         let dim = tier.dim();
         let expected_bytes = PHOTOGRAPHY_TAGS.len() * dim * std::mem::size_of::<f32>();
         let cache_path =
-            model_dir(&self.models_dir, tier.vision_model_id()).join("tag_bank_v1.bin");
+            model_dir(&self.models_dir, tier.vision_model_id()).join("tag_bank_v2.bin");
 
         if let Ok(raw) = std::fs::read(&cache_path) {
             if raw.len() == expected_bytes {

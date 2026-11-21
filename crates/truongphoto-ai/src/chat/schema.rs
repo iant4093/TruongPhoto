@@ -1,9 +1,12 @@
 use crate::AiError;
+use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashSet;
 use truongphoto_core::RouterPlan;
 
 /// Strict JSON Schema for `RouterPlan` structured output (`additionalProperties: false`).
+/// Uses human-readable ISO date strings (`date_from` / `date_to` as `YYYY-MM-DD`) so local LLMs
+/// never have to compute 13-digit Unix millisecond timestamps in their head.
 pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "RouterPlan",
@@ -18,8 +21,8 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     "tags",
     "kind",
     "favorite",
-    "date_from_ms",
-    "date_to_ms",
+    "date_from",
+    "date_to",
     "clear_prior_filters",
     "assistant_reply",
     "follow_up_suggestions"
@@ -42,8 +45,8 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
       "enum": ["photo", "video", "live_photo", "motion_photo", "raw_jpg_stack", null]
     },
     "favorite": { "type": ["boolean", "null"] },
-    "date_from_ms": { "type": ["integer", "null"] },
-    "date_to_ms": { "type": ["integer", "null"] },
+    "date_from": { "type": ["string", "null"] },
+    "date_to": { "type": ["string", "null"] },
     "clear_prior_filters": { "type": "boolean" },
     "assistant_reply": { "type": "string" },
     "follow_up_suggestions": {
@@ -62,12 +65,72 @@ const ALLOWED_ROUTER_PLAN_KEYS: &[&str] = &[
     "tags",
     "kind",
     "favorite",
+    "date_from",
+    "date_to",
     "date_from_ms",
     "date_to_ms",
     "clear_prior_filters",
     "assistant_reply",
     "follow_up_suggestions",
 ];
+
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    let (next_y, next_m) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    NaiveDate::from_ymd_opt(next_y, next_m, 1)
+        .and_then(|d| d.pred_opt())
+        .map(|d| d.day())
+        .unwrap_or(28)
+}
+
+/// Parses an ISO date string (`YYYY-MM-DD`, `YYYY-MM`, or `YYYY`, or RFC3339 prefix)
+/// into UTC epoch milliseconds (start of period when `is_end == false`, end of day when `is_end == true`).
+fn parse_iso_date_to_ms(raw: &str, is_end: bool) -> Option<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Strip time component if the LLM emitted YYYY-MM-DDTHH:MM:SSZ
+    let date_part = trimmed.split(['T', ' ']).next().unwrap_or(trimmed);
+    let parts: Vec<&str> = date_part.split('-').collect();
+    let naive = match parts.as_slice() {
+        [y, m, d] => {
+            let year = y.parse::<i32>().ok()?;
+            let month = m.parse::<u32>().ok()?;
+            let day = d.parse::<u32>().ok()?;
+            NaiveDate::from_ymd_opt(year, month, day)?
+        }
+        [y, m] => {
+            let year = y.parse::<i32>().ok()?;
+            let month = m.parse::<u32>().ok()?;
+            let day = if is_end {
+                last_day_of_month(year, month)
+            } else {
+                1
+            };
+            NaiveDate::from_ymd_opt(year, month, day)?
+        }
+        [y] if y.len() == 4 => {
+            let year = y.parse::<i32>().ok()?;
+            if is_end {
+                NaiveDate::from_ymd_opt(year, 12, 31)?
+            } else {
+                NaiveDate::from_ymd_opt(year, 1, 1)?
+            }
+        }
+        _ => return None,
+    };
+
+    let dt = if is_end {
+        naive.and_hms_milli_opt(23, 59, 59, 999)?
+    } else {
+        naive.and_hms_milli_opt(0, 0, 0, 0)?
+    };
+    Some(Utc.from_utc_datetime(&dt).timestamp_millis())
+}
 
 fn normalize_opt_string(value: Option<String>) -> Option<String> {
     value.and_then(|s| {
@@ -106,11 +169,11 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
         return Err(AiError::InvalidInput("empty RouterPlan JSON".to_string()));
     }
 
-    let value: Value = serde_json::from_str(trimmed)
+    let mut value: Value = serde_json::from_str(trimmed)
         .map_err(|e| AiError::InvalidInput(format!("malformed RouterPlan JSON: {e}")))?;
 
     let obj = value
-        .as_object()
+        .as_object_mut()
         .ok_or_else(|| AiError::InvalidInput("RouterPlan JSON must be an object".to_string()))?;
 
     for key in obj.keys() {
@@ -118,6 +181,27 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
             return Err(AiError::InvalidInput(format!(
                 "unknown or hallucinated RouterPlan field `{key}`"
             )));
+        }
+    }
+
+    // Deterministically convert ISO date strings (`date_from` / `date_to`) into UTC epoch ms.
+    let iso_from = obj
+        .remove("date_from")
+        .and_then(|v| v.as_str().map(str::to_string));
+    let iso_to = obj
+        .remove("date_to")
+        .and_then(|v| v.as_str().map(str::to_string));
+
+    if let Some(raw) = iso_from {
+        if let Some(ms) = parse_iso_date_to_ms(&raw, false) {
+            obj.entry("date_from_ms".to_string())
+                .or_insert_with(|| Value::from(ms));
+        }
+    }
+    if let Some(raw) = iso_to {
+        if let Some(ms) = parse_iso_date_to_ms(&raw, true) {
+            obj.entry("date_to_ms".to_string())
+                .or_insert_with(|| Value::from(ms));
         }
     }
 

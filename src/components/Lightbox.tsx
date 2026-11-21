@@ -55,6 +55,8 @@ export const Lightbox: React.FC = () => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
+  const [hiResLoadedUrl, setHiResLoadedUrl] = useState<string | null>(null);
+  const [hiResLoading, setHiResLoading] = useState(false);
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -116,6 +118,8 @@ export const Lightbox: React.FC = () => {
     setLivePlaying(false);
     setZoom(1);
     setPan({ x: 0, y: 0 });
+    setHiResLoadedUrl(null);
+    setHiResLoading(false);
 
     void getAssetDetail(lightboxAssetId)
       .then((res) => {
@@ -229,7 +233,7 @@ export const Lightbox: React.FC = () => {
         case '+':
         case '=':
           event.preventDefault();
-          setZoom((prev) => Math.min(4, Number((prev + 0.5).toFixed(2))));
+          setZoom((prev) => Math.min(5, Number((prev + 0.5).toFixed(2))));
           break;
         case '-':
           event.preventDefault();
@@ -278,8 +282,6 @@ export const Lightbox: React.FC = () => {
     lightboxAssetId,
   ]);
 
-  if (!lightboxAssetId) return null;
-
   const isVideo =
     detail?.summary.kind === 'video' ||
     detail?.playback.mode === 'direct' ||
@@ -298,15 +300,83 @@ export const Lightbox: React.FC = () => {
   );
 
   const primaryFile = detail?.files.find((f) => f.file_role === 'primary') ?? detail?.files[0];
+  const primaryExt = primaryFile?.rel_path.split('.').pop()?.toLowerCase() ?? '';
+  const browserNativeOriginal = ['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif'].includes(primaryExt);
+
+  const fullResUrl = useMemo(() => {
+    if (!lightboxAssetId || isVideo) return null;
+    if (rawDemosaic) return mediaOriginalUrl(lightboxAssetId, { mode: 'raw_demosaic' });
+    if (browserNativeOriginal) return mediaOriginalUrl(lightboxAssetId);
+    if (
+      hasRaw ||
+      primaryExt === 'heic' ||
+      primaryExt === 'heif' ||
+      primaryExt === 'tif' ||
+      primaryExt === 'tiff' ||
+      primaryExt === 'jxl'
+    ) {
+      return mediaOriginalUrl(lightboxAssetId, { mode: 'raw_demosaic' });
+    }
+    return mediaOriginalUrl(lightboxAssetId);
+  }, [browserNativeOriginal, hasRaw, isVideo, lightboxAssetId, primaryExt, rawDemosaic]);
+
+  // Progressive full-resolution pixel-peeping: automatically preload & decode full original when zoomed in.
+  useEffect(() => {
+    if (!lightboxAssetId || !fullResUrl || isVideo || rawDemosaic) return;
+    if (zoom <= 1.05) return;
+    if (hiResLoadedUrl === fullResUrl) return;
+
+    let cancelled = false;
+    setHiResLoading(true);
+    const loader = new Image();
+    loader.decoding = 'async';
+    loader.src = fullResUrl;
+
+    const finalize = () => {
+      if (cancelled) return;
+      setHiResLoadedUrl(fullResUrl);
+      setHiResLoading(false);
+    };
+    const fail = () => {
+      if (cancelled) return;
+      setHiResLoading(false);
+    };
+
+    if (typeof loader.decode === 'function') {
+      loader
+        .decode()
+        .then(finalize)
+        .catch(() => {
+          loader.onload = finalize;
+          loader.onerror = fail;
+        });
+    } else {
+      loader.onload = finalize;
+      loader.onerror = fail;
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fullResUrl, hiResLoadedUrl, isVideo, lightboxAssetId, rawDemosaic, zoom]);
+
+  if (!lightboxAssetId) return null;
+
   const titleText =
     detail?.overrides?.title ||
     detail?.summary.title ||
     primaryFile?.rel_path.split(/[\\/]/).pop() ||
     'Media';
 
+  const previewUrl = detail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId);
+  const usingHiRes = Boolean(
+    rawDemosaic || (fullResUrl && hiResLoadedUrl === fullResUrl && zoom > 1.05),
+  );
   const stillUrl = rawDemosaic
     ? mediaOriginalUrl(lightboxAssetId, { mode: 'raw_demosaic' })
-    : (detail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId));
+    : usingHiRes
+      ? fullResUrl!
+      : previewUrl;
 
   const liveVideoUrl = detail?.playback.live_video_url ?? mediaLiveVideoUrl(lightboxAssetId);
 
@@ -449,7 +519,7 @@ export const Lightbox: React.FC = () => {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
     setZoom((prev) => {
-      const next = Math.min(4, Math.max(1, Number((prev * factor).toFixed(2))));
+      const next = Math.min(5, Math.max(1, Number((prev * factor).toFixed(2))));
       if (next <= 1.02) {
         setPan({ x: 0, y: 0 });
         return 1;
@@ -528,14 +598,15 @@ export const Lightbox: React.FC = () => {
       aria-label="Media lightbox"
     >
       <header className="lightbox-toolbar" data-tauri-drag-region>
-        <div className="row" style={{ gap: 10, minWidth: 0 }}>
+        <div className="row lightbox-toolbar-left" style={{ gap: 10, minWidth: 0 }}>
           <button
             type="button"
-            className="icon-button"
+            className="icon-button lightbox-close-btn"
             aria-label="Close lightbox"
+            title="Close (Esc)"
             onClick={closeLightbox}
           >
-            <X size={18} />
+            <X size={16} />
           </button>
           <div style={{ minWidth: 0 }}>
             <div
@@ -598,10 +669,14 @@ export const Lightbox: React.FC = () => {
               type="button"
               className={`lightbox-pill-btn${zoom > 1 ? ' is-active' : ''}`}
               aria-pressed={zoom > 1}
+              title={usingHiRes ? 'Viewing full original resolution' : 'Click photo or button to zoom'}
               onClick={togglePixelPeepZoom}
             >
               <ZoomIn size={13} />
               <span>{zoom > 1 ? `${zoom.toFixed(1)}×` : '100%'}</span>
+              {zoom > 1 && (
+                <span className="lightbox-hd-tag">{hiResLoading ? 'HD…' : usingHiRes ? 'HD' : ''}</span>
+              )}
             </button>
           )}
 

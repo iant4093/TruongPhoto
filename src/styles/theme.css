@@ -227,7 +227,7 @@ input.button { cursor: text; }
 .settings-field { display: grid; gap: 4px; font-size: 13px; margin-bottom: 12px; }
 .settings-field input[type='text'], .settings-field input[type='password'] { text-align: left; cursor: text; }
 .text-input { width: 100%; min-height: 34px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: #1c1c1c; color: var(--text-primary); font: inherit; font-size: 13px; }
-.text-input:focus { outline: none; border-color: #bbb; box-shadow: 0 0 0 2px #bbb4; }
+.text-input:focus, .text-input:focus-visible { outline: none; border-color: #bbb; box-shadow: 0 0 0 2px #bbb4; }
 input[type='number'].text-input { width: 90px; }
 .backup-summary { margin-top: 14px; padding: 10px 12px; border: 1px solid #3d5c47; background: var(--ok-bg); border-radius: 6px; font-size: 12px; }
 
@@ -253,7 +253,7 @@ input[type='number'].text-input { width: 90px; }
 .auth-header h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.4px; }
 .auth-header p { margin: 0; font-size: 12px; color: var(--text-muted); }
 .pin-input { width: 100%; min-height: 44px; padding: 8px 12px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface-input); color: var(--text-primary); font: 20px var(--font-mono); letter-spacing: 0.35em; text-align: center; }
-.pin-input:focus { outline: none; border-color: #bbb; box-shadow: 0 0 0 2px #bbb4; }
+.pin-input:focus, .pin-input:focus-visible { outline: none; border-color: #bbb; box-shadow: 0 0 0 2px #bbb4; }
 .profile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
 .profile-card { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 14px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-card); color: var(--text-primary); text-align: center; transition: border-color .12s, background .12s; }
 .profile-card:hover { border-color: #5a5a5a; background: #2a2a2a; }
@@ -1836,7 +1836,37 @@ input[type='number'].text-input { width: 90px; }
    ========================================================================= */
 
 .native-titlebar .lightbox-toolbar {
-  padding-left: 88px;
+  min-height: 54px;
+  padding-left: 86px;
+}
+
+.native-titlebar .lightbox-toolbar-left {
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+}
+
+.lightbox-close-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.lightbox-close-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: var(--border-strong);
+}
+
+.lightbox-hd-tag {
+  margin-left: 4px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--text-primary);
 }
 
 .native-titlebar .chat-main-topbar {
@@ -2394,8 +2424,15 @@ input[type='number'].text-input { width: 90px; }
   line-height: 1.5;
   resize: none;
   outline: none;
+  box-shadow: none;
   padding: 6px 0;
   max-height: 180px;
+}
+
+.chat-composer-input:focus,
+.chat-composer-input:focus-visible {
+  outline: none;
+  box-shadow: none;
 }
 
 .chat-composer-input::placeholder {

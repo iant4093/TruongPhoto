@@ -38,19 +38,22 @@ pub const fn select_rec_width_bucket(scaled_w: u32) -> u32 {
     }
 }
 
-/// Greedy CTC argmax decoder: collapses consecutive identical indices and drops blank index `0`.
-pub fn ctc_greedy_decode(
+/// Greedy CTC argmax decoder with mean per-character probability confidence.
+/// Collapses consecutive identical indices and drops blank index `0`.
+pub fn ctc_greedy_decode_with_confidence(
     logits: &[f32],
     timesteps: usize,
     num_classes: usize,
     dict: &[String],
-) -> String {
+) -> (String, f32) {
     if timesteps == 0 || num_classes == 0 || logits.len() < timesteps * num_classes {
-        return String::new();
+        return (String::new(), 0.0);
     }
 
     let mut out = String::new();
     let mut prev_idx: usize = 0;
+    let mut prob_sum = 0.0f32;
+    let mut char_count = 0usize;
 
     for t in 0..timesteps {
         let row = &logits[t * num_classes..(t + 1) * num_classes];
@@ -65,16 +68,73 @@ pub fn ctc_greedy_decode(
 
         if best_idx != 0 && best_idx != prev_idx {
             let dict_idx = best_idx - 1;
-            if let Some(ch) = dict.get(dict_idx) {
+            let matched = if let Some(ch) = dict.get(dict_idx) {
                 out.push_str(ch);
+                true
             } else if dict_idx == dict.len() {
                 out.push(' ');
+                true
+            } else {
+                false
+            };
+            if matched {
+                // PP-OCRv6 rec outputs probabilities in [0, 1] (post-softmax); fall back to softmax if logits > 1.
+                let prob = if (0.0..=1.0001).contains(&best_val) {
+                    best_val.clamp(0.0, 1.0)
+                } else {
+                    let denom: f32 = row.iter().map(|&v| (v - best_val).exp()).sum();
+                    if denom > 0.0 {
+                        (1.0 / denom).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                };
+                prob_sum += prob;
+                char_count += 1;
             }
         }
         prev_idx = best_idx;
     }
 
-    out.trim().to_string()
+    let mean_conf = if char_count > 0 {
+        prob_sum / (char_count as f32)
+    } else {
+        0.0
+    };
+    (out.trim().to_string(), mean_conf)
+}
+
+/// Greedy CTC argmax decoder: collapses consecutive identical indices and drops blank index `0`.
+pub fn ctc_greedy_decode(
+    logits: &[f32],
+    timesteps: usize,
+    num_classes: usize,
+    dict: &[String],
+) -> String {
+    ctc_greedy_decode_with_confidence(logits, timesteps, num_classes, dict).0
+}
+
+fn is_meaningful_ocr_line(text: &str, mean_conf: f32) -> bool {
+    let alnum_count = text.chars().filter(|c| c.is_alphanumeric()).count();
+    if alnum_count < 2 {
+        return false;
+    }
+    // Short 2-char hits on foliage/rocks are almost always noise unless confidence is very high.
+    if alnum_count == 2 {
+        return mean_conf >= 0.88;
+    }
+    mean_conf >= 0.68
+}
+
+fn is_meaningful_ocr_document(full_text: &str) -> bool {
+    let alnum_count = full_text.chars().filter(|c| c.is_alphanumeric()).count();
+    if alnum_count < 3 {
+        return false;
+    }
+    full_text
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.chars().count() >= 3)
+        || alnum_count >= 4
 }
 
 /// Parses `PostProcess.character_dict` entries from a PaddleOCR `inference.yml` string.
@@ -320,11 +380,11 @@ impl OrtOcrBackend {
         Ok((boxes, scale))
     }
 
-    fn recognize_crop(&self, crop: &RgbImage, dict: &[String]) -> Result<String, AiError> {
+    fn recognize_crop(&self, crop: &RgbImage, dict: &[String]) -> Result<(String, f32), AiError> {
         let cw = crop.width();
         let ch = crop.height();
         if cw == 0 || ch == 0 {
-            return Ok(String::new());
+            return Ok((String::new(), 0.0));
         }
         let scaled_w =
             (((cw as f32) * (OCR_REC_HEIGHT as f32 / ch as f32)).round() as u32).clamp(1, 960);
@@ -368,7 +428,12 @@ impl OrtOcrBackend {
                 }
                 let timesteps = dims[1].max(0) as usize;
                 let num_classes = dims[2].max(0) as usize;
-                Ok(ctc_greedy_decode(logits, timesteps, num_classes, dict))
+                Ok(ctc_greedy_decode_with_confidence(
+                    logits,
+                    timesteps,
+                    num_classes,
+                    dict,
+                ))
             })
     }
 }
@@ -392,14 +457,21 @@ impl OcrBackend for OrtOcrBackend {
                 continue;
             }
             let crop = image::imageops::crop_imm(img, ox0, oy0, cw, ch).to_image();
-            let text = self.recognize_crop(&crop, &dict)?;
-            if text.chars().count() >= 2 {
+            let (text, mean_conf) = self.recognize_crop(&crop, &dict)?;
+            if is_meaningful_ocr_line(&text, mean_conf) {
                 lines.push(text);
             }
         }
 
+        let joined = lines.join("\n");
+        let full_text = if is_meaningful_ocr_document(&joined) {
+            joined
+        } else {
+            String::new()
+        };
+
         Ok(OcrResult {
-            full_text: lines.join("\n"),
+            full_text,
             lang_hint: None,
             model_id: "pp-ocrv6".to_string(),
         })
