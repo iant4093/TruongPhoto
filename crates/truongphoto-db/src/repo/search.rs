@@ -80,6 +80,22 @@ fn parse_iso_token(tok: &str) -> Option<i64> {
     }
 }
 
+fn parse_shutter_speed_token(tok: &str) -> Option<f64> {
+    let lower = tok.trim().to_ascii_lowercase();
+    let stripped = lower
+        .strip_suffix("sec")
+        .or_else(|| lower.strip_suffix('s'))
+        .unwrap_or(&lower);
+    if let Some((num, den)) = stripped.split_once('/') {
+        let n = num.parse::<f64>().ok()?;
+        let d = den.parse::<f64>().ok()?;
+        if n > 0.0 && d >= 1.0 && n / d <= 3600.0 {
+            return Some(n / d);
+        }
+    }
+    None
+}
+
 fn append_deterministic_filters(
     scope: &RbacScope,
     req: &SearchRequest,
@@ -160,7 +176,9 @@ fn append_deterministic_filters(
         || req.aperture_min_f.is_some()
         || req.aperture_max_f.is_some()
         || req.iso_min.is_some()
-        || req.iso_max.is_some();
+        || req.iso_max.is_some()
+        || req.shutter_speed_min_sec.is_some()
+        || req.shutter_speed_max_sec.is_some();
 
     if has_photo_exif_filters {
         let mut exif_checks = Vec::new();
@@ -216,11 +234,52 @@ fn append_deterministic_filters(
             exif_checks.push(format!("dpm_e.iso <= ?{idx}"));
         }
 
+        let (sh_min, sh_max) = match (req.shutter_speed_min_sec, req.shutter_speed_max_sec) {
+            (Some(lo), Some(hi)) if lo > 0.0 && ((hi - lo).abs() / lo) < 0.05 => {
+                (Some(lo * 0.85), Some(hi * 1.15))
+            }
+            pair => pair,
+        };
+        if let Some(lo) = sh_min {
+            let idx = params.len() + 1;
+            params.push(Value::Real(lo));
+            exif_checks.push(format!("dpm_e.shutter_speed_sec >= ?{idx}"));
+        }
+        if let Some(hi) = sh_max {
+            let idx = params.len() + 1;
+            params.push(Value::Real(hi));
+            exif_checks.push(format!("dpm_e.shutter_speed_sec <= ?{idx}"));
+        }
+
         if !exif_checks.is_empty() {
             where_clauses.push(format!(
                 "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_e WHERE dpm_e.asset_id = v.id AND {})",
                 exif_checks.join(" AND ")
             ));
+        }
+    }
+
+    if let Some(orientation) = req.orientation.as_deref().map(str::trim) {
+        match orientation.to_ascii_lowercase().as_str() {
+            "portrait" | "vertical" => {
+                where_clauses.push(
+                    "(v.width IS NOT NULL AND v.height IS NOT NULL AND v.height > v.width)"
+                        .to_string(),
+                );
+            }
+            "landscape" | "horizontal" => {
+                where_clauses.push(
+                    "(v.width IS NOT NULL AND v.height IS NOT NULL AND v.width > v.height)"
+                        .to_string(),
+                );
+            }
+            "square" => {
+                where_clauses.push(
+                    "(v.width IS NOT NULL AND v.height IS NOT NULL AND v.width = v.height)"
+                        .to_string(),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -482,6 +541,15 @@ fn append_free_text_metadata_clauses(
             params.push(Value::Integer(iso_val));
             ors.push(format!(
                 "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_i WHERE dpm_i.asset_id = v.id AND dpm_i.iso = ?{iso_idx})"
+            ));
+        }
+        if let Some(shutter_sec) = parse_shutter_speed_token(&tok) {
+            let lo_idx = params.len() + 1;
+            params.push(Value::Real(shutter_sec * 0.85));
+            let hi_idx = params.len() + 1;
+            params.push(Value::Real(shutter_sec * 1.15));
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_s WHERE dpm_s.asset_id = v.id AND dpm_s.shutter_speed_sec BETWEEN ?{lo_idx} AND ?{hi_idx})"
             ));
         }
 

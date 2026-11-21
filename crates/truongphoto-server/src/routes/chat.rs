@@ -154,6 +154,9 @@ fn build_search_request_from_plan(
         aperture_max_f: plan.aperture_max_f,
         iso_min: plan.iso_min,
         iso_max: plan.iso_max,
+        shutter_speed_min_sec: plan.shutter_speed_min_sec,
+        shutter_speed_max_sec: plan.shutter_speed_max_sec,
+        orientation: plan.orientation.clone(),
         geo_query: plan.location_query.clone(),
         kind: plan.kind,
         favorite: plan.favorite,
@@ -458,6 +461,9 @@ pub async fn send_message(
         || search_req.aperture_max_f.is_some()
         || search_req.iso_min.is_some()
         || search_req.iso_max.is_some()
+        || search_req.shutter_speed_min_sec.is_some()
+        || search_req.shutter_speed_max_sec.is_some()
+        || search_req.orientation.is_some()
         || search_req.geo_query.is_some()
         || search_req.kind.is_some()
         || search_req.favorite.is_some()

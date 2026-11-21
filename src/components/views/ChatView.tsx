@@ -142,6 +142,29 @@ function buildFilterChips(plan: RouterPlan | null): string[] {
       chips.push(`ISO: ≤ ${iMax}`);
     }
   }
+  if (plan.shutter_speed_min_sec != null || plan.shutter_speed_max_sec != null) {
+    const sMin = plan.shutter_speed_min_sec;
+    const sMax = plan.shutter_speed_max_sec;
+    const fmtShutter = (sec: number) => {
+      if (sec >= 1) return `${Number(sec.toFixed(1))}s`;
+      return `1/${Math.max(1, Math.round(1 / sec))}s`;
+    };
+    if (sMin != null && sMax != null && Math.abs(sMin - sMax) / Math.max(sMin, 1e-6) < 0.05) {
+      chips.push(`Shutter: ${fmtShutter(sMin)}`);
+    } else if (sMin != null && sMax != null) {
+      chips.push(`Shutter: ${fmtShutter(sMax)}–${fmtShutter(sMin)}`);
+    } else if (sMax != null) {
+      chips.push(`Shutter: ≤ ${fmtShutter(sMax)}`);
+    } else if (sMin != null) {
+      chips.push(`Shutter: ≥ ${fmtShutter(sMin)}`);
+    }
+  }
+  if (plan.orientation) {
+    const o = plan.orientation.trim();
+    if (o) {
+      chips.push(`Orientation: ${o.charAt(0).toUpperCase()}${o.slice(1)}`);
+    }
+  }
   for (const tag of plan.tags ?? []) {
     if (tag.trim()) {
       chips.push(`Tag: ${tag.trim()}`);

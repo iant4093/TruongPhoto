@@ -228,10 +228,14 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
 
   const { summary, photo_meta, video_meta, files, histogram } = detail;
   const primaryFile = files.find((f) => f.file_role === 'primary') ?? files[0];
+  const cameraMake = photo_meta?.camera_make?.trim() ?? '';
+  const cameraModel = (photo_meta?.camera_model ?? summary.camera_model)?.trim() ?? '';
   const cameraLabel =
-    [photo_meta?.camera_make, photo_meta?.camera_model ?? summary.camera_model]
-      .filter(Boolean)
-      .join(' ') || '—';
+    cameraMake && cameraModel && cameraModel.toLowerCase().startsWith(cameraMake.toLowerCase())
+      ? cameraModel
+      : [cameraMake, cameraModel].filter(Boolean).join(' ') || '—';
+  const relSegments = primaryFile?.rel_path.split(/[\\/]/).filter(Boolean) ?? [];
+  const folderLabel = relSegments.length > 1 ? relSegments.slice(0, -1).join(' / ') : null;
   const shutterLabel = formatShutterSpeed(photo_meta?.shutter_speed_sec ?? null);
   const locationLabel =
     [
@@ -307,6 +311,12 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
             <div className="view-subtitle" style={{ marginTop: 0 }}>Primary Size</div>
             <div>{primaryFile ? formatBytes(primaryFile.file_size) : '—'}</div>
           </div>
+          {folderLabel && (
+            <div style={{ gridColumn: '1 / -1' }}>
+              <div className="view-subtitle" style={{ marginTop: 0 }}>Folder</div>
+              <div style={{ overflowWrap: 'anywhere' }}>{folderLabel}</div>
+            </div>
+          )}
           {video_meta && (
             <>
               <div>

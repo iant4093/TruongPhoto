@@ -23,6 +23,25 @@ const KIND_OPTIONS: ReadonlyArray<readonly [AssetKind | '', string]> = [
   ['raw_jpg_stack', 'RAW + JPG'],
 ];
 
+const ORIENTATION_OPTIONS: ReadonlyArray<readonly [string, string]> = [
+  ['', 'Any orientation'],
+  ['landscape', 'Landscape'],
+  ['portrait', 'Portrait'],
+  ['square', 'Square'],
+];
+
+function parsePositiveNum(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function parsePositiveInt(raw: string): number | null {
+  const n = parsePositiveNum(raw);
+  return n !== null ? Math.round(n) : null;
+}
+
 function msToDateInput(ms: number | null | undefined): string {
   if (!ms || !Number.isFinite(ms)) return '';
   const d = new Date(ms);
@@ -62,6 +81,19 @@ export const SearchFilterBar: React.FC = () => {
   const [people, setPeople] = useState<PersonSummary[]>([]);
 
   const [cameraInput, setCameraInput] = useState(searchRequest.camera_model ?? '');
+  const [lensInput, setLensInput] = useState(searchRequest.lens_model ?? '');
+  const [focalMinInput, setFocalMinInput] = useState(
+    searchRequest.focal_length_min_mm != null ? String(searchRequest.focal_length_min_mm) : '',
+  );
+  const [focalMaxInput, setFocalMaxInput] = useState(
+    searchRequest.focal_length_max_mm != null ? String(searchRequest.focal_length_max_mm) : '',
+  );
+  const [apertureMaxInput, setApertureMaxInput] = useState(
+    searchRequest.aperture_max_f != null ? String(searchRequest.aperture_max_f) : '',
+  );
+  const [isoMinInput, setIsoMinInput] = useState(
+    searchRequest.iso_min != null ? String(searchRequest.iso_min) : '',
+  );
   const [geoInput, setGeoInput] = useState(searchRequest.geo_query ?? '');
   const [tagInput, setTagInput] = useState((searchRequest.tags ?? []).join(', '));
   const [dateFromInput, setDateFromInput] = useState(msToDateInput(searchRequest.date_from_ms));
@@ -69,12 +101,28 @@ export const SearchFilterBar: React.FC = () => {
 
   useEffect(() => {
     setCameraInput(searchRequest.camera_model ?? '');
+    setLensInput(searchRequest.lens_model ?? '');
+    setFocalMinInput(
+      searchRequest.focal_length_min_mm != null ? String(searchRequest.focal_length_min_mm) : '',
+    );
+    setFocalMaxInput(
+      searchRequest.focal_length_max_mm != null ? String(searchRequest.focal_length_max_mm) : '',
+    );
+    setApertureMaxInput(
+      searchRequest.aperture_max_f != null ? String(searchRequest.aperture_max_f) : '',
+    );
+    setIsoMinInput(searchRequest.iso_min != null ? String(searchRequest.iso_min) : '');
     setGeoInput(searchRequest.geo_query ?? '');
     setTagInput((searchRequest.tags ?? []).join(', '));
     setDateFromInput(msToDateInput(searchRequest.date_from_ms));
     setDateToInput(msToDateInput(searchRequest.date_to_ms));
   }, [
     searchRequest.camera_model,
+    searchRequest.lens_model,
+    searchRequest.focal_length_min_mm,
+    searchRequest.focal_length_max_mm,
+    searchRequest.aperture_max_f,
+    searchRequest.iso_min,
     searchRequest.geo_query,
     searchRequest.tags,
     searchRequest.date_from_ms,
@@ -98,6 +146,11 @@ export const SearchFilterBar: React.FC = () => {
   const executeSearch = (patch: Partial<SearchRequest>) => {
     void runSearch({
       camera_model: cameraInput.trim() || null,
+      lens_model: lensInput.trim() || null,
+      focal_length_min_mm: parsePositiveNum(focalMinInput),
+      focal_length_max_mm: parsePositiveNum(focalMaxInput),
+      aperture_max_f: parsePositiveNum(apertureMaxInput),
+      iso_min: parsePositiveInt(isoMinInput),
       geo_query: geoInput.trim() || null,
       tags: parseTagsInput(tagInput),
       date_from_ms: parseDateStartMs(dateFromInput),
@@ -163,9 +216,89 @@ export const SearchFilterBar: React.FC = () => {
               aria-label="Camera"
               className="text-input"
               type="text"
-              placeholder="e.g. X-T5, iPhone"
+              placeholder="e.g. Canon R7, iPhone"
               value={cameraInput}
               onChange={(e) => setCameraInput(e.target.value)}
+            />
+          </label>
+
+          <label className="settings-field" style={{ marginBottom: 0 }}>
+            <span className="workspace-label">Lens</span>
+            <input
+              aria-label="Lens"
+              className="text-input"
+              type="text"
+              placeholder="e.g. 17-40, 56mm, 100-400"
+              value={lensInput}
+              onChange={(e) => setLensInput(e.target.value)}
+            />
+          </label>
+
+          <div className="settings-field" style={{ marginBottom: 0 }}>
+            <span className="workspace-label">Orientation</span>
+            <Dropdown
+              label="Orientation"
+              value={searchRequest.orientation ?? ''}
+              options={ORIENTATION_OPTIONS}
+              onChange={(val) => executeSearch({ orientation: val || null })}
+            />
+          </div>
+
+          <label className="settings-field" style={{ marginBottom: 0 }}>
+            <span className="workspace-label">Focal Min / Max (mm)</span>
+            <div className="row" style={{ gap: 6 }}>
+              <input
+                aria-label="Focal min mm"
+                className="text-input"
+                type="number"
+                min={1}
+                step="any"
+                placeholder="Min"
+                style={{ width: '100%' }}
+                value={focalMinInput}
+                onChange={(e) => setFocalMinInput(e.target.value)}
+              />
+              <input
+                aria-label="Focal max mm"
+                className="text-input"
+                type="number"
+                min={1}
+                step="any"
+                placeholder="Max"
+                style={{ width: '100%' }}
+                value={focalMaxInput}
+                onChange={(e) => setFocalMaxInput(e.target.value)}
+              />
+            </div>
+          </label>
+
+          <label className="settings-field" style={{ marginBottom: 0 }}>
+            <span className="workspace-label">Max Aperture (f/)</span>
+            <input
+              aria-label="Max Aperture"
+              className="text-input"
+              type="number"
+              min={0.7}
+              step="0.1"
+              placeholder="e.g. 1.8"
+              style={{ width: '100%' }}
+              value={apertureMaxInput}
+              onChange={(e) => setApertureMaxInput(e.target.value)}
+            />
+          </label>
+
+          <label className="settings-field" style={{ marginBottom: 0 }}>
+            <span className="workspace-label">Min ISO</span>
+            <input
+              aria-label="Min ISO"
+              className="text-input"
+              type="number"
+              min={25}
+              step={100}
+              placeholder="e.g. 1600"
+              style={{ width: '100%' }}
+              value={isoMinInput}
+              onChange={(e) => setIsoMinInput(e.target.value)}
             />
           </label>
 

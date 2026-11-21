@@ -644,6 +644,9 @@ export interface SearchRequest {
   aperture_max_f?: number | null;
   iso_min?: number | null;
   iso_max?: number | null;
+  shutter_speed_min_sec?: number | null;
+  shutter_speed_max_sec?: number | null;
+  orientation?: 'portrait' | 'landscape' | 'square' | string | null;
   geo_query?: string | null;
   kind?: AssetKind | null;
   favorite?: boolean | null;
@@ -790,6 +793,9 @@ export interface RouterPlan {
   aperture_max_f?: number | null;
   iso_min?: number | null;
   iso_max?: number | null;
+  shutter_speed_min_sec?: number | null;
+  shutter_speed_max_sec?: number | null;
+  orientation?: 'portrait' | 'landscape' | 'square' | string | null;
   tags: string[];
   kind: AssetKind | null;
   favorite: boolean | null;

@@ -6,6 +6,7 @@ use crate::chat::{
 };
 use crate::models::{find_model_spec, model_dir};
 use crate::AiError;
+use chrono::{Datelike, NaiveDate};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -460,36 +461,76 @@ fn pick_ephemeral_port() -> Result<u16, AiError> {
     Ok(port)
 }
 
+fn calendar_month_range(year: i32, month: u32) -> (String, String) {
+    let (next_y, next_m) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let last_day = NaiveDate::from_ymd_opt(next_y, next_m, 1)
+        .and_then(|d| d.pred_opt())
+        .map(|d| d.day())
+        .unwrap_or(28);
+    (
+        format!("{year:04}-{month:02}-01"),
+        format!("{year:04}-{month:02}-{last_day:02}"),
+    )
+}
+
+fn shift_calendar_month(year: i32, month: u32, delta_months: i32) -> (i32, u32) {
+    let total = year * 12 + (month as i32 - 1) + delta_months;
+    let y = total.div_euclid(12);
+    let m = (total.rem_euclid(12) + 1) as u32;
+    (y, m)
+}
+
 fn build_router_system_prompt(input: &ChatTurnInput) -> String {
     let prior_json = serde_json::to_string(&input.prior_filters).unwrap_or_else(|_| "{}".into());
+    let cur_y = input.current_date_utc.year();
+    let cur_m = input.current_date_utc.month();
+    let (this_m_from, this_m_to) = calendar_month_range(cur_y, cur_m);
+    let (prev1_y, prev1_m) = shift_calendar_month(cur_y, cur_m, -1);
+    let (last_m_from, last_m_to) = calendar_month_range(prev1_y, prev1_m);
+    let (prev2_y, prev2_m) = shift_calendar_month(cur_y, cur_m, -2);
+    let (two_m_from, two_m_to) = calendar_month_range(prev2_y, prev2_m);
+
     format!(
         "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a strict RouterPlan JSON object.\n\
          Library Context:\n\
          - Current UTC date: {} (today is {})\n\
+         - Calendar month reference: \"this month\" = {} to {}; \"last month\" = {} to {}; \"two months ago\" = {} to {}\n\
          - Known RBAC-visible person names: {:?}\n\
          - Known camera bodies in library: {:?}\n\
          - Known lenses in library: {:?}\n\
          - Prior active filters JSON: {}\n\
          Rules:\n\
-         - Put ONLY actual visual subjects, animals, objects, scenes, or moods into \"semantic_query\" (e.g. \"waterfall in forest\", \"ape or monkey behind a fence\", \"Eiffel Tower\", \"mountain sunrise\"). Do NOT put technical EXIF adjectives like \"low light\", \"high ISO\", \"crisp\", \"sharp\", \"wide open\", or \"telephoto\" into \"semantic_query\" when filtering by EXIF numbers.\n\
-         - When the user asks for a named location, park, mountain, zoo, or place (e.g. \"Multnomah Falls\", \"Portland Zoo\", \"Bald Mountain\"), put that place name into \"location_query\" and leave \"semantic_query\": null UNLESS they also asked for a specific visual subject there (e.g. \"monkeys at Portland Zoo\" -> location_query: \"Portland Zoo\", semantic_query: \"monkey\").\n\
-         - Put text that literally appears inside an image (signs, receipts, banners, words) into \"ocr_terms\".\n\
-         - Match people against Known RBAC-visible person names into \"person_names\".\n\
-         - Camera & EXIF fields (NEVER invent EXIF filters unless the user explicitly mentioned a camera, lens, focal length, aperture/f-stop, or ISO; NEVER put focal length/lens/aperture/ISO into \"camera_model\"; framing words like \"close up\" or \"portrait\" are NOT apertures):\n\
-           * \"camera_model\": camera body only (match Known camera bodies, e.g. \"Canon R7\" -> \"Canon EOS R7\").\n\
+         - Informational questions about the library itself (e.g. \"what cameras or lenses do I have?\", \"who are the people you know in my photos?\", \"hi\", \"what can you do?\"): answer directly and helpfully in \"assistant_reply\" using Library Context above, set clear_prior_filters=true, and leave ALL filter fields null / [] so no search runs!\n\
+         - Put ONLY actual visual subjects, animals, objects, scenes, or moods into \"semantic_query\" (e.g. \"waterfall in forest\", \"ape or monkey behind a fence\", \"mountain\", \"Eiffel Tower\", \"mountain sunrise\"). Generic terrain/nature words like \"mountain\", \"beach\", \"forest\", \"lake\", \"waterfall\", \"sunset\" belong in \"semantic_query\", NOT \"location_query\"! Do NOT put technical EXIF adjectives like \"low light\", \"high ISO\", \"crisp\", \"sharp\", \"wide open\", or \"telephoto\" into \"semantic_query\" when filtering by EXIF numbers.\n\
+         - Reserve \"location_query\" strictly for proper named places, cities, countries, parks, zoos, or specific landmarks (e.g. \"Multnomah Falls\", \"Portland Zoo\", \"Mount Saint Helens\", \"Bald Mountain\", \"Tokyo\", \"Antarctica\"). When filtering by a named place, leave \"semantic_query\": null UNLESS they also asked for a specific visual subject there (e.g. \"monkeys at Portland Zoo\" -> location_query: \"Portland Zoo\", semantic_query: \"monkey\").\n\
+         - Put specific words/phrases that literally appear inside an image (e.g. \"receipt saying Target\", \"sign with Oregon\") into \"ocr_terms\". If the user asks generally for \"photos with signs or readable text\" without specifying a word, put \"sign or banner with readable text\" into \"semantic_query\" and leave \"ocr_terms\": null.\n\
+         - Match people (including typos/first names) against Known RBAC-visible person names into \"person_names\".\n\
+         - Camera, Orientation & EXIF fields (NEVER invent EXIF or orientation filters unless the user explicitly mentioned them; NEVER put focal length/lens/aperture/ISO/shutter into \"camera_model\"; framing words like \"close up\" are NOT apertures):\n\
+           * \"camera_model\": camera body only (match Known camera bodies, e.g. \"Canon R7\" / \"cannon r7\" -> \"Canon EOS R7\").\n\
            * \"lens_model\": lens name only (match Known lenses, e.g. \"17-40 Art\" -> \"17-40mm F1.8 DC | Art 025\", \"100-400\" -> \"RF100-400mm F5.6-8 IS USM\").\n\
-           * \"focal_length_min_mm\" / \"focal_length_max_mm\": numeric mm range. For an EXACT focal length like \"at 12mm\" or \"56mm shots\", you MUST set BOTH min AND max to that exact number (e.g. \"12mm\" -> focal_length_min_mm: 12, focal_length_max_mm: 12). Only leave one side null for explicit bounds (\"under 15mm\" -> max: 15; \"over 300mm\" -> min: 300).\n\
-           * \"aperture_min_f\" / \"aperture_max_f\": numeric f-stop range (exact \"f/1.4\" -> min: 1.4, max: 1.4; \"wide open / f/2 or wider\" -> max: 2.0; \"f/8 or narrower\" -> min: 8.0).\n\
+           * \"focal_length_min_mm\" / \"focal_length_max_mm\": numeric mm range. For an EXACT focal length like \"at 12mm\" or \"56mm shots\", you MUST set BOTH min AND max to that exact number (e.g. \"12mm\" -> min: 12, max: 12). Only leave one side null for explicit bounds (\"under 15mm\" -> max: 15; \"over 300mm\" -> min: 300).\n\
+           * \"aperture_min_f\" / \"aperture_max_f\": numeric f-stop range. For an EXACT f-stop like \"f/1.4\" or \"narrow aperture f/8\", set BOTH min AND max to that exact number (e.g. \"f/8\" -> min: 8.0, max: 8.0). For \"wide open / bokeh / shallow depth of field\" -> max: 2.0; for \"f/8 or narrower\" -> min: 8.0.\n\
            * \"iso_min\" / \"iso_max\": integer ISO range (exact \"ISO 100\" -> min: 100, max: 100; \"above 3200 / ISO 3200+\" -> min: 3200).\n\
-         - For dates or months/years, output ISO strings in \"date_from\" and \"date_to\" (format \"YYYY-MM-DD\", e.g. November 2026 -> date_from: \"2026-11-01\", date_to: \"2026-11-30\"). Leave both null if no date was mentioned.\n\
+           * \"shutter_speed_min_sec\" / \"shutter_speed_max_sec\": decimal seconds! Faster shutter = SMALLER number (e.g. \"1/1000s or faster\" -> shutter_speed_max_sec: 0.001; \"1/500s or faster\" -> max: 0.002). Slower / long exposure = LARGER number (e.g. \"long exposure / slow shutter / silky water\" -> shutter_speed_min_sec: 0.05; \"1 second or longer\" -> min: 1.0).\n\
+           * \"orientation\": \"portrait\" (for vertical / tall / phone wallpaper), \"landscape\" (for horizontal / wide / desktop wallpaper), \"square\", or null.\n\
+         - For dates, months, or years, output ISO strings in \"date_from\" and \"date_to\" (format \"YYYY-MM-DD\"). Use full calendar months for \"this month\", \"last month\", and \"two months ago\" matching the Calendar month reference above! Leave both null if no date was mentioned.\n\
          - Leave \"tags\": [] UNLESS the user explicitly asks for a tag (e.g. \"tagged X\" or \"#X\"). Never invent speculative tags.\n\
          - Leave \"kind\": null unless the user explicitly asks for only photos, only videos, raw files, or live photos.\n\
-         - If the user greets you (e.g. \"hi\", \"hello\", \"thanks\") or asks what you can do without requesting photos, set clear_prior_filters=true, set all filter fields to null / [], and reply warmly and concisely.\n\
-         - Set clear_prior_filters=true when the user starts over or switches to an unrelated topic; set false when refining the previous search.\n\
-         - Write a crisp, natural 1-sentence \"assistant_reply\" in active voice (e.g. \"Here are your 12mm photos.\" or \"Showing wide-open f/1.4 shots.\"). Avoid repeating boilerplate.\n\
+         - Set clear_prior_filters=true when the user starts over, switches topic, or asks to remove a prior filter (re-emit the remaining filters you want to keep); set false when narrowing the previous search.\n\
+         - Write a crisp, natural 1-sentence \"assistant_reply\" in active voice (e.g. \"Here are your 12mm photos.\"). Avoid repeating boilerplate.\n\
          - Provide 2-3 short, varied \"follow_up_suggestions\". Never invent file paths or extra JSON keys.",
         input.current_date_utc.to_rfc3339(),
         input.current_date_utc.format("%Y-%m-%d"),
+        this_m_from,
+        this_m_to,
+        last_m_from,
+        last_m_to,
+        two_m_from,
+        two_m_to,
         input.known_person_names,
         input.known_cameras,
         input.known_lenses,
@@ -498,10 +539,10 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
 }
 
 /// Deterministic post-parse safety net for small local LLMs:
-/// 1. Strips hallucinated EXIF bounds when the user never asked about focal length, aperture, or ISO
+/// 1. Strips hallucinated EXIF/orientation bounds when the user never asked about them
 ///    (e.g., preventing "close up of a monkey" from hallucinating `aperture_max_f: 2.0`).
 /// 2. Completes one-sided exact EXIF bounds when the user asked for an exact value like "at 12mm"
-///    or "at f/1.4" or "ISO 100" without lower-bound phrasing ("over", "above", "at least", etc.).
+///    or "f/8" or "ISO 100" without explicit range/bound phrasing ("over", "under", "wider", etc.).
 fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
     let lower = user_message.to_ascii_lowercase();
 
@@ -514,6 +555,9 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
         "greater than",
         "higher than",
         "narrower than",
+        "or narrower",
+        "or slower",
+        "or longer",
         "zoomed",
         "beyond ",
         ">=",
@@ -529,6 +573,8 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
         "less than",
         "shorter than",
         "wider than",
+        "or wider",
+        "or faster",
         "lower than",
         "at most",
         "up to ",
@@ -563,6 +609,15 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
         if !has_lower_bound_cue {
             plan.aperture_max_f = Some(lo);
         }
+    } else if let (None, Some(hi)) = (plan.aperture_min_f, plan.aperture_max_f) {
+        if !has_upper_bound_cue
+            && !lower.contains("wide open")
+            && !lower.contains("wide-open")
+            && !lower.contains("bokeh")
+            && !lower.contains("shallow")
+        {
+            plan.aperture_min_f = Some(hi);
+        }
     }
 
     let has_iso_cue = lower.contains("iso")
@@ -576,6 +631,10 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
     } else if let (Some(lo), None) = (plan.iso_min, plan.iso_max) {
         if !has_lower_bound_cue && !lower.contains("high iso") {
             plan.iso_max = Some(lo);
+        }
+    } else if let (None, Some(hi)) = (plan.iso_min, plan.iso_max) {
+        if !has_upper_bound_cue && !lower.contains("low iso") {
+            plan.iso_min = Some(hi);
         }
     }
 
@@ -597,6 +656,58 @@ fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
         if !has_upper_bound_cue && !lower.contains("wide") && !lower.contains("fisheye") {
             plan.focal_length_min_mm = Some(hi);
         }
+    }
+
+    let has_shutter_cue = lower.contains("shutter")
+        || lower.contains("exposure")
+        || lower.contains("silky")
+        || lower.contains("motion blur")
+        || lower.contains("freeze")
+        || lower.contains("1/")
+        || lower.contains("sec");
+
+    if !has_shutter_cue {
+        plan.shutter_speed_min_sec = None;
+        plan.shutter_speed_max_sec = None;
+    } else if let (None, Some(v)) = (plan.shutter_speed_min_sec, plan.shutter_speed_max_sec) {
+        if lower.contains("long exposure")
+            || lower.contains("slow shutter")
+            || lower.contains("silky")
+            || lower.contains("or slower")
+            || lower.contains("or longer")
+        {
+            plan.shutter_speed_min_sec = Some(v);
+            plan.shutter_speed_max_sec = None;
+        }
+    } else if let (Some(v), None) = (plan.shutter_speed_min_sec, plan.shutter_speed_max_sec) {
+        if lower.contains("fast shutter") || lower.contains("or faster") || lower.contains("freeze")
+        {
+            plan.shutter_speed_max_sec = Some(v);
+            plan.shutter_speed_min_sec = None;
+        }
+    }
+
+    let is_who_are_people_info_q = (lower.contains("who are the people")
+        || lower.contains("what people")
+        || lower.contains("which people")
+        || lower.contains("list the people")
+        || lower.contains("who do you know"))
+        && !lower.contains("show me")
+        && !lower.contains("find ");
+    if is_who_are_people_info_q && plan.person_names.len() >= 3 {
+        plan.person_names.clear();
+    }
+
+    let has_orientation_cue = lower.contains("vertical")
+        || lower.contains("portrait")
+        || lower.contains("tall")
+        || lower.contains("wallpaper")
+        || lower.contains("horizontal")
+        || lower.contains("landscape")
+        || lower.contains("square");
+
+    if !has_orientation_cue {
+        plan.orientation = None;
     }
 }
 

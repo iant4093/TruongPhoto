@@ -635,8 +635,37 @@ export const Lightbox: React.FC = () => {
               {titleText}
             </div>
             {detail && (
-              <div className="view-subtitle" style={{ marginTop: 0, fontSize: 11 }}>
-                {formatDateTime(detail.summary.capture_at_ms)}
+              <div
+                className="view-subtitle"
+                style={{
+                  marginTop: 0,
+                  fontSize: 11,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {[
+                  formatDateTime(detail.summary.capture_at_ms),
+                  detail.photo_meta?.focal_length_mm != null
+                    ? `${Math.round(detail.photo_meta.focal_length_mm)}mm`
+                    : null,
+                  detail.photo_meta?.aperture_f != null
+                    ? `f/${Number(detail.photo_meta.aperture_f.toFixed(1))}`
+                    : null,
+                  detail.photo_meta?.shutter_speed_sec != null &&
+                  detail.photo_meta.shutter_speed_sec > 0
+                    ? detail.photo_meta.shutter_speed_sec >= 1
+                      ? `${Number(detail.photo_meta.shutter_speed_sec.toFixed(1))}s`
+                      : `1/${Math.max(1, Math.round(1 / detail.photo_meta.shutter_speed_sec))}s`
+                    : null,
+                  detail.photo_meta?.iso != null ? `ISO ${detail.photo_meta.iso}` : null,
+                  lightboxAssetIds.length > 1 && currentIndex >= 0
+                    ? `${currentIndex + 1} / ${lightboxAssetIds.length}`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
               </div>
             )}
           </div>

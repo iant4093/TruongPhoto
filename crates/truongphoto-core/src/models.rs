@@ -1100,6 +1100,12 @@ pub struct SearchRequest {
     pub iso_min: Option<u32>,
     #[serde(default)]
     pub iso_max: Option<u32>,
+    #[serde(default)]
+    pub shutter_speed_min_sec: Option<f64>,
+    #[serde(default)]
+    pub shutter_speed_max_sec: Option<f64>,
+    #[serde(default)]
+    pub orientation: Option<String>,
     pub geo_query: Option<String>,
     pub kind: Option<AssetKind>,
     pub favorite: Option<bool>,
@@ -1422,6 +1428,12 @@ pub struct RouterPlan {
     pub iso_min: Option<u32>,
     #[serde(default)]
     pub iso_max: Option<u32>,
+    #[serde(default)]
+    pub shutter_speed_min_sec: Option<f64>,
+    #[serde(default)]
+    pub shutter_speed_max_sec: Option<f64>,
+    #[serde(default)]
+    pub orientation: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub kind: Option<AssetKind>,

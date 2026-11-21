@@ -8,7 +8,6 @@ import { JustifiedTimeline } from '../JustifiedTimeline';
 import { EmptyState, ViewHeader } from '../ui';
 
 export const FavoritesView: React.FC = () => {
-  const searchQuery = useAppStore((s) => s.searchQuery);
   const libraryRevision = useAppStore((s) => s.libraryRevision);
 
   const [items, setItems] = useState<AssetSummary[]>([]);
@@ -71,17 +70,6 @@ export const FavoritesView: React.FC = () => {
     setTotalCount((prev) => Math.max(0, prev - assetIds.length));
   }, []);
 
-  const query = searchQuery.trim().toLowerCase();
-  const visible = query
-    ? items.filter(
-        (item) =>
-          item.title?.toLowerCase().includes(query) ||
-          item.camera_model?.toLowerCase().includes(query) ||
-          item.geo_city?.toLowerCase().includes(query) ||
-          item.geo_country?.toLowerCase().includes(query),
-      )
-    : items;
-
   return (
     <div>
       <ViewHeader
@@ -102,10 +90,10 @@ export const FavoritesView: React.FC = () => {
         <div className="view-loading" role="status">
           Loading favorites…
         </div>
-      ) : visible.length > 0 ? (
+      ) : items.length > 0 ? (
         <JustifiedTimeline
-          assets={visible}
-          hasMore={!query && nextCursor !== null}
+          assets={items}
+          hasMore={nextCursor !== null}
           loadingMore={loadingMore}
           onLoadMore={() => void handleLoadMore()}
           onAssetUpdated={handleAssetUpdated}

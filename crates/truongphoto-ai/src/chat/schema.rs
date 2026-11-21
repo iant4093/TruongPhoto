@@ -25,6 +25,9 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     "aperture_max_f",
     "iso_min",
     "iso_max",
+    "shutter_speed_min_sec",
+    "shutter_speed_max_sec",
+    "orientation",
     "tags",
     "kind",
     "favorite",
@@ -50,6 +53,12 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     "aperture_max_f": { "type": ["number", "null"] },
     "iso_min": { "type": ["integer", "null"] },
     "iso_max": { "type": ["integer", "null"] },
+    "shutter_speed_min_sec": { "type": ["number", "null"] },
+    "shutter_speed_max_sec": { "type": ["number", "null"] },
+    "orientation": {
+      "type": ["string", "null"],
+      "enum": ["portrait", "landscape", "square", null]
+    },
     "tags": {
       "type": "array",
       "items": { "type": "string" }
@@ -83,6 +92,9 @@ const ALLOWED_ROUTER_PLAN_KEYS: &[&str] = &[
     "aperture_max_f",
     "iso_min",
     "iso_max",
+    "shutter_speed_min_sec",
+    "shutter_speed_max_sec",
+    "orientation",
     "tags",
     "kind",
     "favorite",
@@ -242,6 +254,14 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
     plan.location_query = normalize_opt_string(plan.location_query);
     plan.camera_model = normalize_opt_string(plan.camera_model);
     plan.lens_model = normalize_opt_string(plan.lens_model);
+    plan.orientation = normalize_opt_string(plan.orientation).and_then(|o| {
+        match o.to_ascii_lowercase().as_str() {
+            "portrait" | "vertical" => Some("portrait".to_string()),
+            "landscape" | "horizontal" => Some("landscape".to_string()),
+            "square" => Some("square".to_string()),
+            _ => None,
+        }
+    });
     plan.person_names = normalize_string_vec(plan.person_names);
     plan.tags = normalize_string_vec(plan.tags);
     plan.assistant_reply = plan.assistant_reply.trim().to_string();
@@ -289,6 +309,9 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
             aperture_max_f: next.aperture_max_f,
             iso_min: next.iso_min,
             iso_max: next.iso_max,
+            shutter_speed_min_sec: next.shutter_speed_min_sec,
+            shutter_speed_max_sec: next.shutter_speed_max_sec,
+            orientation: normalize_opt_string(next.orientation.clone()),
             tags: normalize_string_vec(next.tags.clone()),
             kind: next.kind,
             favorite: next.favorite,
@@ -322,6 +345,12 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
     } else {
         (prior.iso_min, prior.iso_max)
     };
+    let (shutter_speed_min_sec, shutter_speed_max_sec) =
+        if next.shutter_speed_min_sec.is_some() || next.shutter_speed_max_sec.is_some() {
+            (next.shutter_speed_min_sec, next.shutter_speed_max_sec)
+        } else {
+            (prior.shutter_speed_min_sec, prior.shutter_speed_max_sec)
+        };
 
     RouterPlan {
         semantic_query: normalize_opt_string(next.semantic_query.clone())
@@ -341,6 +370,10 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         aperture_max_f,
         iso_min,
         iso_max,
+        shutter_speed_min_sec,
+        shutter_speed_max_sec,
+        orientation: normalize_opt_string(next.orientation.clone())
+            .or_else(|| normalize_opt_string(prior.orientation.clone())),
         tags: merge_string_lists(&prior.tags, &next.tags),
         kind: next.kind.or(prior.kind),
         favorite: next.favorite.or(prior.favorite),

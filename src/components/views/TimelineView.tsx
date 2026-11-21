@@ -29,7 +29,6 @@ export const TimelineView: React.FC = () => {
   const user = useAppStore((s) => s.user);
   const setActiveNav = useAppStore((s) => s.setActiveNav);
   const setUploadModalOpen = useAppStore((s) => s.setUploadModalOpen);
-  const searchQuery = useAppStore((s) => s.searchQuery);
   const libraryRevision = useAppStore((s) => s.libraryRevision);
   const inspectorOpen = useAppStore((s) => s.inspectorOpen);
   const chatDrawerOpen = useAppStore((s) => s.chatDrawerOpen);
@@ -114,17 +113,6 @@ export const TimelineView: React.FC = () => {
     setTotalCount((prev) => Math.max(0, prev - assetIds.length));
   }, []);
 
-  const query = searchQuery.trim().toLowerCase();
-  const visibleItems = query
-    ? items.filter(
-        (item) =>
-          item.title?.toLowerCase().includes(query) ||
-          item.camera_model?.toLowerCase().includes(query) ||
-          item.geo_city?.toLowerCase().includes(query) ||
-          item.geo_country?.toLowerCase().includes(query),
-      )
-    : items;
-
   return (
     <div>
       <ViewHeader
@@ -164,11 +152,11 @@ export const TimelineView: React.FC = () => {
         <div className="view-loading" role="status">
           Loading timeline…
         </div>
-      ) : visibleItems.length > 0 ? (
+      ) : items.length > 0 ? (
         <>
           <JustifiedTimeline
-            assets={visibleItems}
-            hasMore={!query && nextCursor !== null}
+            assets={items}
+            hasMore={nextCursor !== null}
             loadingMore={loadingMore}
             onLoadMore={() => void handleLoadMore()}
             onAssetUpdated={handleAssetUpdated}
@@ -182,12 +170,6 @@ export const TimelineView: React.FC = () => {
             />
           )}
         </>
-      ) : query ? (
-        <EmptyState
-          icon={<Images size={28} strokeWidth={1.3} />}
-          title="No matching items"
-          description="No loaded timeline items matched your filter. Semantic and OCR search arrive in Phases 2–3."
-        />
       ) : jumpTarget ? (
         <EmptyState
           icon={<Images size={28} strokeWidth={1.3} />}
