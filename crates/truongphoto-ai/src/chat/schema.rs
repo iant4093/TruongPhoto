@@ -18,6 +18,13 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     "person_names",
     "location_query",
     "camera_model",
+    "lens_model",
+    "focal_length_min_mm",
+    "focal_length_max_mm",
+    "aperture_min_f",
+    "aperture_max_f",
+    "iso_min",
+    "iso_max",
     "tags",
     "kind",
     "favorite",
@@ -36,6 +43,13 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     },
     "location_query": { "type": ["string", "null"] },
     "camera_model": { "type": ["string", "null"] },
+    "lens_model": { "type": ["string", "null"] },
+    "focal_length_min_mm": { "type": ["number", "null"] },
+    "focal_length_max_mm": { "type": ["number", "null"] },
+    "aperture_min_f": { "type": ["number", "null"] },
+    "aperture_max_f": { "type": ["number", "null"] },
+    "iso_min": { "type": ["integer", "null"] },
+    "iso_max": { "type": ["integer", "null"] },
     "tags": {
       "type": "array",
       "items": { "type": "string" }
@@ -62,6 +76,13 @@ const ALLOWED_ROUTER_PLAN_KEYS: &[&str] = &[
     "person_names",
     "location_query",
     "camera_model",
+    "lens_model",
+    "focal_length_min_mm",
+    "focal_length_max_mm",
+    "aperture_min_f",
+    "aperture_max_f",
+    "iso_min",
+    "iso_max",
     "tags",
     "kind",
     "favorite",
@@ -220,6 +241,7 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
     plan.ocr_terms = normalize_opt_string(plan.ocr_terms);
     plan.location_query = normalize_opt_string(plan.location_query);
     plan.camera_model = normalize_opt_string(plan.camera_model);
+    plan.lens_model = normalize_opt_string(plan.lens_model);
     plan.person_names = normalize_string_vec(plan.person_names);
     plan.tags = normalize_string_vec(plan.tags);
     plan.assistant_reply = plan.assistant_reply.trim().to_string();
@@ -260,6 +282,13 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
             person_names: normalize_string_vec(next.person_names.clone()),
             location_query: normalize_opt_string(next.location_query.clone()),
             camera_model: normalize_opt_string(next.camera_model.clone()),
+            lens_model: normalize_opt_string(next.lens_model.clone()),
+            focal_length_min_mm: next.focal_length_min_mm,
+            focal_length_max_mm: next.focal_length_max_mm,
+            aperture_min_f: next.aperture_min_f,
+            aperture_max_f: next.aperture_max_f,
+            iso_min: next.iso_min,
+            iso_max: next.iso_max,
             tags: normalize_string_vec(next.tags.clone()),
             kind: next.kind,
             favorite: next.favorite,
@@ -276,6 +305,23 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
     } else {
         (prior.date_from_ms, prior.date_to_ms)
     };
+    let (focal_length_min_mm, focal_length_max_mm) =
+        if next.focal_length_min_mm.is_some() || next.focal_length_max_mm.is_some() {
+            (next.focal_length_min_mm, next.focal_length_max_mm)
+        } else {
+            (prior.focal_length_min_mm, prior.focal_length_max_mm)
+        };
+    let (aperture_min_f, aperture_max_f) =
+        if next.aperture_min_f.is_some() || next.aperture_max_f.is_some() {
+            (next.aperture_min_f, next.aperture_max_f)
+        } else {
+            (prior.aperture_min_f, prior.aperture_max_f)
+        };
+    let (iso_min, iso_max) = if next.iso_min.is_some() || next.iso_max.is_some() {
+        (next.iso_min, next.iso_max)
+    } else {
+        (prior.iso_min, prior.iso_max)
+    };
 
     RouterPlan {
         semantic_query: normalize_opt_string(next.semantic_query.clone())
@@ -287,6 +333,14 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
             .or_else(|| normalize_opt_string(prior.location_query.clone())),
         camera_model: normalize_opt_string(next.camera_model.clone())
             .or_else(|| normalize_opt_string(prior.camera_model.clone())),
+        lens_model: normalize_opt_string(next.lens_model.clone())
+            .or_else(|| normalize_opt_string(prior.lens_model.clone())),
+        focal_length_min_mm,
+        focal_length_max_mm,
+        aperture_min_f,
+        aperture_max_f,
+        iso_min,
+        iso_max,
         tags: merge_string_lists(&prior.tags, &next.tags),
         kind: next.kind.or(prior.kind),
         favorite: next.favorite.or(prior.favorite),

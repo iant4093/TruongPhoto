@@ -27,6 +27,8 @@ pub struct ChatTurnInput {
     pub prior_filters: RouterPlan,
     pub recent_turns: Vec<(ChatRole, String)>,
     pub known_person_names: Vec<String>,
+    pub known_cameras: Vec<String>,
+    pub known_lenses: Vec<String>,
     pub current_date_utc: DateTime<Utc>,
 }
 

@@ -163,7 +163,7 @@ pub(crate) async fn execute_hybrid_search(
     let q_clone = query_str.clone();
     let want_ocr = req.mode == SearchMode::Hybrid;
 
-    let (active_tier, candidates, ocr_hits) = state
+    let (active_tier, candidates, ocr_hits, metadata_hits) = state
         .db
         .read(move |conn| {
             let ai_state = repo::ai::get_ai_index_state(conn)?;
@@ -180,7 +180,14 @@ pub(crate) async fn execute_hybrid_search(
             } else {
                 Vec::new()
             };
-            Ok((tier, cands, ocr))
+            let meta = if want_ocr {
+                repo::search::search_metadata_matches(
+                    conn, &scope, &req_clone, &q_clone, MAX_LIMIT,
+                )?
+            } else {
+                Vec::new()
+            };
+            Ok((tier, cands, ocr, meta))
         })
         .await?;
 
@@ -306,9 +313,27 @@ pub(crate) async fn execute_hybrid_search(
     let collapse_limit = keyframe_hits.len().max(1);
     let collapsed = collapse_video_keyframes(keyframe_hits, collapse_limit);
 
+    let meta_id_set: std::collections::HashSet<&str> = if want_ocr {
+        metadata_hits.iter().map(String::as_str).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let has_meta_hits = !meta_id_set.is_empty();
+    // When deterministic metadata (camera, lens, focal length, aperture, ISO, filename, folder, or
+    // named person) matched the query, avoid polluting results with low-confidence SigLIP2 noise
+    // for proper nouns / EXIF codes; still keep semantic boost on metadata matches and very strong
+    // visual matches (>= 0.165).
+    const META_SEMANTIC_EXTRA_MIN_SCORE: f32 = 0.165;
+
     let mut by_asset: HashMap<String, PendingHit> = HashMap::new();
     for hit in collapsed {
         if hit.score <= MIN_SEMANTIC_SCORE {
+            continue;
+        }
+        if has_meta_hits
+            && !meta_id_set.contains(hit.asset_id.as_str())
+            && hit.score < META_SEMANTIC_EXTRA_MIN_SCORE
+        {
             continue;
         }
         let pct = (hit.score.clamp(0.0, 1.0) * 100.0).round() as i32;
@@ -340,6 +365,28 @@ pub(crate) async fn execute_hybrid_search(
                         timestamp_sec: None,
                         match_reasons: vec!["OCR".to_string()],
                         ocr_snippet: Some(snippet),
+                    },
+                );
+            }
+        }
+
+        // Fuse deterministic EXIF/camera/lens/filename/tag/person matches in Hybrid mode so queries
+        // like "canon r7", "12mm", "f/1.4", "iso 6400", or "Portland Zoo" always surface exact matches.
+        for (rank_idx, asset_id) in metadata_hits.into_iter().enumerate() {
+            let meta_score = (0.85 - (rank_idx as f32) * 0.0005).max(0.50);
+            if let Some(existing) = by_asset.get_mut(&asset_id) {
+                existing.score =
+                    existing.score.max(meta_score) + 0.15 * existing.score.min(meta_score);
+                existing.match_reasons.push("Metadata".to_string());
+            } else {
+                by_asset.insert(
+                    asset_id.clone(),
+                    PendingHit {
+                        asset_id,
+                        score: meta_score,
+                        timestamp_sec: None,
+                        match_reasons: vec!["Metadata".to_string()],
+                        ocr_snippet: None,
                     },
                 );
             }

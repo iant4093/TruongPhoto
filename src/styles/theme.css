@@ -9,8 +9,10 @@
   --surface-input: #292929;
   --surface-inspector: #1b1b1b;
   --surface-omnibar: #262626;
+  --bg-canvas: #202020;
   --border: #343434;
   --border-subtle: #2c2c2c;
+  --border-strong: #4a4a4a;
   --border-titlebar: #303030;
   --border-button: #414141;
   --text-primary: #ededed;
@@ -33,8 +35,7 @@ html, body, #root, #tray-root { margin: 0; width: 100%; height: 100%; overflow: 
 body { font: 13px/1.5 var(--font-sans); color: var(--text-primary); -webkit-font-smoothing: antialiased; background: var(--surface-main); }
 body.tauri-transparent { background: transparent; }
 button, input, textarea { font: inherit; }
-button { -webkit-user-select: none; user-select: none; }
-button { cursor: pointer; }
+button { -webkit-appearance: none; appearance: none; -webkit-user-select: none; user-select: none; cursor: pointer; }
 button:disabled { cursor: default; opacity: .4; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:focus-visible { outline: 2px solid #aaa; outline-offset: 3px; }
 input, textarea { -webkit-user-select: text; user-select: text; min-width: 0; }
@@ -2546,11 +2547,18 @@ input[type='number'].text-input { width: 90px; }
    ========================================================================= */
 
 .sidebar-status-trigger {
+  -webkit-appearance: none;
+  appearance: none;
   width: 100%;
   text-align: left;
   font: inherit;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  padding: 9px 11px;
   cursor: pointer;
-  transition: background-color 120ms ease, border-color 120ms ease;
+  transition: background-color 140ms ease, border-color 140ms ease, transform 120ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .sidebar-status-trigger:hover {
@@ -2558,8 +2566,12 @@ input[type='number'].text-input { width: 90px; }
   border-color: var(--border-strong);
 }
 
+.sidebar-status-trigger:active {
+  transform: scale(0.985);
+}
+
 .sidebar-status-trigger.is-active {
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.075);
   border-color: var(--border-strong);
 }
 
@@ -2759,5 +2771,213 @@ input[type='number'].text-input { width: 90px; }
 @media (max-width: 767px) {
   .status-drawer-slot {
     bottom: 58px;
+  }
+}
+
+/* =========================================================================
+   Cohesive Native Micro-Interactions & Subtle Motion Layer
+   ========================================================================= */
+
+@keyframes tp-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes tp-fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes tp-modal-pop {
+  from { opacity: 0; transform: translateY(8px) scale(0.975); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes tp-dropdown-pop {
+  from { opacity: 0; transform: translateY(-4px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Smooth transitions across core interactive controls */
+.nav-item,
+.icon-button,
+.lightbox-pill-btn,
+.lightbox-live-badge,
+.chat-suggestion-pill,
+.chat-thread-btn,
+.mobile-tabbar-item,
+.preset-choice-card,
+.advanced-accordion-trigger,
+.omnibar-field,
+.field-box,
+.text-input,
+.dropdown-menu li,
+.context-menu-item {
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    box-shadow 140ms ease,
+    transform 120ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 140ms ease;
+}
+
+.button {
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    transform 110ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 140ms ease;
+}
+
+/* Tactile micro-press feedback */
+.button:active:not(:disabled),
+.icon-button:active:not(:disabled),
+.lightbox-pill-btn:active:not(:disabled),
+.chat-suggestion-pill:active:not(:disabled),
+.chat-send-btn:active:not(:disabled) {
+  transform: scale(0.965);
+}
+
+.nav-item:active:not(:disabled),
+.chat-thread-btn:active:not(:disabled),
+.chat-starter-card:active:not(:disabled),
+.preset-choice-card:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+/* Gallery cards & media hover depth */
+.timeline-tile {
+  transition: outline-color 140ms ease, box-shadow 180ms ease;
+}
+
+.timeline-tile img {
+  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1), filter 180ms ease;
+}
+
+.timeline-tile:hover img {
+  transform: scale(1.024);
+}
+
+.tile-fav-btn,
+.tile-select-btn {
+  transition:
+    opacity 150ms ease,
+    background-color 140ms ease,
+    border-color 140ms ease,
+    transform 130ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tile-fav-btn:hover,
+.tile-select-btn:hover {
+  transform: scale(1.08);
+}
+
+.tile-fav-btn:active,
+.tile-select-btn:active {
+  transform: scale(0.92);
+}
+
+.album-card,
+.search-hit-card,
+.person-card {
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease,
+    transform 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 180ms ease;
+}
+
+.album-card:hover,
+.search-hit-card:hover,
+.person-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
+}
+
+.album-card:active,
+.search-hit-card:active,
+.person-card:active {
+  transform: translateY(0) scale(0.99);
+}
+
+.album-cover img,
+.search-hit-thumb img,
+.person-avatar img,
+.chat-hit-thumb img {
+  transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.album-card:hover .album-cover img,
+.search-hit-card:hover .search-hit-thumb img,
+.person-card:hover .person-avatar img,
+.chat-hit-thumb:hover img {
+  transform: scale(1.045);
+}
+
+/* Lightbox smooth entrance & nav arrow polish */
+.lightbox-overlay {
+  animation: tp-fade-in 160ms ease-out both;
+}
+
+.lightbox-nav-btn {
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    transform 140ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 140ms ease;
+}
+
+.lightbox-nav-btn:hover:not(:disabled) {
+  transform: translateY(-50%) scale(1.07);
+}
+
+.lightbox-nav-btn:active:not(:disabled) {
+  transform: translateY(-50%) scale(0.94);
+}
+
+/* Modals, dropdowns & chat turns */
+.modal-backdrop {
+  animation: tp-fade-in 140ms ease-out both;
+}
+
+.modal-backdrop > * {
+  animation: tp-modal-pop 190ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.dropdown-menu {
+  animation: tp-dropdown-pop 130ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.chat-bubble-row {
+  animation: tp-fade-up 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes tp-bulk-bar-in {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+.bulk-action-bar {
+  animation: tp-bulk-bar-in 170ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Toggle switch tactile thumb */
+.toggle-switch {
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+
+.toggle-switch::after {
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 160ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

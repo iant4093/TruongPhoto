@@ -31,6 +31,55 @@ fn escape_like_lower(raw: &str) -> String {
     out
 }
 
+fn tokenize_search_words(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+fn parse_focal_mm_token(tok: &str) -> Option<f64> {
+    let lower = tok.trim().to_ascii_lowercase();
+    let num_str = lower.strip_suffix("mm")?;
+    let val = num_str.parse::<f64>().ok()?;
+    if val.is_finite() && (1.0..=2000.0).contains(&val) {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn parse_aperture_f_token(tok: &str) -> Option<f64> {
+    let lower = tok.trim().to_ascii_lowercase();
+    let num_str = lower
+        .strip_prefix("f/")
+        .or_else(|| lower.strip_prefix('f'))?;
+    if num_str.is_empty() || !num_str.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    let val = num_str.parse::<f64>().ok()?;
+    if val.is_finite() && (0.7..=64.0).contains(&val) {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn parse_iso_token(tok: &str) -> Option<i64> {
+    let lower = tok.trim().to_ascii_lowercase();
+    let num_str = lower.strip_prefix("iso")?;
+    if num_str.is_empty() {
+        return None;
+    }
+    let val = num_str.parse::<i64>().ok()?;
+    if (25..=1_000_000).contains(&val) {
+        Some(val)
+    } else {
+        None
+    }
+}
+
 fn append_deterministic_filters(
     scope: &RbacScope,
     req: &SearchRequest,
@@ -79,33 +128,140 @@ fn append_deterministic_filters(
             let idx = params.len() + 1;
             params.push(Value::Text(trimmed.to_string()));
             where_clauses.push(format!(
-                "EXISTS (SELECT 1 FROM media_tags mt WHERE mt.asset_id = v.id AND mt.state = 'active' AND mt.tag = ?{idx})"
+                "EXISTS (SELECT 1 FROM media_tags mt WHERE mt.asset_id = v.id AND mt.state = 'active' AND LOWER(mt.tag) = LOWER(?{idx}))"
             ));
         }
     }
 
     if let Some(camera_model) = req.camera_model.as_deref() {
-        let trimmed = camera_model.trim();
-        if !trimmed.is_empty() {
-            let idx = params.len() + 1;
-            params.push(Value::Text(format!("%{}%", escape_like_lower(trimmed))));
+        let tokens = tokenize_search_words(camera_model);
+        if !tokens.is_empty() {
+            let mut token_checks = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                let idx = params.len() + 1;
+                params.push(Value::Text(format!("%{}%", escape_like_lower(&tok))));
+                token_checks.push(format!(
+                    "LOWER(COALESCE(dpm_c.camera_make, '') || ' ' || COALESCE(dpm_c.camera_model, '') || ' ' || COALESCE(v.camera_model, '')) LIKE ?{idx} ESCAPE '\\'"
+                ));
+            }
             where_clauses.push(format!(
-                "LOWER(COALESCE(v.camera_model, '')) LIKE ?{idx} ESCAPE '\\'"
+                "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_c WHERE dpm_c.asset_id = v.id AND {})",
+                token_checks.join(" AND ")
+            ));
+        }
+    }
+
+    let has_photo_exif_filters = req
+        .lens_model
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || req.focal_length_min_mm.is_some()
+        || req.focal_length_max_mm.is_some()
+        || req.aperture_min_f.is_some()
+        || req.aperture_max_f.is_some()
+        || req.iso_min.is_some()
+        || req.iso_max.is_some();
+
+    if has_photo_exif_filters {
+        let mut exif_checks = Vec::new();
+
+        if let Some(lens) = req.lens_model.as_deref() {
+            for tok in tokenize_search_words(lens) {
+                let idx = params.len() + 1;
+                params.push(Value::Text(format!("%{}%", escape_like_lower(&tok))));
+                exif_checks.push(format!(
+                    "LOWER(COALESCE(dpm_e.lens_model, '')) LIKE ?{idx} ESCAPE '\\'"
+                ));
+            }
+        }
+
+        let (fl_min, fl_max) = match (req.focal_length_min_mm, req.focal_length_max_mm) {
+            (Some(lo), Some(hi)) if (hi - lo).abs() < 0.2 => (Some(lo - 0.6), Some(hi + 0.6)),
+            pair => pair,
+        };
+        if let Some(lo) = fl_min {
+            let idx = params.len() + 1;
+            params.push(Value::Real(lo));
+            exif_checks.push(format!("dpm_e.focal_length_mm >= ?{idx}"));
+        }
+        if let Some(hi) = fl_max {
+            let idx = params.len() + 1;
+            params.push(Value::Real(hi));
+            exif_checks.push(format!("dpm_e.focal_length_mm <= ?{idx}"));
+        }
+
+        let (ap_min, ap_max) = match (req.aperture_min_f, req.aperture_max_f) {
+            (Some(lo), Some(hi)) if (hi - lo).abs() < 0.1 => (Some(lo - 0.15), Some(hi + 0.15)),
+            pair => pair,
+        };
+        if let Some(lo) = ap_min {
+            let idx = params.len() + 1;
+            params.push(Value::Real(lo));
+            exif_checks.push(format!("dpm_e.aperture_f >= ?{idx}"));
+        }
+        if let Some(hi) = ap_max {
+            let idx = params.len() + 1;
+            params.push(Value::Real(hi));
+            exif_checks.push(format!("dpm_e.aperture_f <= ?{idx}"));
+        }
+
+        if let Some(lo) = req.iso_min {
+            let idx = params.len() + 1;
+            params.push(Value::Integer(i64::from(lo)));
+            exif_checks.push(format!("dpm_e.iso >= ?{idx}"));
+        }
+        if let Some(hi) = req.iso_max {
+            let idx = params.len() + 1;
+            params.push(Value::Integer(i64::from(hi)));
+            exif_checks.push(format!("dpm_e.iso <= ?{idx}"));
+        }
+
+        if !exif_checks.is_empty() {
+            where_clauses.push(format!(
+                "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_e WHERE dpm_e.asset_id = v.id AND {})",
+                exif_checks.join(" AND ")
             ));
         }
     }
 
     if let Some(geo_query) = req.geo_query.as_deref() {
-        let trimmed = geo_query.trim();
-        if !trimmed.is_empty() {
-            let idx = params.len() + 1;
-            params.push(Value::Text(format!("%{}%", escape_like_lower(trimmed))));
-            where_clauses.push(format!(
-                "(LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'
-                  OR LOWER(COALESCE(v.effective_geo_admin1, '')) LIKE ?{idx} ESCAPE '\\'
-                  OR LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'
-                  OR LOWER(COALESCE(v.effective_geo_country_code, '')) LIKE ?{idx} ESCAPE '\\')"
-            ));
+        let tokens = tokenize_search_words(geo_query);
+        if !tokens.is_empty() {
+            let mut geo_token_checks = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                // Normalize "mount" <-> "mt" so "Mount Saint Helens" matches "Mt. Saint Helens".
+                let normalized = if tok == "mount" {
+                    "mt".to_string()
+                } else {
+                    tok.clone()
+                };
+                let idx = params.len() + 1;
+                params.push(Value::Text(format!("%{}%", escape_like_lower(&tok))));
+                if normalized != tok {
+                    let alt_idx = params.len() + 1;
+                    params.push(Value::Text(format!("%{}%", escape_like_lower(&normalized))));
+                    geo_token_checks.push(format!(
+                        "(LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_geo_admin1, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_geo_country_code, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_title, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_description, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR EXISTS (SELECT 1 FROM asset_files af_g WHERE af_g.asset_id = v.id AND (LOWER(af_g.rel_path) LIKE ?{idx} ESCAPE '\\' OR LOWER(af_g.rel_path) LIKE ?{alt_idx} ESCAPE '\\')))"
+                    ));
+                } else {
+                    geo_token_checks.push(format!(
+                        "(LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_geo_admin1, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_geo_country_code, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_title, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR LOWER(COALESCE(v.effective_description, '')) LIKE ?{idx} ESCAPE '\\'
+                          OR EXISTS (SELECT 1 FROM asset_files af_g WHERE af_g.asset_id = v.id AND LOWER(af_g.rel_path) LIKE ?{idx} ESCAPE '\\'))"
+                    ));
+                }
+            }
+            where_clauses.push(format!("({})", geo_token_checks.join(" AND ")));
         }
     }
 
@@ -264,6 +420,194 @@ pub fn search_ocr_fts(
     Ok(results)
 }
 
+fn append_free_text_metadata_clauses(
+    query: &str,
+    params: &mut Vec<Value>,
+    where_clauses: &mut Vec<String>,
+) -> bool {
+    let raw_tokens = tokenize_search_words(query);
+    if raw_tokens.is_empty() {
+        return false;
+    }
+
+    // Merge "iso" + "6400" into a single "iso6400" token so "iso 6400" matches dpm.iso cleanly.
+    let mut tokens: Vec<String> = Vec::with_capacity(raw_tokens.len());
+    let mut i = 0usize;
+    while i < raw_tokens.len() {
+        if raw_tokens[i] == "iso" {
+            if let Some(next) = raw_tokens.get(i + 1) {
+                if next.chars().all(|c| c.is_ascii_digit()) {
+                    tokens.push(format!("iso{next}"));
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        tokens.push(raw_tokens[i].clone());
+        i += 1;
+    }
+
+    // Ignore overly long queries or pure punctuation so metadata matching stays precise.
+    let meaningful: Vec<String> = tokens
+        .into_iter()
+        .filter(|t| t.chars().any(|c| c.is_alphanumeric()))
+        .take(6)
+        .collect();
+    if meaningful.is_empty() {
+        return false;
+    }
+
+    for tok in meaningful {
+        let mut ors = Vec::new();
+        if let Some(fl) = parse_focal_mm_token(&tok) {
+            let lo_idx = params.len() + 1;
+            params.push(Value::Real(fl - 0.6));
+            let hi_idx = params.len() + 1;
+            params.push(Value::Real(fl + 0.6));
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_q WHERE dpm_q.asset_id = v.id AND dpm_q.focal_length_mm BETWEEN ?{lo_idx} AND ?{hi_idx})"
+            ));
+        }
+        if let Some(ap) = parse_aperture_f_token(&tok) {
+            let lo_idx = params.len() + 1;
+            params.push(Value::Real(ap - 0.15));
+            let hi_idx = params.len() + 1;
+            params.push(Value::Real(ap + 0.15));
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_a WHERE dpm_a.asset_id = v.id AND dpm_a.aperture_f BETWEEN ?{lo_idx} AND ?{hi_idx})"
+            ));
+        }
+        if let Some(iso_val) = parse_iso_token(&tok) {
+            let iso_idx = params.len() + 1;
+            params.push(Value::Integer(iso_val));
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_i WHERE dpm_i.asset_id = v.id AND dpm_i.iso = ?{iso_idx})"
+            ));
+        }
+
+        let idx = params.len() + 1;
+        params.push(Value::Text(format!("%{}%", escape_like_lower(&tok))));
+        ors.push(format!(
+            "LOWER(COALESCE(v.effective_title, '')) LIKE ?{idx} ESCAPE '\\'"
+        ));
+        ors.push(format!(
+            "LOWER(COALESCE(v.effective_description, '')) LIKE ?{idx} ESCAPE '\\'"
+        ));
+        ors.push(format!(
+            "LOWER(COALESCE(v.camera_model, '')) LIKE ?{idx} ESCAPE '\\'"
+        ));
+        ors.push(format!(
+            "LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'"
+        ));
+        ors.push(format!(
+            "LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'"
+        ));
+        ors.push(format!(
+            "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_t WHERE dpm_t.asset_id = v.id AND (LOWER(COALESCE(dpm_t.camera_make, '')) LIKE ?{idx} ESCAPE '\\' OR LOWER(COALESCE(dpm_t.lens_model, '')) LIKE ?{idx} ESCAPE '\\'))"
+        ));
+        ors.push(format!(
+            "EXISTS (SELECT 1 FROM asset_files afq WHERE afq.asset_id = v.id AND LOWER(afq.rel_path) LIKE ?{idx} ESCAPE '\\')"
+        ));
+        ors.push(format!(
+            "EXISTS (SELECT 1 FROM media_tags mtq WHERE mtq.asset_id = v.id AND mtq.state = 'active' AND LOWER(mtq.tag) LIKE ?{idx} ESCAPE '\\')"
+        ));
+        ors.push(format!(
+            "EXISTS (SELECT 1 FROM faces fq JOIN people pq ON pq.id = fq.person_id WHERE fq.asset_id = v.id AND pq.is_hidden = 0 AND LOWER(COALESCE(pq.name, '')) LIKE ?{idx} ESCAPE '\\')"
+        ));
+
+        where_clauses.push(format!("({})", ors.join(" OR ")));
+    }
+
+    true
+}
+
+/// Returns RBAC-scoped asset IDs matching free-text deterministic metadata (camera make/model,
+/// lens, focal length, aperture, ISO, folder/filename, title, tags, and named people) for
+/// hybrid search fusion.
+pub fn search_metadata_matches(
+    conn: &Connection,
+    scope: &RbacScope,
+    req: &SearchRequest,
+    raw_query: &str,
+    limit: usize,
+) -> DbResult<Vec<String>> {
+    if limit == 0 || raw_query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut params: Vec<Value> = Vec::new();
+    let mut where_clauses = Vec::new();
+    if !append_deterministic_filters(scope, req, &mut params, &mut where_clauses) {
+        return Ok(Vec::new());
+    }
+    if !append_free_text_metadata_clauses(raw_query, &mut params, &mut where_clauses) {
+        return Ok(Vec::new());
+    }
+
+    let limit_idx = params.len() + 1;
+    params.push(Value::Integer(limit.min(MAX_SEARCH_LIMIT as usize) as i64));
+
+    let sql = format!(
+        "SELECT v.id
+         FROM v_assets_effective v
+         WHERE {}
+         ORDER BY v.effective_capture_at_ms DESC, v.id DESC
+         LIMIT ?{limit_idx}",
+        where_clauses.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(params), |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Lists distinct camera models and lens models visible within `scope` for AI chat router context.
+pub fn list_distinct_gear(
+    conn: &Connection,
+    scope: &RbacScope,
+) -> DbResult<(Vec<String>, Vec<String>)> {
+    let mut params_c: Vec<Value> = Vec::new();
+    let folder_c = rbac_sql::folder_clause("a", scope, &mut params_c);
+    let cam_sql = format!(
+        "SELECT DISTINCT TRIM(dpm.camera_model) AS cam
+         FROM deterministic_photo_meta dpm
+         JOIN assets a ON a.id = dpm.asset_id
+         WHERE a.deleted_at_ms IS NULL
+           AND a.is_hidden = 0
+           AND {folder_c}
+           AND dpm.camera_model IS NOT NULL
+           AND TRIM(dpm.camera_model) != ''
+         ORDER BY cam ASC
+         LIMIT 25"
+    );
+    let mut cam_stmt = conn.prepare(&cam_sql)?;
+    let cameras = cam_stmt
+        .query_map(params_from_iter(params_c), |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut params_l: Vec<Value> = Vec::new();
+    let folder_l = rbac_sql::folder_clause("a", scope, &mut params_l);
+    let lens_sql = format!(
+        "SELECT DISTINCT TRIM(dpm.lens_model) AS lens
+         FROM deterministic_photo_meta dpm
+         JOIN assets a ON a.id = dpm.asset_id
+         WHERE a.deleted_at_ms IS NULL
+           AND a.is_hidden = 0
+           AND {folder_l}
+           AND dpm.lens_model IS NOT NULL
+           AND TRIM(dpm.lens_model) != ''
+         ORDER BY lens ASC
+         LIMIT 30"
+    );
+    let mut lens_stmt = conn.prepare(&lens_sql)?;
+    let lenses = lens_stmt
+        .query_map(params_from_iter(params_l), |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((cameras, lenses))
+}
+
 /// Lists active, RBAC-scoped assets matching deterministic metadata filters (`sql_only` / `filters` mode).
 ///
 /// Returns `(items, total_count)`.
@@ -281,26 +625,7 @@ pub fn list_sql_filtered_assets(
     if let Some(query) = req.query.as_deref() {
         let trimmed = query.trim();
         if !trimmed.is_empty() {
-            let idx = params.len() + 1;
-            params.push(Value::Text(format!("%{}%", escape_like_lower(trimmed))));
-            where_clauses.push(format!(
-                "(LOWER(COALESCE(v.effective_title, '')) LIKE ?{idx} ESCAPE '\\'
-                  OR LOWER(COALESCE(v.effective_description, '')) LIKE ?{idx} ESCAPE '\\'
-                  OR LOWER(COALESCE(v.camera_model, '')) LIKE ?{idx} ESCAPE '\\'
-                  OR LOWER(COALESCE(v.effective_geo_city, '')) LIKE ?{idx} ESCAPE '\\'
-                  OR LOWER(COALESCE(v.effective_geo_country, '')) LIKE ?{idx} ESCAPE '\\'
-                  OR EXISTS (
-                      SELECT 1 FROM asset_files afq
-                      WHERE afq.asset_id = v.id
-                        AND LOWER(afq.rel_path) LIKE ?{idx} ESCAPE '\\'
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM media_tags mtq
-                      WHERE mtq.asset_id = v.id
-                        AND mtq.state = 'active'
-                        AND LOWER(mtq.tag) LIKE ?{idx} ESCAPE '\\'
-                  ))"
-            ));
+            append_free_text_metadata_clauses(trimmed, &mut params, &mut where_clauses);
         }
     }
 

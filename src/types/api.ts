@@ -637,6 +637,13 @@ export interface SearchRequest {
   person_ids?: string[] | null;
   tags?: string[] | null;
   camera_model?: string | null;
+  lens_model?: string | null;
+  focal_length_min_mm?: number | null;
+  focal_length_max_mm?: number | null;
+  aperture_min_f?: number | null;
+  aperture_max_f?: number | null;
+  iso_min?: number | null;
+  iso_max?: number | null;
   geo_query?: string | null;
   kind?: AssetKind | null;
   favorite?: boolean | null;
@@ -776,6 +783,13 @@ export interface RouterPlan {
   person_names: string[];
   location_query: string | null;
   camera_model: string | null;
+  lens_model?: string | null;
+  focal_length_min_mm?: number | null;
+  focal_length_max_mm?: number | null;
+  aperture_min_f?: number | null;
+  aperture_max_f?: number | null;
+  iso_min?: number | null;
+  iso_max?: number | null;
   tags: string[];
   kind: AssetKind | null;
   favorite: boolean | null;

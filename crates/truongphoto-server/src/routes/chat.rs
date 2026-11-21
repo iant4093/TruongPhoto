@@ -147,6 +147,13 @@ fn build_search_request_from_plan(
         person_ids,
         tags,
         camera_model: plan.camera_model.clone(),
+        lens_model: plan.lens_model.clone(),
+        focal_length_min_mm: plan.focal_length_min_mm,
+        focal_length_max_mm: plan.focal_length_max_mm,
+        aperture_min_f: plan.aperture_min_f,
+        aperture_max_f: plan.aperture_max_f,
+        iso_min: plan.iso_min,
+        iso_max: plan.iso_max,
         geo_query: plan.location_query.clone(),
         kind: plan.kind,
         favorite: plan.favorite,
@@ -382,28 +389,30 @@ pub async fn send_message(
     let sid_read = session_id.clone();
     let default_paths = state.default_paths.clone();
 
-    let (session, recent_turns, visible_people, ai_state, settings) = state
-        .db
-        .read(move |conn| {
-            let Some(session) = repo::chat::get_chat_session(conn, &user_id, &sid_read)? else {
-                return Err(DbError::NotFound("Chat session not found.".to_string()));
-            };
-            let stored = repo::chat::list_chat_messages(conn, &sid_read)?;
-            let recent: Vec<(ChatRole, String)> = stored
-                .iter()
-                .rev()
-                .take(RECENT_TURNS_WINDOW)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|m| (m.role, m.content.clone()))
-                .collect();
-            let people = repo::people::list_people(conn, &scope)?;
-            let ai_state = repo::ai::get_ai_index_state(conn)?;
-            let settings = repo::settings::load_app_settings(conn, &default_paths)?;
-            Ok((session, recent, people, ai_state, settings))
-        })
-        .await?;
+    let (session, recent_turns, visible_people, known_cameras, known_lenses, ai_state, settings) =
+        state
+            .db
+            .read(move |conn| {
+                let Some(session) = repo::chat::get_chat_session(conn, &user_id, &sid_read)? else {
+                    return Err(DbError::NotFound("Chat session not found.".to_string()));
+                };
+                let stored = repo::chat::list_chat_messages(conn, &sid_read)?;
+                let recent: Vec<(ChatRole, String)> = stored
+                    .iter()
+                    .rev()
+                    .take(RECENT_TURNS_WINDOW)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(|m| (m.role, m.content.clone()))
+                    .collect();
+                let people = repo::people::list_people(conn, &scope)?;
+                let (cameras, lenses) = repo::search::list_distinct_gear(conn, &scope)?;
+                let ai_state = repo::ai::get_ai_index_state(conn)?;
+                let settings = repo::settings::load_app_settings(conn, &default_paths)?;
+                Ok((session, recent, people, cameras, lenses, ai_state, settings))
+            })
+            .await?;
 
     let known_person_names: Vec<String> = visible_people
         .iter()
@@ -417,6 +426,8 @@ pub async fn send_message(
         prior_filters: session.active_filters.clone(),
         recent_turns,
         known_person_names,
+        known_cameras,
+        known_lenses,
         current_date_utc: Utc::now(),
     };
 
@@ -440,6 +451,13 @@ pub async fn send_message(
         || search_req.person_ids.is_some()
         || search_req.tags.is_some()
         || search_req.camera_model.is_some()
+        || search_req.lens_model.is_some()
+        || search_req.focal_length_min_mm.is_some()
+        || search_req.focal_length_max_mm.is_some()
+        || search_req.aperture_min_f.is_some()
+        || search_req.aperture_max_f.is_some()
+        || search_req.iso_min.is_some()
+        || search_req.iso_max.is_some()
         || search_req.geo_query.is_some()
         || search_req.kind.is_some()
         || search_req.favorite.is_some()

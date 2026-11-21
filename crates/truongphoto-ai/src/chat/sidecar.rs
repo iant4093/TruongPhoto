@@ -212,7 +212,10 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         self.touch_last_used();
 
         match parse_and_validate_router_plan(&content) {
-            Ok(parsed) => Ok(merge_router_plan(&input.prior_filters, &parsed)),
+            Ok(mut parsed) => {
+                sanitize_sidecar_plan(&input.user_message, &mut parsed);
+                Ok(merge_router_plan(&input.prior_filters, &parsed))
+            }
             Err(err) => {
                 tracing::warn!(tier = %tier, error = %err, "llama-server returned invalid RouterPlan JSON; falling back to ClassicChatRouter");
                 self.classic.route_turn(tier, input)
@@ -461,25 +464,140 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
     let prior_json = serde_json::to_string(&input.prior_filters).unwrap_or_else(|_| "{}".into());
     format!(
         "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a strict RouterPlan JSON object.\n\
-         Rules:\n\
+         Library Context:\n\
          - Current UTC date: {} (today is {})\n\
          - Known RBAC-visible person names: {:?}\n\
+         - Known camera bodies in library: {:?}\n\
+         - Known lenses in library: {:?}\n\
          - Prior active filters JSON: {}\n\
-         - Put ANY visual subject, animal, landmark, scene, object, or mood into \"semantic_query\" (e.g. \"waterfall in forest\", \"chimpanzee or monkey\", \"Eiffel Tower\", \"mountain sunrise\"). Never leave \"semantic_query\" null when the user asks for a visual subject or landmark.\n\
+         Rules:\n\
+         - Put ONLY actual visual subjects, animals, objects, scenes, or moods into \"semantic_query\" (e.g. \"waterfall in forest\", \"ape or monkey behind a fence\", \"Eiffel Tower\", \"mountain sunrise\"). Do NOT put technical EXIF adjectives like \"low light\", \"high ISO\", \"crisp\", \"sharp\", \"wide open\", or \"telephoto\" into \"semantic_query\" when filtering by EXIF numbers.\n\
+         - When the user asks for a named location, park, mountain, zoo, or place (e.g. \"Multnomah Falls\", \"Portland Zoo\", \"Bald Mountain\"), put that place name into \"location_query\" and leave \"semantic_query\": null UNLESS they also asked for a specific visual subject there (e.g. \"monkeys at Portland Zoo\" -> location_query: \"Portland Zoo\", semantic_query: \"monkey\").\n\
          - Put text that literally appears inside an image (signs, receipts, banners, words) into \"ocr_terms\".\n\
          - Match people against Known RBAC-visible person names into \"person_names\".\n\
+         - Camera & EXIF fields (NEVER invent EXIF filters unless the user explicitly mentioned a camera, lens, focal length, aperture/f-stop, or ISO; NEVER put focal length/lens/aperture/ISO into \"camera_model\"; framing words like \"close up\" or \"portrait\" are NOT apertures):\n\
+           * \"camera_model\": camera body only (match Known camera bodies, e.g. \"Canon R7\" -> \"Canon EOS R7\").\n\
+           * \"lens_model\": lens name only (match Known lenses, e.g. \"17-40 Art\" -> \"17-40mm F1.8 DC | Art 025\", \"100-400\" -> \"RF100-400mm F5.6-8 IS USM\").\n\
+           * \"focal_length_min_mm\" / \"focal_length_max_mm\": numeric mm range. For an EXACT focal length like \"at 12mm\" or \"56mm shots\", you MUST set BOTH min AND max to that exact number (e.g. \"12mm\" -> focal_length_min_mm: 12, focal_length_max_mm: 12). Only leave one side null for explicit bounds (\"under 15mm\" -> max: 15; \"over 300mm\" -> min: 300).\n\
+           * \"aperture_min_f\" / \"aperture_max_f\": numeric f-stop range (exact \"f/1.4\" -> min: 1.4, max: 1.4; \"wide open / f/2 or wider\" -> max: 2.0; \"f/8 or narrower\" -> min: 8.0).\n\
+           * \"iso_min\" / \"iso_max\": integer ISO range (exact \"ISO 100\" -> min: 100, max: 100; \"above 3200 / ISO 3200+\" -> min: 3200).\n\
          - For dates or months/years, output ISO strings in \"date_from\" and \"date_to\" (format \"YYYY-MM-DD\", e.g. November 2026 -> date_from: \"2026-11-01\", date_to: \"2026-11-30\"). Leave both null if no date was mentioned.\n\
          - Leave \"tags\": [] UNLESS the user explicitly asks for a tag (e.g. \"tagged X\" or \"#X\"). Never invent speculative tags.\n\
          - Leave \"kind\": null unless the user explicitly asks for only photos, only videos, raw files, or live photos.\n\
          - If the user greets you (e.g. \"hi\", \"hello\", \"thanks\") or asks what you can do without requesting photos, set clear_prior_filters=true, set all filter fields to null / [], and reply warmly and concisely.\n\
          - Set clear_prior_filters=true when the user starts over or switches to an unrelated topic; set false when refining the previous search.\n\
-         - Write a crisp, natural 1-sentence \"assistant_reply\" in active voice (e.g. \"Here are your waterfall photos.\" or \"Showing photos with Sebastian and Carson.\"). Avoid repeating boilerplate like \"Would you like to narrow it down by location, time of day...\".\n\
+         - Write a crisp, natural 1-sentence \"assistant_reply\" in active voice (e.g. \"Here are your 12mm photos.\" or \"Showing wide-open f/1.4 shots.\"). Avoid repeating boilerplate.\n\
          - Provide 2-3 short, varied \"follow_up_suggestions\". Never invent file paths or extra JSON keys.",
         input.current_date_utc.to_rfc3339(),
         input.current_date_utc.format("%Y-%m-%d"),
         input.known_person_names,
+        input.known_cameras,
+        input.known_lenses,
         prior_json,
     )
+}
+
+/// Deterministic post-parse safety net for small local LLMs:
+/// 1. Strips hallucinated EXIF bounds when the user never asked about focal length, aperture, or ISO
+///    (e.g., preventing "close up of a monkey" from hallucinating `aperture_max_f: 2.0`).
+/// 2. Completes one-sided exact EXIF bounds when the user asked for an exact value like "at 12mm"
+///    or "at f/1.4" or "ISO 100" without lower-bound phrasing ("over", "above", "at least", etc.).
+fn sanitize_sidecar_plan(user_message: &str, plan: &mut RouterPlan) {
+    let lower = user_message.to_ascii_lowercase();
+
+    let has_lower_bound_cue = [
+        "over ",
+        "above ",
+        "more than",
+        "at least",
+        "longer than",
+        "greater than",
+        "higher than",
+        "narrower than",
+        "zoomed",
+        "beyond ",
+        ">=",
+        ">",
+        "+",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+
+    let has_upper_bound_cue = [
+        "under ",
+        "below ",
+        "less than",
+        "shorter than",
+        "wider than",
+        "lower than",
+        "at most",
+        "up to ",
+        "<=",
+        "<",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+
+    let has_aperture_cue = lower.contains("f/")
+        || lower.contains("aperture")
+        || lower.contains("wide open")
+        || lower.contains("wide-open")
+        || lower.contains("bokeh")
+        || lower.contains("shallow")
+        || lower.contains("f-stop")
+        || lower.contains("f stop")
+        || lower.contains("depth of field")
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+            .any(|tok| {
+                tok.starts_with('f')
+                    && tok.len() >= 2
+                    && tok[1..].chars().all(|c| c.is_ascii_digit() || c == '.')
+                    && tok[1..].chars().any(|c| c.is_ascii_digit())
+            });
+
+    if !has_aperture_cue {
+        plan.aperture_min_f = None;
+        plan.aperture_max_f = None;
+    } else if let (Some(lo), None) = (plan.aperture_min_f, plan.aperture_max_f) {
+        if !has_lower_bound_cue {
+            plan.aperture_max_f = Some(lo);
+        }
+    }
+
+    let has_iso_cue = lower.contains("iso")
+        || lower.contains("grain")
+        || lower.contains("noisy")
+        || lower.contains("noise");
+
+    if !has_iso_cue {
+        plan.iso_min = None;
+        plan.iso_max = None;
+    } else if let (Some(lo), None) = (plan.iso_min, plan.iso_max) {
+        if !has_lower_bound_cue && !lower.contains("high iso") {
+            plan.iso_max = Some(lo);
+        }
+    }
+
+    let has_focal_cue = lower.contains("mm")
+        || lower.contains("focal")
+        || lower.contains("wide")
+        || lower.contains("telephoto")
+        || lower.contains("zoom")
+        || lower.contains("fisheye");
+
+    if !has_focal_cue {
+        plan.focal_length_min_mm = None;
+        plan.focal_length_max_mm = None;
+    } else if let (Some(lo), None) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
+        if !has_lower_bound_cue && !lower.contains("telephoto") {
+            plan.focal_length_max_mm = Some(lo);
+        }
+    } else if let (None, Some(hi)) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
+        if !has_upper_bound_cue && !lower.contains("wide") && !lower.contains("fisheye") {
+            plan.focal_length_min_mm = Some(hi);
+        }
+    }
 }
 
 fn run_blocking_http<F, T>(fut_fn: F) -> Result<T, AiError>

@@ -20,6 +20,8 @@ fn turn_input(msg: &str, prior: RouterPlan, people: &[&str]) -> ChatTurnInput {
         prior_filters: prior,
         recent_turns: Vec::new(),
         known_person_names: people.iter().map(|s| (*s).to_string()).collect(),
+        known_cameras: Vec::new(),
+        known_lenses: Vec::new(),
         current_date_utc: fixed_date(),
     }
 }
@@ -425,6 +427,8 @@ fn deterministic_test_router_tier3_rerank_and_idle_eviction() {
         prior_filters: RouterPlan::default(),
         recent_turns: vec![(ChatRole::User, "hello".to_string())],
         known_person_names: vec!["Mom".to_string()],
+        known_cameras: Vec::new(),
+        known_lenses: Vec::new(),
         current_date_utc: fixed_date(),
     };
     let t0_plan = pipeline.chat.route_turn(ChatTier::Tier0, &input).unwrap();

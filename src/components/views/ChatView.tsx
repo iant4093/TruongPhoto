@@ -44,9 +44,9 @@ const STARTER_PROMPTS: ReadonlyArray<{ title: string; subtitle: string; prompt: 
     prompt: 'Show me mountain landscapes',
   },
   {
-    title: 'Filter by camera or gear',
-    subtitle: 'Deterministic EXIF metadata lookup',
-    prompt: 'Show me favorite photos or videos',
+    title: 'Filter by camera, lens, or EXIF',
+    subtitle: 'Focal length, aperture, ISO & camera lookup',
+    prompt: 'Show me wide-angle photos under 24mm',
   },
   {
     title: 'Search text inside photos',
@@ -97,6 +97,50 @@ function buildFilterChips(plan: RouterPlan | null): string[] {
   }
   if (plan.camera_model) {
     chips.push(`Camera: ${plan.camera_model}`);
+  }
+  if (plan.lens_model) {
+    chips.push(`Lens: ${plan.lens_model}`);
+  }
+  if (plan.focal_length_min_mm != null || plan.focal_length_max_mm != null) {
+    const fMin = plan.focal_length_min_mm;
+    const fMax = plan.focal_length_max_mm;
+    const fmtMm = (v: number) => `${Number.isInteger(v) ? v : Number(v.toFixed(1))}mm`;
+    if (fMin != null && fMax != null && Math.abs(fMin - fMax) < 0.05) {
+      chips.push(`Focal: ${fmtMm(fMin)}`);
+    } else if (fMin != null && fMax != null) {
+      chips.push(`Focal: ${fmtMm(fMin)}–${fmtMm(fMax)}`);
+    } else if (fMin != null) {
+      chips.push(`Focal: ≥ ${fmtMm(fMin)}`);
+    } else if (fMax != null) {
+      chips.push(`Focal: ≤ ${fmtMm(fMax)}`);
+    }
+  }
+  if (plan.aperture_min_f != null || plan.aperture_max_f != null) {
+    const aMin = plan.aperture_min_f;
+    const aMax = plan.aperture_max_f;
+    const fmtF = (v: number) => `f/${Number(v.toFixed(1))}`;
+    if (aMin != null && aMax != null && Math.abs(aMin - aMax) < 0.05) {
+      chips.push(`Aperture: ${fmtF(aMin)}`);
+    } else if (aMin != null && aMax != null) {
+      chips.push(`Aperture: ${fmtF(aMin)}–${fmtF(aMax)}`);
+    } else if (aMin != null) {
+      chips.push(`Aperture: ≥ ${fmtF(aMin)}`);
+    } else if (aMax != null) {
+      chips.push(`Aperture: ≤ ${fmtF(aMax)}`);
+    }
+  }
+  if (plan.iso_min != null || plan.iso_max != null) {
+    const iMin = plan.iso_min;
+    const iMax = plan.iso_max;
+    if (iMin != null && iMax != null && iMin === iMax) {
+      chips.push(`ISO: ${iMin}`);
+    } else if (iMin != null && iMax != null) {
+      chips.push(`ISO: ${iMin}–${iMax}`);
+    } else if (iMin != null) {
+      chips.push(`ISO: ≥ ${iMin}`);
+    } else if (iMax != null) {
+      chips.push(`ISO: ≤ ${iMax}`);
+    }
   }
   for (const tag of plan.tags ?? []) {
     if (tag.trim()) {

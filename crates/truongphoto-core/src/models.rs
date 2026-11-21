@@ -1077,7 +1077,7 @@ impl FromStr for PlannerMode {
 }
 
 /// Hybrid semantic, OCR, and deterministic metadata filter search request (`POST /api/search`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchRequest {
     pub query: Option<String>,
@@ -1086,6 +1086,20 @@ pub struct SearchRequest {
     pub person_ids: Option<Vec<String>>,
     pub tags: Option<Vec<String>>,
     pub camera_model: Option<String>,
+    #[serde(default)]
+    pub lens_model: Option<String>,
+    #[serde(default)]
+    pub focal_length_min_mm: Option<f64>,
+    #[serde(default)]
+    pub focal_length_max_mm: Option<f64>,
+    #[serde(default)]
+    pub aperture_min_f: Option<f64>,
+    #[serde(default)]
+    pub aperture_max_f: Option<f64>,
+    #[serde(default)]
+    pub iso_min: Option<u32>,
+    #[serde(default)]
+    pub iso_max: Option<u32>,
     pub geo_query: Option<String>,
     pub kind: Option<AssetKind>,
     pub favorite: Option<bool>,
@@ -1385,7 +1399,7 @@ pub struct SetChatTierRequest {
 }
 
 /// Structured conversational query router output & carried-forward filter state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RouterPlan {
     pub semantic_query: Option<String>,
@@ -1394,6 +1408,20 @@ pub struct RouterPlan {
     pub person_names: Vec<String>,
     pub location_query: Option<String>,
     pub camera_model: Option<String>,
+    #[serde(default)]
+    pub lens_model: Option<String>,
+    #[serde(default)]
+    pub focal_length_min_mm: Option<f64>,
+    #[serde(default)]
+    pub focal_length_max_mm: Option<f64>,
+    #[serde(default)]
+    pub aperture_min_f: Option<f64>,
+    #[serde(default)]
+    pub aperture_max_f: Option<f64>,
+    #[serde(default)]
+    pub iso_min: Option<u32>,
+    #[serde(default)]
+    pub iso_max: Option<u32>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub kind: Option<AssetKind>,
@@ -1460,7 +1488,7 @@ pub struct ChatSessionSummary {
 }
 
 /// Detailed session DTO including carried-forward active filters (`GET /api/chat/sessions/{id}`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatSessionDetail {
     pub id: String,
     pub title: String,
@@ -1935,6 +1963,7 @@ mod tests {
             clear_prior_filters: true,
             assistant_reply: "Found 2 videos from Tokyo.".to_string(),
             follow_up_suggestions: vec!["Favorites only".to_string()],
+            ..Default::default()
         };
         let plan_json = serde_json::to_string(&plan).unwrap();
         let parsed_plan: RouterPlan = serde_json::from_str(&plan_json).unwrap();
