@@ -47,7 +47,7 @@ function formatUtcDate(ms: number): string {
 }
 
 function buildFilterChips(plan: RouterPlan | null): string[] {
-  if (!plan) return [];
+  if (!plan || plan.intent === 'answer') return [];
   const chips: string[] = [];
 
   if (plan.kind) {

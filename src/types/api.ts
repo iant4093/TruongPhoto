@@ -784,6 +784,7 @@ export interface SetChatTierRequest {
 }
 
 export interface RouterPlan {
+  intent?: 'search' | 'answer' | string | null;
   semantic_query: string | null;
   ocr_terms: string | null;
   person_names: string[];

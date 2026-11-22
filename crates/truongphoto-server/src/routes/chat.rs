@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use truongphoto_ai::{ChatTurnInput, RerankCandidate};
+use truongphoto_ai::{ChatTurnInput, LibraryChatContext, RerankCandidate};
 use truongphoto_core::{
     ChatHitRef, ChatMessageView, ChatRole, ChatSessionDetail, ChatSessionSummary, ChatTier,
     CreateChatSessionRequest, PersonSummary, RouterPlan, SearchHit, SearchMode, SearchRequest,
@@ -377,6 +377,132 @@ pub async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn synthesize_grounded_answer(
+    prompt: &str,
+    summary: &repo::search::LibraryChatSummary,
+    cameras: &[String],
+    lenses: &[String],
+) -> String {
+    let lower = prompt.to_ascii_lowercase();
+
+    let people_list: Vec<String> = summary
+        .person_counts
+        .iter()
+        .take(12)
+        .map(|(name, cnt)| format!("{name} ({cnt})"))
+        .collect();
+    let folders_list: Vec<String> = summary
+        .folders
+        .iter()
+        .take(8)
+        .map(|(name, cnt)| format!("{name} ({cnt})"))
+        .collect();
+
+    if lower.contains("who") || lower.contains("people") {
+        if people_list.is_empty() {
+            return format!(
+                "You have {} items in your library, and no named people are tagged yet. You can name detected faces in the People view.",
+                summary.total_assets
+            );
+        }
+        return format!(
+            "Here are the named people in your library: {}. Ask me to show photos of any of them!",
+            people_list.join(", ")
+        );
+    }
+
+    if lower.contains("camera")
+        || lower.contains("lens")
+        || lower.contains("gear")
+        || lower.contains("equipment")
+    {
+        let cam_str = if cameras.is_empty() {
+            "none detected".to_string()
+        } else {
+            cameras.join(", ")
+        };
+        let lens_str = if lenses.is_empty() {
+            "none detected".to_string()
+        } else {
+            lenses.join(", ")
+        };
+        return format!("Your library uses camera(s): {cam_str}, with lens(es): {lens_str}.");
+    }
+
+    if lower.contains("folder")
+        || lower.contains("trip")
+        || lower.contains("event")
+        || lower.contains("where")
+        || lower.contains("place")
+    {
+        if folders_list.is_empty() {
+            return format!("Your library contains {} items.", summary.total_assets);
+        }
+        return format!(
+            "Your library has {} items across these collections: {}.",
+            summary.total_assets,
+            folders_list.join(", ")
+        );
+    }
+
+    let mut parts = vec![format!("Your library has {} items", summary.total_assets)];
+    if let Some((lo, hi)) = &summary.date_range {
+        parts.push(format!("spanning {lo} to {hi}"));
+    }
+    let mut sentence = format!("{}.", parts.join(" "));
+    if !folders_list.is_empty() {
+        sentence.push_str(&format!(" Main collections: {}.", folders_list.join(", ")));
+    }
+    if !people_list.is_empty() {
+        sentence.push_str(&format!(" Recognized people: {}.", people_list.join(", ")));
+    }
+    if !cameras.is_empty() {
+        sentence.push_str(&format!(" Shot on {}.", cameras.join(", ")));
+    }
+    sentence
+}
+
+fn describe_zero_hit_filters(plan: &RouterPlan) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(q) = plan.semantic_query.as_deref() {
+        parts.push(format!("\"{q}\""));
+    }
+    if let Some(loc) = plan.location_query.as_deref() {
+        parts.push(format!("location \"{loc}\""));
+    }
+    if !plan.person_names.is_empty() {
+        parts.push(format!("person {}", plan.person_names.join(" + ")));
+    }
+    if let Some(ocr) = plan.ocr_terms.as_deref() {
+        parts.push(format!("text \"{ocr}\""));
+    }
+    if let Some(cam) = plan.camera_model.as_deref() {
+        parts.push(format!("camera {cam}"));
+    }
+    if let Some(lens) = plan.lens_model.as_deref() {
+        parts.push(format!("lens {lens}"));
+    }
+    if let (Some(lo), Some(hi)) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
+        if (lo - hi).abs() < 0.05 {
+            parts.push(format!("{lo:.0}mm"));
+        } else {
+            parts.push(format!("{lo:.0}–{hi:.0}mm"));
+        }
+    } else if let Some(lo) = plan.focal_length_min_mm {
+        parts.push(format!("≥ {lo:.0}mm"));
+    } else if let Some(hi) = plan.focal_length_max_mm {
+        parts.push(format!("≤ {hi:.0}mm"));
+    }
+    if parts.is_empty() {
+        "I didn't find any matching photos or videos for those filters. Try broadening your request or asking what's in your library.".to_string()
+    } else {
+        format!(
+            "I didn't find any photos or videos matching {}. Try a broader description or another filter.",
+            parts.join(", ")
+        )
+    }
+}
+
 /// `POST /api/chat/sessions/{id}/messages` (AuthSession + RbacContext; multi-turn RBAC-enforced hybrid search + optional Tier 3 VLM reranker).
 pub async fn send_message(
     rbac: RbacContext,
@@ -398,30 +524,48 @@ pub async fn send_message(
     let sid_read = session_id.clone();
     let default_paths = state.default_paths.clone();
 
-    let (session, recent_turns, visible_people, known_cameras, known_lenses, ai_state, settings) =
-        state
-            .db
-            .read(move |conn| {
-                let Some(session) = repo::chat::get_chat_session(conn, &user_id, &sid_read)? else {
-                    return Err(DbError::NotFound("Chat session not found.".to_string()));
-                };
-                let stored = repo::chat::list_chat_messages(conn, &sid_read)?;
-                let recent: Vec<(ChatRole, String)> = stored
-                    .iter()
-                    .rev()
-                    .take(RECENT_TURNS_WINDOW)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .map(|m| (m.role, m.content.clone()))
-                    .collect();
-                let people = repo::people::list_people(conn, &scope)?;
-                let (cameras, lenses) = repo::search::list_distinct_gear(conn, &scope)?;
-                let ai_state = repo::ai::get_ai_index_state(conn)?;
-                let settings = repo::settings::load_app_settings(conn, &default_paths)?;
-                Ok((session, recent, people, cameras, lenses, ai_state, settings))
-            })
-            .await?;
+    let (
+        session,
+        recent_turns,
+        visible_people,
+        known_cameras,
+        known_lenses,
+        library_summary,
+        ai_state,
+        settings,
+    ) = state
+        .db
+        .read(move |conn| {
+            let Some(session) = repo::chat::get_chat_session(conn, &user_id, &sid_read)? else {
+                return Err(DbError::NotFound("Chat session not found.".to_string()));
+            };
+            let stored = repo::chat::list_chat_messages(conn, &sid_read)?;
+            let recent: Vec<(ChatRole, String)> = stored
+                .iter()
+                .rev()
+                .take(RECENT_TURNS_WINDOW)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|m| (m.role, m.content.clone()))
+                .collect();
+            let people = repo::people::list_people(conn, &scope)?;
+            let (cameras, lenses) = repo::search::list_distinct_gear(conn, &scope)?;
+            let library_summary = repo::search::load_library_chat_summary(conn, &scope)?;
+            let ai_state = repo::ai::get_ai_index_state(conn)?;
+            let settings = repo::settings::load_app_settings(conn, &default_paths)?;
+            Ok((
+                session,
+                recent,
+                people,
+                cameras,
+                lenses,
+                library_summary,
+                ai_state,
+                settings,
+            ))
+        })
+        .await?;
 
     let known_person_names: Vec<String> = visible_people
         .iter()
@@ -430,13 +574,26 @@ pub async fn send_message(
         .map(str::to_string)
         .collect();
 
+    let library_context = LibraryChatContext {
+        total_assets: library_summary.total_assets,
+        date_range: library_summary.date_range.clone(),
+        known_folders: library_summary
+            .folders
+            .iter()
+            .map(|(name, cnt)| format!("{name} ({cnt})"))
+            .collect(),
+        top_tags: library_summary.top_tags.clone(),
+        person_counts: library_summary.person_counts.clone(),
+    };
+
     let turn_input = ChatTurnInput {
         user_message: content.clone(),
         prior_filters: session.active_filters.clone(),
         recent_turns,
         known_person_names,
-        known_cameras,
-        known_lenses,
+        known_cameras: known_cameras.clone(),
+        known_lenses: known_lenses.clone(),
+        library: library_context,
         current_date_utc: Utc::now(),
     };
 
@@ -449,35 +606,41 @@ pub async fn send_message(
     .map_err(|e| AppError::internal(format!("Chat router worker panicked: {e}")))?
     .map_err(|e| AppError::internal(format!("Chat query routing failed: {e}")))?;
 
-    let person_ids = resolve_rbac_person_ids(&plan.person_names, &visible_people);
+    let is_answer_only = plan.intent.as_deref() == Some("answer");
+    let person_ids = if is_answer_only {
+        None
+    } else {
+        resolve_rbac_person_ids(&plan.person_names, &visible_people)
+    };
     let search_limit = req
         .limit
         .unwrap_or(DEFAULT_CHAT_LIMIT)
         .clamp(1, MAX_CHAT_LIMIT) as u32;
     let search_req = build_search_request_from_plan(&plan, person_ids, search_limit);
 
-    let has_any_search_criteria = search_req.query.is_some()
-        || search_req.ocr_query.is_some()
-        || search_req.person_ids.is_some()
-        || search_req.has_people.is_some()
-        || search_req.tags.is_some()
-        || search_req.camera_model.is_some()
-        || search_req.lens_model.is_some()
-        || search_req.focal_length_min_mm.is_some()
-        || search_req.focal_length_max_mm.is_some()
-        || search_req.aperture_min_f.is_some()
-        || search_req.aperture_max_f.is_some()
-        || search_req.iso_min.is_some()
-        || search_req.iso_max.is_some()
-        || search_req.shutter_speed_min_sec.is_some()
-        || search_req.shutter_speed_max_sec.is_some()
-        || search_req.orientation.is_some()
-        || search_req.sort_by.is_some()
-        || search_req.geo_query.is_some()
-        || search_req.kind.is_some()
-        || search_req.favorite.is_some()
-        || search_req.date_from_ms.is_some()
-        || search_req.date_to_ms.is_some();
+    let has_any_search_criteria = !is_answer_only
+        && (search_req.query.is_some()
+            || search_req.ocr_query.is_some()
+            || search_req.person_ids.is_some()
+            || search_req.has_people.is_some()
+            || search_req.tags.is_some()
+            || search_req.camera_model.is_some()
+            || search_req.lens_model.is_some()
+            || search_req.focal_length_min_mm.is_some()
+            || search_req.focal_length_max_mm.is_some()
+            || search_req.aperture_min_f.is_some()
+            || search_req.aperture_max_f.is_some()
+            || search_req.iso_min.is_some()
+            || search_req.iso_max.is_some()
+            || search_req.shutter_speed_min_sec.is_some()
+            || search_req.shutter_speed_max_sec.is_some()
+            || search_req.orientation.is_some()
+            || search_req.sort_by.is_some()
+            || search_req.geo_query.is_some()
+            || search_req.kind.is_some()
+            || search_req.favorite.is_some()
+            || search_req.date_from_ms.is_some()
+            || search_req.date_to_ms.is_some());
 
     let mut search_resp = if has_any_search_criteria {
         execute_hybrid_search(&state, &rbac, search_req).await?
@@ -561,9 +724,36 @@ pub async fn send_message(
         }
     }
 
-    if plan.assistant_reply.trim().is_empty() {
+    if is_answer_only {
+        let lower_reply = plan.assistant_reply.trim().to_ascii_lowercase();
+        let needs_fallback = lower_reply.is_empty()
+            || lower_reply.contains("didn't find")
+            || lower_reply.contains("no match")
+            || lower_reply.starts_with("here are your photos")
+            || lower_reply.starts_with("showing photos");
+        if needs_fallback {
+            plan.assistant_reply = synthesize_grounded_answer(
+                &content,
+                &library_summary,
+                &known_cameras,
+                &known_lenses,
+            );
+        }
+        if plan.follow_up_suggestions.is_empty() {
+            if let Some((first_person, _)) = library_summary.person_counts.first() {
+                plan.follow_up_suggestions
+                    .push(format!("Show me photos of {first_person}"));
+            }
+            if let Some((first_folder, _)) = library_summary.folders.first() {
+                plan.follow_up_suggestions
+                    .push(format!("Show me {first_folder}"));
+            }
+            plan.follow_up_suggestions
+                .push("Show me my best photos".to_string());
+        }
+    } else if plan.assistant_reply.trim().is_empty() {
         plan.assistant_reply = if search_resp.items.is_empty() {
-            "No matching photos or videos found for those filters.".to_string()
+            describe_zero_hit_filters(&plan)
         } else {
             format!("Found {} matching item(s).", search_resp.total_count)
         };
@@ -574,7 +764,7 @@ pub async fn send_message(
             && !lower.contains("didn't find")
             && !lower.contains("none found")
         {
-            plan.assistant_reply = "I searched your library, but didn't find any matching photos or videos. Try broadening the description or starting a new search.".to_string();
+            plan.assistant_reply = describe_zero_hit_filters(&plan);
         }
     }
 

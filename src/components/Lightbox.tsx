@@ -47,7 +47,6 @@ export const Lightbox: React.FC = () => {
   const canMutate = user?.role === 'admin' || user?.role === 'contributor';
 
   const [detail, setDetail] = useState<AssetDetail | null>(null);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [infoOpen, setInfoOpen] = useState(false);
@@ -58,6 +57,7 @@ export const Lightbox: React.FC = () => {
   const [isDragging, setIsDragging] = useState(false);
   const [hiResLoadedUrl, setHiResLoadedUrl] = useState<string | null>(null);
   const [hiResLoading, setHiResLoading] = useState(false);
+  const [navDir, setNavDir] = useState<'fade' | 'next' | 'prev'>('fade');
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -97,11 +97,13 @@ export const Lightbox: React.FC = () => {
 
   const goPrev = useCallback(() => {
     if (!hasPrev) return;
+    setNavDir('prev');
     setLightboxAsset(lightboxAssetIds[currentIndex - 1]);
   }, [currentIndex, hasPrev, lightboxAssetIds, setLightboxAsset]);
 
   const goNext = useCallback(() => {
     if (!hasNext) return;
+    setNavDir('next');
     setLightboxAsset(lightboxAssetIds[currentIndex + 1]);
   }, [currentIndex, hasNext, lightboxAssetIds, setLightboxAsset]);
 
@@ -109,11 +111,11 @@ export const Lightbox: React.FC = () => {
     if (!lightboxAssetId) {
       setDetail(null);
       setInfoOpen(false);
+      setNavDir('fade');
       return;
     }
 
     let active = true;
-    setLoading(true);
     setError(null);
     setRawDemosaic(false);
     setLivePlaying(false);
@@ -126,12 +128,10 @@ export const Lightbox: React.FC = () => {
       .then((res) => {
         if (!active) return;
         setDetail(res);
-        setLoading(false);
       })
       .catch((err) => {
         if (!active) return;
         setError(errorMessage(err));
-        setLoading(false);
       });
 
     return () => {
@@ -372,13 +372,14 @@ export const Lightbox: React.FC = () => {
 
   if (!lightboxAssetId) return null;
 
+  const activeDetail = detail?.summary.id === lightboxAssetId ? detail : null;
   const titleText =
-    detail?.overrides?.title ||
-    detail?.summary.title ||
+    activeDetail?.overrides?.title ||
+    activeDetail?.summary.title ||
     primaryFile?.rel_path.split(/[\\/]/).pop() ||
     'Media';
 
-  const previewUrl = detail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId);
+  const previewUrl = activeDetail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId);
   const usingHiRes = Boolean(
     rawDemosaic || (fullResUrl && hiResLoadedUrl === fullResUrl && zoom > 1.05),
   );
@@ -790,31 +791,26 @@ export const Lightbox: React.FC = () => {
             </button>
           )}
 
-          {loading ? (
-            <div className="view-loading" role="status">
-              Loading media…
-            </div>
-          ) : error ? (
+          {error ? (
             <div className="error-banner" role="alert">
               {error}
             </div>
-          ) : isVideo && detail ? (
-            <VideoPlayer
-              playback={detail.playback}
-              posterUrl={mediaThumbUrl(lightboxAssetId)}
-              initialTimestampSec={lightboxInitialTimestampSec}
-              className="lightbox-media"
-            />
+          ) : isVideo && detail && detail.summary.id === lightboxAssetId ? (
+            <div
+              key={lightboxAssetId}
+              className={`lightbox-media-frame is-nav-${navDir}`}
+            >
+              <VideoPlayer
+                playback={detail.playback}
+                posterUrl={mediaThumbUrl(lightboxAssetId)}
+                initialTimestampSec={lightboxInitialTimestampSec}
+                className="lightbox-media"
+              />
+            </div>
           ) : (
             <div
-              style={{
-                position: 'relative',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                width: '100%',
-                height: '100%',
-              }}
+              key={lightboxAssetId}
+              className={`lightbox-media-frame is-nav-${navDir}`}
             >
               <img
                 ref={imgRef}

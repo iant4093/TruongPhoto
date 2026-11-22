@@ -1414,6 +1414,8 @@ pub struct SetChatTierRequest {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RouterPlan {
+    #[serde(default)]
+    pub intent: Option<String>,
     pub semantic_query: Option<String>,
     pub ocr_terms: Option<String>,
     #[serde(default)]

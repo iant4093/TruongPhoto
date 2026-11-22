@@ -499,21 +499,45 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
     let (prev2_y, prev2_m) = shift_calendar_month(cur_y, cur_m, -2);
     let (two_m_from, two_m_to) = calendar_month_range(prev2_y, prev2_m);
 
+    let date_span = match &input.library.date_range {
+        Some((lo, hi)) => format!("{lo} to {hi}"),
+        None => "unknown".to_string(),
+    };
+    let people_overview: Vec<String> = if !input.library.person_counts.is_empty() {
+        input
+            .library
+            .person_counts
+            .iter()
+            .map(|(name, cnt)| format!("{name} ({cnt})"))
+            .collect()
+    } else {
+        input.known_person_names.clone()
+    };
+
     format!(
         "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a strict RouterPlan JSON object.\n\
-         Library Context:\n\
+         Library Overview (RBAC-visible to this user):\n\
          - Current UTC date: {} (today is {})\n\
          - Calendar month reference: \"this month\" = {} to {}; \"last month\" = {} to {}; \"two months ago\" = {} to {}\n\
-         - Known RBAC-visible person names: {:?}\n\
-         - Known camera bodies in library: {:?}\n\
-         - Known lenses in library: {:?}\n\
+         - Total items: {} (capture date span: {})\n\
+         - Folders / Events: {:?}\n\
+         - Known RBAC-visible people (with photo counts): {:?}\n\
+         - Known camera bodies: {:?}\n\
+         - Known lenses: {:?}\n\
+         - Top tags: {:?}\n\
          - Prior active filters JSON: {}\n\
          Rules:\n\
-         - Informational questions about the library itself (e.g. \"what cameras or lenses do I have?\", \"who are the people you know in my photos?\", \"hi\", \"what can you do?\"): answer directly and helpfully in \"assistant_reply\" using Library Context above, set clear_prior_filters=true, and leave ALL filter fields null / [] so no search runs!\n\
+         - Choose \"intent\" FIRST:\n\
+           * Set \"intent\": \"answer\" for ANY conversational message or meta-question ABOUT the library itself — e.g. \"who are in my pics\", \"who is in my photos\", \"what's in my library\", \"tell me about my photos\", \"what trips or folders do I have\", \"how many photos do I have\", \"what gear / cameras / lenses do I use\", \"when were my photos taken\", \"hi\", \"what can you do?\". Answer directly, warmly, and concretely in \"assistant_reply\" using the exact names, counts, dates, folders, and gear from Library Overview above, set clear_prior_filters=true, and leave ALL filter fields null / [] so NO search runs!\n\
+           * Set \"intent\": \"search\" whenever the user wants to view, browse, or find photos/videos (including casual or vague requests like \"show me cool pics\", \"best photos\", \"surprise me\", \"what did I shoot recently\", \"show me people\", \"graduation stuff\").\n\
+         - Vague & exploratory photo requests (intent=\"search\"):\n\
+           * For subjective or open browsing requests (\"cool pics\", \"best photos\", \"something interesting\", \"surprise me\", \"good shots\"), set \"semantic_query\": null, \"has_people\": null, and \"sort_by\": \"aperture_asc\" (or \"capture_desc\" for \"recent\", \"latest\", \"what did I shoot recently\", \"everything\", \"my photos\"). For concrete visual subjects (\"animals\", \"nature\", \"mountain\", \"graduation\"), leave \"sort_by\": null and \"has_people\": null! NEVER put subjective filler words (\"cool\", \"nice\", \"best\", \"good\", \"awesome\", \"interesting\", \"random\", \"stuff\", \"pics\", \"photos\") into \"semantic_query\"!\n\
+           * For broad people requests without a specific name (\"show me people\", \"show me my friends\", \"pics with people\"), set \"has_people\": true, \"person_names\": [], \"semantic_query\": null, \"sort_by\": null.\n\
+           * When the user casually references an event or trip from Folders/Events (e.g. \"graduation stuff\", \"zoo pics\", \"bald mountain\"), put a clean proper place name into \"location_query\" (e.g. \"Portland Zoo\", \"Bald Mountain\", \"Multnomah Falls\") OR a clean single visual concept into \"semantic_query\" (e.g. \"graduation\", \"animals\").\n\
          - Put ONLY positive visual subjects, animals, objects, scenes, or moods into \"semantic_query\" (e.g. \"waterfall in forest\", \"ape or monkey behind a fence\", \"mountain\", \"Eiffel Tower\", \"mountain sunrise\"). NEVER put negations like \"not graduation\" or \"without people\" into \"semantic_query\", and NEVER put generic terrain like \"mountain\", \"beach\", \"forest\", \"lake\", \"waterfall\", \"sunset\" into \"location_query\"! Do NOT put technical EXIF adjectives (\"low light\", \"high ISO\", \"crisp\", \"sharp\", \"wide open\", \"telephoto\") into \"semantic_query\" when filtering by EXIF numbers.\n\
          - Reserve \"location_query\" strictly for proper named places, cities, countries, parks, zoos, or specific landmarks (e.g. \"Multnomah Falls\", \"Portland Zoo\", \"Mount Saint Helens\", \"Bald Mountain\", \"Tokyo\", \"Antarctica\"). When filtering by a named place, leave \"semantic_query\": null UNLESS they also asked for a specific visual subject there (e.g. \"monkeys at Portland Zoo\" -> location_query: \"Portland Zoo\", semantic_query: \"monkey\").\n\
          - Put specific words/phrases that literally appear inside an image (e.g. \"receipt saying Target\", \"sign with Oregon\") into \"ocr_terms\". If the user asks generally for \"photos with signs or readable text\" without specifying a word, put \"sign or banner with readable text\" into \"semantic_query\" and leave \"ocr_terms\": null.\n\
-         - Match people (including typos/first names) against Known RBAC-visible person names into \"person_names\". For \"without people\" / \"no people\" / \"empty landscapes\", set \"has_people\": false (and leave \"person_names\": []).\n\
+         - Match named people (including typos/first names) against Known RBAC-visible people into \"person_names\". NEVER put all people into \"person_names\" unless the user explicitly asked for a group photo containing all of them. For \"without people\" / \"no people\" / \"empty landscapes\", set \"has_people\": false (and leave \"person_names\": []).\n\
          - Superlatives & sorting (\"sort_by\"): NEVER leave all filters and sort_by null for superlative requests!\n\
            * \"widest angle / widest shots\" -> sort_by: \"focal_asc\" (leave semantic_query null unless a subject was also asked).\n\
            * \"most zoomed in / longest focal length / telephoto extremes\" -> sort_by: \"focal_desc\".\n\
@@ -534,8 +558,8 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
          - Leave \"tags\": [] UNLESS the user explicitly asks for a tag (e.g. \"tagged X\" or \"#X\"). Never invent speculative tags.\n\
          - Leave \"kind\": null unless the user explicitly asks for only photos, only videos, raw files, or live photos.\n\
          - Set clear_prior_filters=true when the user starts over, switches topic, or asks to remove a prior filter (re-emit the remaining filters you want to keep); set false when narrowing the previous search.\n\
-         - Write a crisp, natural 1-sentence \"assistant_reply\" in active voice (e.g. \"Here are your 12mm photos.\"). Avoid repeating boilerplate.\n\
-         - Provide 2-3 short, varied \"follow_up_suggestions\". Never invent file paths or extra JSON keys.",
+         - Write a crisp, natural \"assistant_reply\" in active voice (1–2 sentences for informational answers, 1 sentence for searches). Avoid repeating boilerplate.\n\
+         - Provide 2-3 short, varied \"follow_up_suggestions\" grounded in the actual people, folders, or subjects in Library Overview. Never invent file paths or extra JSON keys.",
         input.current_date_utc.to_rfc3339(),
         input.current_date_utc.format("%Y-%m-%d"),
         this_m_from,
@@ -544,23 +568,244 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
         last_m_to,
         two_m_from,
         two_m_to,
-        input.known_person_names,
+        input.library.total_assets,
+        date_span,
+        input.library.known_folders,
+        people_overview,
         input.known_cameras,
         input.known_lenses,
+        input.library.top_tags,
         prior_json,
     )
 }
 
+fn clear_all_search_filters(plan: &mut RouterPlan) {
+    plan.semantic_query = None;
+    plan.ocr_terms = None;
+    plan.person_names.clear();
+    plan.location_query = None;
+    plan.camera_model = None;
+    plan.lens_model = None;
+    plan.focal_length_min_mm = None;
+    plan.focal_length_max_mm = None;
+    plan.aperture_min_f = None;
+    plan.aperture_max_f = None;
+    plan.iso_min = None;
+    plan.iso_max = None;
+    plan.shutter_speed_min_sec = None;
+    plan.shutter_speed_max_sec = None;
+    plan.orientation = None;
+    plan.has_people = None;
+    plan.sort_by = None;
+    plan.tags.clear();
+    plan.kind = None;
+    plan.favorite = None;
+    plan.date_from_ms = None;
+    plan.date_to_ms = None;
+}
+
+fn plan_has_any_criteria(plan: &RouterPlan) -> bool {
+    plan.semantic_query.is_some()
+        || plan.ocr_terms.is_some()
+        || !plan.person_names.is_empty()
+        || plan.location_query.is_some()
+        || plan.camera_model.is_some()
+        || plan.lens_model.is_some()
+        || plan.focal_length_min_mm.is_some()
+        || plan.focal_length_max_mm.is_some()
+        || plan.aperture_min_f.is_some()
+        || plan.aperture_max_f.is_some()
+        || plan.iso_min.is_some()
+        || plan.iso_max.is_some()
+        || plan.shutter_speed_min_sec.is_some()
+        || plan.shutter_speed_max_sec.is_some()
+        || plan.orientation.is_some()
+        || plan.has_people.is_some()
+        || plan.sort_by.is_some()
+        || !plan.tags.is_empty()
+        || plan.kind.is_some()
+        || plan.favorite.is_some()
+        || plan.date_from_ms.is_some()
+        || plan.date_to_ms.is_some()
+}
+
+/// Removes subjective filler words and photo-wrapper nouns from `semantic_query` so SigLIP2
+/// receives clean visual concepts (e.g. `"cool mountain pics"` -> `"mountain"`, `"cool pics"` -> `None`).
+fn strip_semantic_filler(raw: &str) -> Option<String> {
+    const SUBJECTIVE_FILLERS: &[&str] = &[
+        "cool",
+        "nice",
+        "good",
+        "great",
+        "best",
+        "awesome",
+        "amazing",
+        "pretty",
+        "interesting",
+        "random",
+        "neat",
+        "fun",
+        "favorite",
+        "favourite",
+        "favorites",
+        "favourites",
+        "standout",
+        "highlight",
+        "highlights",
+        "surprise",
+        "recent",
+        "recently",
+        "latest",
+        "newest",
+        "stuff",
+        "things",
+        "something",
+        "anything",
+        "everything",
+    ];
+    const EDGE_WRAPPERS: &[&str] = &[
+        "show", "me", "find", "my", "some", "any", "all", "the", "a", "an", "of", "pics", "pic",
+        "photos", "photo", "pictures", "picture", "shots", "shot", "images", "image",
+    ];
+
+    let mut tokens: Vec<&str> = raw
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '\''))
+        .filter(|t| !t.is_empty())
+        .filter(|t| !SUBJECTIVE_FILLERS.contains(&t.to_ascii_lowercase().as_str()))
+        .collect();
+
+    while let Some(first) = tokens.first() {
+        if EDGE_WRAPPERS.contains(&first.to_ascii_lowercase().as_str()) {
+            tokens.remove(0);
+        } else {
+            break;
+        }
+    }
+    while let Some(last) = tokens.last() {
+        if EDGE_WRAPPERS.contains(&last.to_ascii_lowercase().as_str()) {
+            tokens.pop();
+        } else {
+            break;
+        }
+    }
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
+}
+
 /// Deterministic post-parse safety net for small local LLMs:
-/// 1. Strips hallucinated EXIF/orientation bounds when the user never asked about them
+/// 1. Routes informational/meta-questions about the library cleanly to `intent = "answer"` with
+///    all search filters cleared so they never trigger impossible multi-person AND queries.
+/// 2. Strips hallucinated EXIF/orientation bounds when the user never asked about them
 ///    (while preserving filters carried forward from `prior` on filter-removal turns).
-/// 2. Fixes common small-LLM exact-equality slips on open-ended bounds ("wide open" -> `<= 2.0`,
+/// 3. Fixes common small-LLM exact-equality slips on open-ended bounds ("wide open" -> `<= 2.0`,
 ///    "long exposure" -> `>= 0.05s`) and completes one-sided exact EXIF bounds ("at 12mm" -> `12..12`).
-/// 3. Ensures superlative queries ("widest angle", "most zoomed in", "highest ISO", "fastest shutter")
-///    always populate `sort_by`, and prevents informational "who are the people" queries from running
-///    an impossible AND search across all people.
+/// 4. Cleans subjective filler words from `semantic_query` and rescues vague exploratory queries
+///    ("cool pics", "best photos", "surprise me", "what did I shoot recently?", "show me people")
+///    so they always return meaningful results.
 fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut RouterPlan) {
-    let lower = user_message.to_ascii_lowercase();
+    let lower = user_message.trim().to_ascii_lowercase();
+    let trimmed_punct = lower.trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace());
+
+    // 1. Broad informational / meta-question guard.
+    let is_explicit_show_search = [
+        "show me",
+        "show ",
+        "find ",
+        "pull up",
+        "get me",
+        "give me",
+        "search ",
+        "look for",
+        "browse",
+        "pics of",
+        "photos of",
+        "pictures of",
+        "shots of",
+        "what did i shoot",
+        "what have i shot",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+
+    let is_short_greeting = matches!(
+        trimmed_punct,
+        "hi" | "hello" | "hey" | "yo" | "sup" | "thanks" | "thank you" | "help"
+    );
+
+    let is_meta_info_question = is_short_greeting
+        || (!is_explicit_show_search
+            && [
+                "who are in my",
+                "who is in my",
+                "who's in my",
+                "whos in my",
+                "who are the people",
+                "who appears in",
+                "who do you know",
+                "who do i have",
+                "what people",
+                "which people",
+                "list the people",
+                "list people",
+                "people in my library",
+                "what's in my library",
+                "whats in my library",
+                "what is in my library",
+                "what's in my photo",
+                "whats in my photo",
+                "what is in my photo",
+                "what's in my pic",
+                "whats in my pic",
+                "what is in my pic",
+                "tell me about my",
+                "summarize my",
+                "overview of my",
+                "describe my library",
+                "how many photo",
+                "how many pic",
+                "how many image",
+                "how many video",
+                "how many item",
+                "how many file",
+                "total photo",
+                "total pic",
+                "what folder",
+                "which folder",
+                "list folder",
+                "what trip",
+                "what event",
+                "what album",
+                "what collection",
+                "where have i been",
+                "what places are in my",
+                "what camera",
+                "which camera",
+                "what lens",
+                "which lens",
+                "what gear",
+                "what equipment",
+                "when were my",
+                "what dates",
+                "date range",
+                "what can you do",
+                "how do you work",
+            ]
+            .iter()
+            .any(|kw| lower.contains(kw)));
+
+    if is_meta_info_question || plan.intent.as_deref() == Some("answer") {
+        plan.intent = Some("answer".to_string());
+        clear_all_search_filters(plan);
+        plan.clear_prior_filters = true;
+        return;
+    }
+
+    plan.intent = Some("search".to_string());
 
     let has_lower_bound_cue = [
         "over ",
@@ -776,25 +1021,114 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
     }
 
     // Negation safety net: "without people" / "no people" -> has_people = Some(false).
-    if lower.contains("without people")
+    // Conversely, strip hallucinated `has_people: false` when the user never asked to exclude people!
+    let wants_no_people = lower.contains("without people")
         || lower.contains("without any people")
         || lower.contains("no people")
-        || lower.contains("nobody in")
-    {
+        || lower.contains("nobody")
+        || lower.contains("empty landscape")
+        || lower.contains("unpeopled")
+        || lower.contains("no faces")
+        || lower.contains("without faces");
+    if wants_no_people {
         plan.has_people = Some(false);
+    } else if plan.has_people == Some(false) && prior.has_people != Some(false) {
+        plan.has_people = None;
     }
 
-    // Informational "who are the people" guard: never run an AND-search over all people.
-    let is_who_are_people_info_q = (lower.contains("who are the people")
-        || lower.contains("what people")
-        || lower.contains("which people")
-        || lower.contains("list the people")
-        || lower.contains("who do you know"))
-        && !lower.contains("show me")
-        && !lower.contains("find ");
-    if is_who_are_people_info_q {
-        plan.person_names.clear();
-        plan.has_people = None;
+    // Strip hallucinated `sort_by: "aperture_asc"` when the user did not ask for aperture/bokeh
+    // or subjective/exploratory browsing (so concrete searches like "show me animals" keep natural
+    // semantic or capture-date ranking).
+    let wants_exploratory = [
+        "cool",
+        "best",
+        "good",
+        "great",
+        "nice",
+        "awesome",
+        "pretty",
+        "interesting",
+        "surprise",
+        "random",
+        "highlight",
+        "standout",
+        "top",
+        "something",
+        "anything",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    if plan.sort_by.as_deref() == Some("aperture_asc")
+        && !has_aperture_cue
+        && !wants_exploratory
+        && prior.sort_by.as_deref() != Some("aperture_asc")
+    {
+        plan.sort_by = None;
+    }
+
+    // Strip subjective filler words ("cool", "best", "nice", "stuff", "pics") from semantic_query.
+    if let Some(sq) = plan.semantic_query.take() {
+        plan.semantic_query = strip_semantic_filler(&sq);
+    }
+
+    // Broad people request rescue ("show me people" / "show me my friends" with no specific name).
+    if !wants_no_people
+        && plan.person_names.is_empty()
+        && plan.has_people.is_none()
+        && (lower.contains("people")
+            || lower.contains("friends")
+            || lower.contains("everyone")
+            || lower.contains("folks"))
+    {
+        plan.has_people = Some(true);
+        if let Some(sq) = plan.semantic_query.as_deref() {
+            let sq_low = sq.trim().to_ascii_lowercase();
+            if matches!(
+                sq_low.as_str(),
+                "people" | "person" | "friends" | "friend" | "everyone" | "folks" | "portraits"
+            ) {
+                plan.semantic_query = None;
+            }
+        }
+    }
+
+    // Vague & exploratory browsing rescue: if the plan still has no criteria (or after filler stripping),
+    // map recent/latest/everything -> capture_desc, and cool/best/surprise/interesting -> aperture_asc.
+    let explicit_reset = [
+        "start over",
+        "reset",
+        "clear filter",
+        "clear all",
+        "new search",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+
+    let effective_has_criteria =
+        plan_has_any_criteria(plan) || (!plan.clear_prior_filters && plan_has_any_criteria(prior));
+    if !effective_has_criteria && !explicit_reset {
+        let wants_recent = [
+            "recent",
+            "latest",
+            "newest",
+            "what did i shoot",
+            "what have i shot",
+            "everything",
+            "all my",
+            "my photos",
+            "my pics",
+            "browse",
+        ]
+        .iter()
+        .any(|kw| lower.contains(kw));
+
+        if wants_recent {
+            plan.sort_by = Some("capture_desc".to_string());
+            plan.clear_prior_filters = true;
+        } else if wants_exploratory {
+            plan.sort_by = Some("aperture_asc".to_string());
+            plan.clear_prior_filters = true;
+        }
     }
 }
 
@@ -925,4 +1259,82 @@ fn encode_base64(input: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_routes_meta_questions_to_answer_and_clears_filters() {
+        let mut plan = RouterPlan {
+            intent: Some("search".to_string()),
+            person_names: vec!["Sebastian".to_string(), "AJ".to_string()],
+            has_people: Some(true),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan("who are in my pics", &RouterPlan::default(), &mut plan);
+        assert_eq!(plan.intent.as_deref(), Some("answer"));
+        assert!(plan.person_names.is_empty());
+        assert_eq!(plan.has_people, None);
+        assert!(plan.clear_prior_filters);
+    }
+
+    #[test]
+    fn sanitize_strips_hallucinated_has_people_false_and_aperture_sort() {
+        let mut plan = RouterPlan {
+            intent: Some("search".to_string()),
+            semantic_query: Some("animals".to_string()),
+            has_people: Some(false),
+            sort_by: Some("aperture_asc".to_string()),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan("show me animals", &RouterPlan::default(), &mut plan);
+        assert_eq!(plan.intent.as_deref(), Some("search"));
+        assert_eq!(plan.semantic_query.as_deref(), Some("animals"));
+        assert_eq!(plan.has_people, None);
+        assert_eq!(plan.sort_by, None);
+
+        // Explicit negation must be preserved.
+        let mut no_people = RouterPlan {
+            semantic_query: Some("mountain".to_string()),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "mountain photos without people",
+            &RouterPlan::default(),
+            &mut no_people,
+        );
+        assert_eq!(no_people.has_people, Some(false));
+    }
+
+    #[test]
+    fn sanitize_strips_filler_and_rescues_vague_browsing() {
+        let mut mountain = RouterPlan {
+            semantic_query: Some("cool mountain pics".to_string()),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "show me cool mountain pics",
+            &RouterPlan::default(),
+            &mut mountain,
+        );
+        assert_eq!(mountain.semantic_query.as_deref(), Some("mountain"));
+
+        let mut cool = RouterPlan {
+            semantic_query: Some("cool pics".to_string()),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan("show me cool pics", &RouterPlan::default(), &mut cool);
+        assert_eq!(cool.semantic_query, None);
+        assert_eq!(cool.sort_by.as_deref(), Some("aperture_asc"));
+
+        let mut recent = RouterPlan::default();
+        sanitize_sidecar_plan(
+            "what did I shoot recently?",
+            &RouterPlan::default(),
+            &mut recent,
+        );
+        assert_eq!(recent.sort_by.as_deref(), Some("capture_desc"));
+    }
 }

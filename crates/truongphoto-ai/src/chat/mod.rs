@@ -20,6 +20,17 @@ use chrono::{DateTime, Utc};
 use std::time::Duration;
 use truongphoto_core::{ChatRole, ChatTier, RouterPlan};
 
+/// RBAC-scoped high-level library overview passed to the conversational router so it can
+/// ground open-ended, vague, and informational questions accurately.
+#[derive(Debug, Clone, Default)]
+pub struct LibraryChatContext {
+    pub total_assets: i64,
+    pub date_range: Option<(String, String)>,
+    pub known_folders: Vec<String>,
+    pub top_tags: Vec<String>,
+    pub person_counts: Vec<(String, i64)>,
+}
+
 /// Context passed into [`ChatRouterBackend::route_turn`] for multi-turn query routing.
 #[derive(Debug, Clone)]
 pub struct ChatTurnInput {
@@ -29,6 +40,7 @@ pub struct ChatTurnInput {
     pub known_person_names: Vec<String>,
     pub known_cameras: Vec<String>,
     pub known_lenses: Vec<String>,
+    pub library: LibraryChatContext,
     pub current_date_utc: DateTime<Utc>,
 }
 

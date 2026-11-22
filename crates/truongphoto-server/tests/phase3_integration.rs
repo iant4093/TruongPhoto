@@ -1245,3 +1245,205 @@ async fn map_clustering_rbac_config_and_pmtiles_range_security() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "live real-model AI eval against TP_EVAL_DATA_DIR"]
+async fn live_vague_ai_eval() {
+    let eval_dir = PathBuf::from(
+        std::env::var("TP_EVAL_DATA_DIR")
+            .expect("set TP_EVAL_DATA_DIR to a cloned scratch data dir"),
+    );
+    let mut config = ServerConfig::from_data_dir(eval_dir.clone());
+    let bootstrap_secret = "eval-bootstrap-secret-1234567890".to_string();
+    config.desktop_bootstrap_token = Some(bootstrap_secret.clone());
+
+    let db = DbHandle::open(&config.db_path).expect("open cloned eval db");
+    let gate_key = auth::generate_process_key().expect("gate key");
+    let (ws_tx, _) = tokio::sync::broadcast::channel::<WsServerEvent>(64);
+    let (_power_tx, power_rx) = watch::channel(PowerState::default());
+    let mdns = MdnsHandle::start(config.mdns_hostname.clone(), 38435, false);
+    let hardware = truongphoto_ai::hardware::detect_hardware_info();
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+
+    let state = Arc::new(AppState::new(
+        db.clone(),
+        config,
+        gate_key,
+        ws_tx,
+        power_rx,
+        mdns,
+        hardware,
+        38435,
+        shutdown_token,
+    ));
+    let router = build_router(state.clone());
+
+    let send = |req: Request<Body>| {
+        let router = router.clone();
+        async move {
+            let resp = router.oneshot(req).await.expect("oneshot");
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, headers, json)
+        }
+    };
+
+    // Authenticate cleanly via official desktop bootstrap on loopback.
+    let (status, headers, _) = send(TestHarness::req_json(
+        Method::POST,
+        "/api/auth/desktop-bootstrap",
+        &[],
+        Some(json!({ "token": bootstrap_secret })),
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "desktop bootstrap failed");
+    let cookie = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|s| s.split(';').next().filter(|p| p.starts_with("tp_session=")))
+        .expect("tp_session cookie")
+        .to_string();
+
+    let cases: &[(&str, &str, i64, i64, &[&str])] = &[
+        (
+            "who are in my pics",
+            "answer",
+            0,
+            0,
+            &["sebastian", "aj", "nate", "carson", "colin", "david"],
+        ),
+        (
+            "who is in my photos?",
+            "answer",
+            0,
+            0,
+            &["sebastian", "aj", "nate"],
+        ),
+        (
+            "what's in my library?",
+            "answer",
+            0,
+            0,
+            &["453", "zoo", "grad", "canon"],
+        ),
+        (
+            "tell me about my photos",
+            "answer",
+            0,
+            0,
+            &["453", "canon", "zoo", "grad"],
+        ),
+        (
+            "what trips or folders do I have?",
+            "answer",
+            0,
+            0,
+            &["zoo", "grad", "bald", "multnomah", "helens"],
+        ),
+        ("how many photos do I have?", "answer", 0, 0, &["453"]),
+        (
+            "what gear do I use?",
+            "answer",
+            0,
+            0,
+            &["canon", "r7", "17-40", "100-400"],
+        ),
+        ("hi", "answer", 0, 0, &[]),
+        ("show me cool pics", "search", 10, 500, &[]),
+        ("show me my best photos", "search", 10, 500, &[]),
+        ("surprise me", "search", 10, 500, &[]),
+        ("what did I shoot recently?", "search", 10, 500, &[]),
+        ("show me people", "search", 10, 500, &[]),
+        ("show me my friends", "search", 10, 500, &[]),
+        ("show me nature", "search", 1, 500, &[]),
+        ("show me outdoors", "search", 1, 500, &[]),
+        ("show me animals", "search", 1, 500, &[]),
+        ("show me cool mountain pics", "search", 1, 500, &[]),
+        ("show me graduation stuff", "search", 1, 500, &[]),
+        ("show me pics at 12mm", "search", 1, 500, &[]),
+        ("photos of a dinosaur", "search", 0, 0, &[]),
+    ];
+
+    let mut passed = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for &(prompt, exp_intent, min_hits, max_hits, mention_any) in cases {
+        let (st_c, _, sess_body) = send(TestHarness::req_json(
+            Method::POST,
+            "/api/chat/sessions",
+            &[&cookie],
+            Some(json!({ "title": "Eval" })),
+        ))
+        .await;
+        assert_eq!(st_c, StatusCode::CREATED);
+        let sid = sess_body["session"]["id"].as_str().unwrap();
+
+        let (st_m, _, resp) = send(TestHarness::req_json(
+            Method::POST,
+            &format!("/api/chat/sessions/{sid}/messages"),
+            &[&cookie],
+            Some(json!({ "content": prompt })),
+        ))
+        .await;
+        assert_eq!(st_m, StatusCode::OK, "chat failed for {prompt}: {resp}");
+
+        let plan = &resp["active_filters"];
+        let hits = resp["total_count"].as_i64().unwrap_or(-1);
+        let reply = resp["assistant_message"]["content"].as_str().unwrap_or("");
+        let intent = plan["intent"].as_str().unwrap_or("search");
+        let ms = resp["elapsed_ms"].as_u64().unwrap_or(0);
+
+        let mut errs: Vec<String> = Vec::new();
+        if intent != exp_intent {
+            errs.push(format!("intent={intent} expected={exp_intent}"));
+        }
+        if hits < min_hits || hits > max_hits {
+            errs.push(format!("hits={hits} expected=[{min_hits}..={max_hits}]"));
+        }
+        if !mention_any.is_empty() {
+            let low = reply.to_ascii_lowercase();
+            if !mention_any.iter().any(|m| low.contains(m)) {
+                errs.push(format!("reply missing any of {mention_any:?}"));
+            }
+        }
+        if exp_intent == "answer"
+            && (!plan["semantic_query"].is_null()
+                || !plan["person_names"].as_array().is_none_or(|a| a.is_empty())
+                || !plan["location_query"].is_null()
+                || !plan["has_people"].is_null()
+                || !plan["sort_by"].is_null())
+        {
+            errs.push(format!("answer turn leaked filters: {plan}"));
+        }
+
+        let tag = if errs.is_empty() {
+            passed += 1;
+            "PASS"
+        } else {
+            failures.push(format!("{prompt} => {}", errs.join("; ")));
+            "FAIL"
+        };
+        println!(
+            "[{tag}] ({ms}ms) Q={prompt:?} intent={intent} hits={hits} sem={:?} loc={:?} sort={:?} people={:?} has_p={:?}",
+            plan["semantic_query"].as_str(),
+            plan["location_query"].as_str(),
+            plan["sort_by"].as_str(),
+            plan["person_names"],
+            plan["has_people"],
+        );
+        println!("       reply: {reply}");
+        if !errs.is_empty() {
+            println!("       ERRS:  {}", errs.join("; "));
+        }
+    }
+
+    println!("\nLIVE EVAL SUMMARY: {passed}/{} passed", cases.len());
+    assert!(
+        failures.is_empty(),
+        "Live vague AI eval failures:\n{}",
+        failures.join("\n")
+    );
+}

@@ -18,8 +18,8 @@ pub mod vision;
 pub use backend::AiPipeline;
 pub use chat::{
     merge_router_plan, parse_and_validate_router_plan, ChatRouterBackend, ChatTurnInput,
-    ClassicChatRouter, DeterministicTestChatRouter, RerankCandidate, RerankResult,
-    SidecarLlamaRouter, ROUTER_PLAN_JSON_SCHEMA,
+    ClassicChatRouter, DeterministicTestChatRouter, LibraryChatContext, RerankCandidate,
+    RerankResult, SidecarLlamaRouter, ROUTER_PLAN_JSON_SCHEMA,
 };
 pub use clustering::{
     chinese_whispers_cluster, decode_centroid_le, encode_centroid_le, match_face_to_centroids,

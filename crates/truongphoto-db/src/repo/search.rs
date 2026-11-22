@@ -728,6 +728,124 @@ pub fn list_distinct_gear(
     Ok((cameras, lenses))
 }
 
+/// RBAC-scoped overview of visible library contents for conversational AI grounding.
+#[derive(Debug, Clone, Default)]
+pub struct LibraryChatSummary {
+    pub total_assets: i64,
+    pub date_range: Option<(String, String)>,
+    pub folders: Vec<(String, i64)>,
+    pub top_tags: Vec<String>,
+    pub person_counts: Vec<(String, i64)>,
+}
+
+/// Computes an RBAC-scoped summary of the visible library (total count, capture date span,
+/// top subfolder/event groups, active tags, and named people with photo counts).
+pub fn load_library_chat_summary(
+    conn: &Connection,
+    scope: &RbacScope,
+) -> DbResult<LibraryChatSummary> {
+    // 1. Total count + capture date range.
+    let mut params_t: Vec<Value> = Vec::new();
+    let folder_t = rbac_sql::folder_clause("v", scope, &mut params_t);
+    let totals_sql = format!(
+        "SELECT COUNT(*),
+                strftime('%Y-%m-%d', MIN(v.effective_capture_at_ms) / 1000, 'unixepoch'),
+                strftime('%Y-%m-%d', MAX(v.effective_capture_at_ms) / 1000, 'unixepoch')
+         FROM v_assets_effective v
+         WHERE {folder_t}"
+    );
+    let (total_assets, min_date, max_date): (i64, Option<String>, Option<String>) = conn
+        .query_row(&totals_sql, params_from_iter(params_t), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    let date_range = match (min_date, max_date) {
+        (Some(lo), Some(hi)) if !lo.is_empty() && !hi.is_empty() => Some((lo, hi)),
+        _ => None,
+    };
+
+    // 2. Top subfolder / event collections (first path segment of rel_path, falling back to folder name).
+    let mut params_f: Vec<Value> = Vec::new();
+    let folder_f = rbac_sql::folder_clause("a", scope, &mut params_f);
+    let folders_sql = format!(
+        "SELECT
+             CASE
+                 WHEN instr(af.rel_path, '/') > 1 THEN substr(af.rel_path, 1, instr(af.rel_path, '/') - 1)
+                 WHEN instr(af.rel_path, '\\') > 1 THEN substr(af.rel_path, 1, instr(af.rel_path, '\\') - 1)
+                 ELSE COALESCE(NULLIF(TRIM(f.name), ''), 'Library')
+             END AS grp,
+             COUNT(DISTINCT a.id) AS cnt
+         FROM assets a
+         JOIN asset_files af ON af.asset_id = a.id
+         LEFT JOIN folders f ON f.id = a.folder_id
+         WHERE a.deleted_at_ms IS NULL
+           AND a.is_hidden = 0
+           AND {folder_f}
+         GROUP BY grp
+         ORDER BY cnt DESC, grp ASC
+         LIMIT 15"
+    );
+    let mut folders_stmt = conn.prepare(&folders_sql)?;
+    let folders = folders_stmt
+        .query_map(params_from_iter(params_f), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // 3. Top active tags.
+    let mut params_tag: Vec<Value> = Vec::new();
+    let folder_tag = rbac_sql::folder_clause("a", scope, &mut params_tag);
+    let tags_sql = format!(
+        "SELECT TRIM(mt.tag) AS tag
+         FROM media_tags mt
+         JOIN assets a ON a.id = mt.asset_id
+         WHERE a.deleted_at_ms IS NULL
+           AND a.is_hidden = 0
+           AND {folder_tag}
+           AND mt.state = 'active'
+           AND TRIM(mt.tag) != ''
+         GROUP BY LOWER(TRIM(mt.tag))
+         ORDER BY COUNT(DISTINCT a.id) DESC, tag ASC
+         LIMIT 15"
+    );
+    let mut tags_stmt = conn.prepare(&tags_sql)?;
+    let top_tags = tags_stmt
+        .query_map(params_from_iter(params_tag), |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // 4. Visible named people with distinct asset counts (always exclude hidden people).
+    let mut params_p: Vec<Value> = Vec::new();
+    let folder_p = rbac_sql::folder_clause("a", scope, &mut params_p);
+    let people_sql = format!(
+        "SELECT TRIM(p.name) AS pname, COUNT(DISTINCT a.id) AS cnt
+         FROM people p
+         JOIN faces fc ON fc.person_id = p.id
+         JOIN assets a ON a.id = fc.asset_id
+         WHERE a.deleted_at_ms IS NULL
+           AND a.is_hidden = 0
+           AND p.is_hidden = 0
+           AND {folder_p}
+           AND p.name IS NOT NULL
+           AND TRIM(p.name) != ''
+         GROUP BY p.id
+         ORDER BY cnt DESC, pname ASC
+         LIMIT 25"
+    );
+    let mut people_stmt = conn.prepare(&people_sql)?;
+    let person_counts = people_stmt
+        .query_map(params_from_iter(params_p), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(LibraryChatSummary {
+        total_assets,
+        date_range,
+        folders,
+        top_tags,
+        person_counts,
+    })
+}
+
 /// Lists active, RBAC-scoped assets matching deterministic metadata filters (`sql_only` / `filters` mode).
 ///
 /// Returns `(items, total_count)`.

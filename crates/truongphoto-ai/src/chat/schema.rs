@@ -13,6 +13,7 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "intent",
     "semantic_query",
     "ocr_terms",
     "person_names",
@@ -40,6 +41,10 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     "follow_up_suggestions"
   ],
   "properties": {
+    "intent": {
+      "type": ["string", "null"],
+      "enum": ["search", "answer", null]
+    },
     "semantic_query": { "type": ["string", "null"] },
     "ocr_terms": { "type": ["string", "null"] },
     "person_names": {
@@ -97,6 +102,7 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
 }"#;
 
 const ALLOWED_ROUTER_PLAN_KEYS: &[&str] = &[
+    "intent",
     "semantic_query",
     "ocr_terms",
     "person_names",
@@ -307,6 +313,12 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
         }
     }
 
+    plan.intent =
+        normalize_opt_string(plan.intent).and_then(|i| match i.to_ascii_lowercase().as_str() {
+            "search" => Some("search".to_string()),
+            "answer" => Some("answer".to_string()),
+            _ => None,
+        });
     plan.semantic_query = normalize_opt_string(plan.semantic_query);
     plan.ocr_terms = normalize_opt_string(plan.ocr_terms);
     plan.location_query = normalize_opt_string(plan.location_query);
@@ -359,8 +371,20 @@ fn merge_string_lists(prior: &[String], next: &[String]) -> Vec<String> {
 /// with `clear_prior_filters = true`. Otherwise, unchanged constraints from `prior` are carried
 /// forward and any non-empty/`Some` fields from `next` are overlaid.
 pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
+    let next_intent = normalize_opt_string(next.intent.clone());
+    if next_intent.as_deref() == Some("answer") {
+        return RouterPlan {
+            intent: Some("answer".to_string()),
+            clear_prior_filters: next.clear_prior_filters,
+            assistant_reply: next.assistant_reply.trim().to_string(),
+            follow_up_suggestions: normalize_string_vec(next.follow_up_suggestions.clone()),
+            ..Default::default()
+        };
+    }
+
     if next.clear_prior_filters {
         return RouterPlan {
+            intent: next_intent,
             semantic_query: normalize_opt_string(next.semantic_query.clone()),
             ocr_terms: normalize_opt_string(next.ocr_terms.clone()),
             person_names: normalize_string_vec(next.person_names.clone()),
@@ -443,6 +467,7 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
     );
 
     RouterPlan {
+        intent: next_intent,
         semantic_query: normalize_opt_string(next.semantic_query.clone())
             .or_else(|| normalize_opt_string(prior.semantic_query.clone())),
         ocr_terms: normalize_opt_string(next.ocr_terms.clone())

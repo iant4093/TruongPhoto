@@ -22,6 +22,7 @@ fn turn_input(msg: &str, prior: RouterPlan, people: &[&str]) -> ChatTurnInput {
         known_person_names: people.iter().map(|s| (*s).to_string()).collect(),
         known_cameras: Vec::new(),
         known_lenses: Vec::new(),
+        library: Default::default(),
         current_date_utc: fixed_date(),
     }
 }
@@ -429,6 +430,7 @@ fn deterministic_test_router_tier3_rerank_and_idle_eviction() {
         known_person_names: vec!["Mom".to_string()],
         known_cameras: Vec::new(),
         known_lenses: Vec::new(),
+        library: Default::default(),
         current_date_utc: fixed_date(),
     };
     let t0_plan = pipeline.chat.route_turn(ChatTier::Tier0, &input).unwrap();
@@ -567,4 +569,54 @@ fn phase3_manifest_entries_are_apache2_and_exact_filenames() {
     assert_eq!(basemap.tier, None);
     assert_eq!(basemap.files.len(), 1);
     assert_eq!(basemap.files[0].filename, "world-z0-z6.pmtiles");
+}
+
+#[test]
+fn router_plan_intent_answer_and_merge_isolation() {
+    let raw = r#"{
+        "intent": "answer",
+        "semantic_query": null,
+        "ocr_terms": null,
+        "person_names": [],
+        "location_query": null,
+        "camera_model": null,
+        "lens_model": null,
+        "focal_length_min_mm": null,
+        "focal_length_max_mm": null,
+        "aperture_min_f": null,
+        "aperture_max_f": null,
+        "iso_min": null,
+        "iso_max": null,
+        "shutter_speed_min_sec": null,
+        "shutter_speed_max_sec": null,
+        "orientation": null,
+        "has_people": null,
+        "sort_by": null,
+        "tags": [],
+        "kind": null,
+        "favorite": null,
+        "date_from": null,
+        "date_to": null,
+        "clear_prior_filters": false,
+        "assistant_reply": "I recognize Sebastian and AJ in your photos.",
+        "follow_up_suggestions": ["Show me photos of Sebastian"]
+    }"#;
+    let parsed = parse_and_validate_router_plan(raw).expect("valid answer intent plan");
+    assert_eq!(parsed.intent.as_deref(), Some("answer"));
+
+    // Merging an answer turn over an active search plan must NOT leak prior search filters.
+    let prior = RouterPlan {
+        intent: Some("search".to_string()),
+        location_query: Some("Portland Zoo".to_string()),
+        person_names: vec!["Sebastian".to_string()],
+        ..Default::default()
+    };
+    let merged = merge_router_plan(&prior, &parsed);
+    assert_eq!(merged.intent.as_deref(), Some("answer"));
+    assert_eq!(merged.location_query, None);
+    assert!(merged.person_names.is_empty());
+    assert_eq!(
+        merged.assistant_reply,
+        "I recognize Sebastian and AJ in your photos."
+    );
 }
