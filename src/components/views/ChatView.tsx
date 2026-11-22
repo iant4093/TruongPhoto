@@ -12,7 +12,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { mediaOriginalUrl, mediaThumbUrl, warmupChat } from '../../lib/api';
+import { listPeople, mediaOriginalUrl, mediaThumbUrl, warmupChat } from '../../lib/api';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../../lib/escapeStack';
 import { isTauri } from '../../lib/tauri';
 import { notifyError, notifySuccess } from '../../store/feedback';
@@ -294,6 +294,7 @@ export const ChatView: React.FC = () => {
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const lastAssistantRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
 
@@ -370,23 +371,50 @@ export const ChatView: React.FC = () => {
     return () => window.clearInterval(id);
   }, [chatPendingStartedAt, chatSending]);
 
-  // Smooth auto-scroll only when the user is already near the bottom (or just sent a prompt).
+  // Smooth auto-scroll: follow thinking bubble to bottom, and frame new photo-heavy replies at their header.
   useEffect(() => {
-    if (stickToBottomRef.current || chatSending) {
+    if (!stickToBottomRef.current && !chatSending) return;
+    if (chatSending) {
+      messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
+      return;
+    }
+    const lastMsg = chatMessages[chatMessages.length - 1];
+    if (lastMsg?.role === 'assistant' && lastMsg.hits.length > 0 && lastAssistantRef.current) {
+      lastAssistantRef.current.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+    } else {
       messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
     }
-  }, [chatMessages.length, chatSending]);
+  }, [chatMessages, chatSending]);
 
-  const handleOpenInSearch = (plan: RouterPlan | null) => {
+  const handleOpenInSearch = async (plan: RouterPlan | null) => {
     if (!plan) return;
     const sem = plan.semantic_query?.trim() || undefined;
     const ocr = plan.ocr_terms?.trim() || undefined;
+    let personIds: string[] | undefined;
+    if (plan.person_names && plan.person_names.length > 0) {
+      try {
+        const res = await listPeople({ include_hidden: false });
+        const wanted = plan.person_names.map((n) => n.trim().toLowerCase()).filter(Boolean);
+        const matched = res.items
+          .filter((p) => {
+            const name = (p.name ?? '').trim().toLowerCase();
+            if (!name) return false;
+            return wanted.some((w) => name === w || name.split(/\s+/)[0] === w);
+          })
+          .map((p) => p.id);
+        if (matched.length > 0) {
+          personIds = matched;
+        }
+      } catch {
+        // Proceed without person_ids if people lookup fails.
+      }
+    }
     const req: SearchRequest = {
       query: sem ?? ocr ?? '',
       ocr_query: sem && ocr ? ocr : undefined,
       mode: sem ? 'hybrid' : ocr ? 'ocr' : 'filters',
       folder_id: undefined,
-      person_ids: undefined,
+      person_ids: personIds,
       has_people: plan.has_people ?? undefined,
       tags: plan.tags && plan.tags.length > 0 ? plan.tags : undefined,
       camera_model: plan.camera_model ?? undefined,
@@ -669,7 +697,7 @@ export const ChatView: React.FC = () => {
               </div>
             ) : (
               <div className="chat-thread-messages">
-                {chatMessages.map((msg) => {
+                {chatMessages.map((msg, msgIndex) => {
                   if (msg.role === 'user') {
                     return (
                       <div key={msg.id} className="chat-bubble-row is-user">
@@ -681,9 +709,14 @@ export const ChatView: React.FC = () => {
                   const filterChips = buildFilterChips(msg.plan);
                   const allHitIds = msg.hits.map((h) => h.asset.id);
                   const suggestions = msg.plan?.follow_up_suggestions ?? [];
+                  const isLastMessage = msgIndex === chatMessages.length - 1;
 
                   return (
-                    <div key={msg.id} className="chat-bubble-row is-assistant">
+                    <div
+                      key={msg.id}
+                      ref={isLastMessage ? lastAssistantRef : undefined}
+                      className="chat-bubble-row is-assistant"
+                    >
                       <div className="chat-assistant-avatar" aria-hidden="true">
                         <Sparkles size={13} />
                       </div>
@@ -735,7 +768,7 @@ export const ChatView: React.FC = () => {
                                 <button
                                   type="button"
                                   className="chat-open-search-btn"
-                                  onClick={() => handleOpenInSearch(msg.plan)}
+                                  onClick={() => void handleOpenInSearch(msg.plan)}
                                 >
                                   <Search size={11} aria-hidden="true" />
                                   <span>Open in Search</span>

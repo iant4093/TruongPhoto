@@ -10,6 +10,7 @@ import {
   trashAssets,
 } from '../lib/api';
 import { computeJustifiedRows, type JustifiedRow } from '../lib/justifiedLayout';
+import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
 import { notifyError, notifySuccess } from '../store/feedback';
 import { useAppStore } from '../store/useAppStore';
 import type { AlbumSummary, AssetSummary } from '../types/api';
@@ -182,17 +183,22 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
     setAlbumPickerOpen(false);
   }, []);
 
-  // Pressing Escape clears active multi-selection cleanly when no modal/lightbox is on top.
+  // Pressing Escape clears active multi-selection cleanly when no modal/lightbox/menu is on top.
   useEffect(() => {
     if (selectedIds.size === 0) return;
+    const layer = pushEscapeLayer();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
+      if (event.key !== 'Escape' || !isTopEscapeLayer(layer)) return;
       if (useAppStore.getState().lightboxAssetId) return;
       event.preventDefault();
+      event.stopPropagation();
       clearSelection();
     };
     document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      popEscapeLayer(layer);
+    };
   }, [clearSelection, selectedIds.size]);
 
   const toggleSelect = useCallback(
@@ -323,7 +329,12 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
               className={`timeline-tile${isSelected ? ' is-selected' : ''}`}
               style={{ width, height }}
               aria-label={asset.title || `${asset.kind} item`}
-              onClick={() => {
+              onClick={(e) => {
+                if (canMutate && (e.metaKey || e.ctrlKey || e.shiftKey)) {
+                  e.preventDefault();
+                  toggleSelect(asset.id, e.shiftKey);
+                  return;
+                }
                 selectAsset(asset.id);
                 openLightbox(asset.id, allAssetIds);
               }}
