@@ -462,7 +462,26 @@ fn synthesize_grounded_answer(
     sentence
 }
 
-fn describe_zero_hit_filters(plan: &RouterPlan) -> String {
+fn describe_zero_hit_filters(
+    plan: &RouterPlan,
+    unmatched_people: &[String],
+    known_people: &[String],
+) -> String {
+    if !unmatched_people.is_empty() {
+        let missing = unmatched_people.join(", ");
+        return if known_people.is_empty() {
+            format!(
+                "I couldn't find anyone named {missing} in your library — no people have been named yet."
+            )
+        } else {
+            let preview: Vec<&str> = known_people.iter().take(8).map(String::as_str).collect();
+            format!(
+                "I don't have anyone named {missing} in your library. Known people are: {}.",
+                preview.join(", ")
+            )
+        };
+    }
+
     let mut parts: Vec<String> = Vec::new();
     if let Some(q) = plan.semantic_query.as_deref() {
         parts.push(format!("\"{q}\""));
@@ -472,6 +491,13 @@ fn describe_zero_hit_filters(plan: &RouterPlan) -> String {
     }
     if !plan.person_names.is_empty() {
         parts.push(format!("person {}", plan.person_names.join(" + ")));
+    }
+    if let Some(hp) = plan.has_people {
+        parts.push(if hp {
+            "with people".to_string()
+        } else {
+            "without people".to_string()
+        });
     }
     if let Some(ocr) = plan.ocr_terms.as_deref() {
         parts.push(format!("text \"{ocr}\""));
@@ -493,14 +519,80 @@ fn describe_zero_hit_filters(plan: &RouterPlan) -> String {
     } else if let Some(hi) = plan.focal_length_max_mm {
         parts.push(format!("≤ {hi:.0}mm"));
     }
+    if let (Some(lo), Some(hi)) = (plan.aperture_min_f, plan.aperture_max_f) {
+        if (lo - hi).abs() < 0.05 {
+            parts.push(format!("f/{lo:.1}"));
+        } else {
+            parts.push(format!("f/{lo:.1}–f/{hi:.1}"));
+        }
+    } else if let Some(lo) = plan.aperture_min_f {
+        parts.push(format!("≥ f/{lo:.1}"));
+    } else if let Some(hi) = plan.aperture_max_f {
+        parts.push(format!("≤ f/{hi:.1}"));
+    }
+    if let (Some(lo), Some(hi)) = (plan.iso_min, plan.iso_max) {
+        if lo == hi {
+            parts.push(format!("ISO {lo}"));
+        } else {
+            parts.push(format!("ISO {lo}–{hi}"));
+        }
+    } else if let Some(lo) = plan.iso_min {
+        parts.push(format!("ISO ≥ {lo}"));
+    } else if let Some(hi) = plan.iso_max {
+        parts.push(format!("ISO ≤ {hi}"));
+    }
+    if plan.shutter_speed_min_sec.is_some() || plan.shutter_speed_max_sec.is_some() {
+        parts.push("that shutter speed range".to_string());
+    }
+    if let Some(orient) = plan.orientation.as_deref() {
+        parts.push(format!("{orient} orientation"));
+    }
+    if !plan.tags.is_empty() {
+        parts.push(format!("tag {}", plan.tags.join(", ")));
+    }
+    if let Some(kind) = plan.kind {
+        parts.push(format!("kind {kind:?}").to_ascii_lowercase());
+    }
+    if plan.favorite == Some(true) {
+        parts.push("favorites".to_string());
+    }
+    if plan.date_from_ms.is_some() || plan.date_to_ms.is_some() {
+        parts.push("that date range".to_string());
+    }
     if parts.is_empty() {
         "I didn't find any matching photos or videos for those filters. Try broadening your request or asking what's in your library.".to_string()
     } else {
         format!(
-            "I didn't find any photos or videos matching {}. Try a broader description or another filter.",
+            "I didn't find any photos or videos matching {}. Try removing a filter or broadening your search.",
             parts.join(", ")
         )
     }
+}
+
+fn build_zero_hit_relaxation_suggestions(
+    plan: &RouterPlan,
+    summary: &repo::search::LibraryChatSummary,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if plan.location_query.is_some() {
+        out.push("Remove the location filter".to_string());
+    }
+    if plan.date_from_ms.is_some() || plan.date_to_ms.is_some() {
+        out.push("Remove the date filter".to_string());
+    }
+    if !plan.person_names.is_empty() {
+        out.push("Remove the person filter".to_string());
+    }
+    if out.len() < 2 {
+        if let Some((first_folder, _)) = summary.folders.first() {
+            out.push(format!("Show me {first_folder}"));
+        }
+    }
+    if out.len() < 3 {
+        out.push("What's in my library?".to_string());
+    }
+    out.truncate(3);
+    out
 }
 
 /// `POST /api/chat/sessions/{id}/messages` (AuthSession + RbacContext; multi-turn RBAC-enforced hybrid search + optional Tier 3 VLM reranker).
@@ -607,6 +699,18 @@ pub async fn send_message(
     .map_err(|e| AppError::internal(format!("Chat query routing failed: {e}")))?;
 
     let is_answer_only = plan.intent.as_deref() == Some("answer");
+    let unmatched_people: Vec<String> = if is_answer_only {
+        Vec::new()
+    } else {
+        plan.person_names
+            .iter()
+            .filter(|name| {
+                resolve_rbac_person_ids(&[(*name).clone()], &visible_people)
+                    .is_some_and(|ids| ids.iter().any(|id| id == UNMATCHED_PERSON_SENTINEL))
+            })
+            .cloned()
+            .collect()
+    };
     let person_ids = if is_answer_only {
         None
     } else {
@@ -656,6 +760,7 @@ pub async fn send_message(
 
     if active_chat_tier == ChatTier::Tier3
         && ai_state.vlm_rerank_enabled
+        && plan.semantic_query.is_some()
         && !search_resp.items.is_empty()
     {
         let thumbs_dir = PathBuf::from(&settings.thumbnails_dir);
@@ -724,6 +829,13 @@ pub async fn send_message(
         }
     }
 
+    let known_people_for_msg: Vec<String> = visible_people
+        .iter()
+        .filter_map(|p| p.name.as_deref().map(str::trim))
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+
     if is_answer_only {
         let lower_reply = plan.assistant_reply.trim().to_ascii_lowercase();
         let needs_fallback = lower_reply.is_empty()
@@ -753,19 +865,22 @@ pub async fn send_message(
         }
     } else if plan.assistant_reply.trim().is_empty() {
         plan.assistant_reply = if search_resp.items.is_empty() {
-            describe_zero_hit_filters(&plan)
+            describe_zero_hit_filters(&plan, &unmatched_people, &known_people_for_msg)
         } else {
             format!("Found {} matching item(s).", search_resp.total_count)
         };
     } else if has_any_search_criteria && search_resp.items.is_empty() {
         let lower = plan.assistant_reply.to_ascii_lowercase();
-        if !lower.contains("no match")
-            && !lower.contains("couldn't find")
-            && !lower.contains("didn't find")
-            && !lower.contains("none found")
+        if !unmatched_people.is_empty()
+            || (!lower.contains("no match")
+                && !lower.contains("couldn't find")
+                && !lower.contains("didn't find")
+                && !lower.contains("none found"))
         {
-            plan.assistant_reply = describe_zero_hit_filters(&plan);
+            plan.assistant_reply =
+                describe_zero_hit_filters(&plan, &unmatched_people, &known_people_for_msg);
         }
+        plan.follow_up_suggestions = build_zero_hit_relaxation_suggestions(&plan, &library_summary);
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -793,10 +908,13 @@ pub async fn send_message(
         "clear filter",
         "clear all",
         "new search",
+        "remove the",
+        "remove filter",
+        "drop the",
     ]
     .iter()
     .any(|kw| lower_prompt.contains(kw));
-    let persisted_filters = if !has_any_search_criteria && !explicit_reset {
+    let persisted_filters = if is_answer_only || (!has_any_search_criteria && !explicit_reset) {
         session.active_filters.clone()
     } else {
         plan.clone()

@@ -188,7 +188,7 @@ input.button { cursor: text; }
 .dropdown-trigger.button { width: 100%; justify-content: space-between; text-align: left; padding: 5px 8px; background: var(--surface-input); }
 .dropdown-trigger > span, .dropdown-menu li > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dropdown-trigger[aria-expanded='true'] { border-color: #757575; }
-.dropdown-menu { position: fixed; z-index: 1200; margin: 0; padding: 4px; overflow: auto; overscroll-behavior: contain; list-style: none; color: var(--text-primary); background: rgba(34, 34, 36, 0.96); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); border: 1px solid var(--border-strong); border-radius: 9px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55); font-size: 12px; }
+.dropdown-menu { position: fixed; z-index: 1600; margin: 0; padding: 4px; overflow: auto; overscroll-behavior: contain; list-style: none; color: var(--text-primary); background: rgba(34, 34, 36, 0.96); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); border: 1px solid var(--border-strong); border-radius: 9px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55); font-size: 12px; }
 .dropdown-menu li { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 30px; padding: 5px 8px; border-radius: 4px; cursor: pointer; }
 .dropdown-menu li:hover, .dropdown-menu .is-highlighted { background: #444; }
 .dropdown-menu li svg { flex-shrink: 0; }
@@ -1897,7 +1897,7 @@ input[type='number'].text-input { width: 90px; }
 /* Custom Right-Click Context Menu */
 .context-menu {
   position: fixed;
-  z-index: 1300;
+  z-index: 1650;
   min-width: 196px;
   max-width: 268px;
   padding: 5px;
@@ -2573,6 +2573,12 @@ input[type='number'].text-input { width: 90px; }
   border-color: var(--border-strong);
 }
 
+@media (min-width: 768px) and (max-width: 800px) {
+  .sidebar-status-trigger {
+    display: none;
+  }
+}
+
 .status-pill-btn {
   gap: 7px;
 }
@@ -3088,6 +3094,140 @@ input[type='number'].text-input { width: 90px; }
 
 .toggle-switch::after {
   transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 160ms ease;
+}
+
+/* Ask AI interactive chips, inline formatting, Open-in-Search handoff & mobile scrim */
+.chat-filter-chip.is-removable {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font: inherit;
+  transition: background-color 130ms ease, border-color 130ms ease, color 130ms ease;
+}
+
+.chat-filter-chip.is-removable:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.chat-results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.chat-results-header .chat-results-meta {
+  margin-bottom: 0;
+}
+
+.chat-open-search-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 130ms ease, border-color 130ms ease, color 130ms ease;
+}
+
+.chat-open-search-btn:hover {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.chat-inline-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+}
+
+.chat-reply-bullet {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-top: 3px;
+}
+
+.chat-threads-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 39;
+  background: rgba(0, 0, 0, 0.48);
+  animation: tp-fade-in 140ms ease-out both;
+}
+
+.lightbox-info-drawer {
+  animation: tp-lightbox-next 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Prevent duplicate native WebKit search clear button beside our custom clear button */
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.simple-ai-cards {
+  align-items: start;
+}
+
+.map-status-pill {
+  max-width: calc(100% - 24px);
+}
+
+/* Windows frameless chrome parity: auth screens, workspace header, Ask AI topbar, Lightbox */
+.windows-auth-chrome {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 36px;
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+  z-index: 60;
+}
+
+.windows-auth-chrome .caption-buttons {
+  margin-right: 0;
+}
+
+.windows-caption .workspace-controls {
+  margin-left: auto;
+}
+
+.windows-caption .workspace-header > .caption-buttons {
+  margin-left: 8px;
+}
+
+.chat-main-topbar > .caption-buttons {
+  margin-left: 8px;
+  margin-right: -20px;
+}
+
+.lightbox-toolbar > .caption-buttons {
+  margin-left: 8px;
+  margin-right: -16px;
+  align-self: flex-start;
+}
+
+@media (max-width: 767px) {
+  .map-view-shell {
+    height: calc(100dvh - 110px - env(safe-area-inset-bottom, 0px));
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -48,6 +48,12 @@ fn geo_synonym_variant(tok: &str) -> Option<&'static str> {
         "st" => Some("saint"),
         "fort" => Some("ft"),
         "ft" => Some("fort"),
+        "grad" => Some("graduation"),
+        "graduation" => Some("grad"),
+        "bday" => Some("birthday"),
+        "birthday" => Some("bday"),
+        "xmas" => Some("christmas"),
+        "christmas" => Some("xmas"),
         _ => None,
     }
 }
@@ -158,11 +164,24 @@ fn append_deterministic_filters(
 
     if let Some(has_people) = req.has_people {
         if has_people {
-            where_clauses
-                .push("EXISTS (SELECT 1 FROM faces f_hp WHERE f_hp.asset_id = v.id)".to_string());
-        } else {
+            if is_admin {
+                where_clauses.push(
+                    "EXISTS (SELECT 1 FROM faces f_hp WHERE f_hp.asset_id = v.id)".to_string(),
+                );
+            } else {
+                where_clauses.push(
+                    "EXISTS (SELECT 1 FROM faces f_hp JOIN people p_hp ON p_hp.id = f_hp.person_id WHERE f_hp.asset_id = v.id AND p_hp.is_hidden = 0)"
+                        .to_string(),
+                );
+            }
+        } else if is_admin {
             where_clauses.push(
                 "NOT EXISTS (SELECT 1 FROM faces f_np WHERE f_np.asset_id = v.id)".to_string(),
+            );
+        } else {
+            where_clauses.push(
+                "NOT EXISTS (SELECT 1 FROM faces f_np JOIN people p_np ON p_np.id = f_np.person_id WHERE f_np.asset_id = v.id AND p_np.is_hidden = 0)"
+                    .to_string(),
             );
         }
     }
@@ -222,10 +241,11 @@ fn append_deterministic_filters(
 
         if let Some(lens) = req.lens_model.as_deref() {
             for tok in tokenize_search_words(lens) {
+                let norm_tok = tok.replace("f/", "f");
                 let idx = params.len() + 1;
-                params.push(Value::Text(format!("%{}%", escape_like_lower(&tok))));
+                params.push(Value::Text(format!("%{}%", escape_like_lower(&norm_tok))));
                 exif_checks.push(format!(
-                    "LOWER(COALESCE(dpm_e.lens_model, '')) LIKE ?{idx} ESCAPE '\\'"
+                    "REPLACE(LOWER(COALESCE(dpm_e.lens_model, '')), 'f/', 'f') LIKE ?{idx} ESCAPE '\\'"
                 ));
             }
         }
@@ -744,7 +764,7 @@ pub fn load_library_chat_summary(
     conn: &Connection,
     scope: &RbacScope,
 ) -> DbResult<LibraryChatSummary> {
-    // 1. Total count + capture date range.
+    // 1. Total count + capture date range (strictly active, non-hidden assets).
     let mut params_t: Vec<Value> = Vec::new();
     let folder_t = rbac_sql::folder_clause("v", scope, &mut params_t);
     let totals_sql = format!(
@@ -752,7 +772,9 @@ pub fn load_library_chat_summary(
                 strftime('%Y-%m-%d', MIN(v.effective_capture_at_ms) / 1000, 'unixepoch'),
                 strftime('%Y-%m-%d', MAX(v.effective_capture_at_ms) / 1000, 'unixepoch')
          FROM v_assets_effective v
-         WHERE {folder_t}"
+         WHERE v.deleted_at_ms IS NULL
+           AND v.is_hidden = 0
+           AND {folder_t}"
     );
     let (total_assets, min_date, max_date): (i64, Option<String>, Option<String>) = conn
         .query_row(&totals_sql, params_from_iter(params_t), |row| {
@@ -763,14 +785,24 @@ pub fn load_library_chat_summary(
         _ => None,
     };
 
-    // 2. Top subfolder / event collections (first path segment of rel_path, falling back to folder name).
+    // 2. Top subfolder / event collections (handles both `Event/img.jpg` and nested `2026/Event/img.jpg`,
+    // falling back to watched folder name when files sit at the root).
     let mut params_f: Vec<Value> = Vec::new();
     let folder_f = rbac_sql::folder_clause("a", scope, &mut params_f);
     let folders_sql = format!(
         "SELECT
              CASE
-                 WHEN instr(af.rel_path, '/') > 1 THEN substr(af.rel_path, 1, instr(af.rel_path, '/') - 1)
-                 WHEN instr(af.rel_path, '\\') > 1 THEN substr(af.rel_path, 1, instr(af.rel_path, '\\') - 1)
+                 WHEN instr(replace(af.rel_path, '\\', '/'), '/') > 1 THEN
+                     CASE
+                         WHEN instr(substr(replace(af.rel_path, '\\', '/'), instr(replace(af.rel_path, '\\', '/'), '/') + 1), '/') > 1 THEN
+                             substr(
+                                 substr(replace(af.rel_path, '\\', '/'), instr(replace(af.rel_path, '\\', '/'), '/') + 1),
+                                 1,
+                                 instr(substr(replace(af.rel_path, '\\', '/'), instr(replace(af.rel_path, '\\', '/'), '/') + 1), '/') - 1
+                             )
+                         ELSE
+                             substr(replace(af.rel_path, '\\', '/'), 1, instr(replace(af.rel_path, '\\', '/'), '/') - 1)
+                     END
                  ELSE COALESCE(NULLIF(TRIM(f.name), ''), 'Library')
              END AS grp,
              COUNT(DISTINCT a.id) AS cnt
@@ -782,7 +814,7 @@ pub fn load_library_chat_summary(
            AND {folder_f}
          GROUP BY grp
          ORDER BY cnt DESC, grp ASC
-         LIMIT 15"
+         LIMIT 20"
     );
     let mut folders_stmt = conn.prepare(&folders_sql)?;
     let folders = folders_stmt
@@ -978,6 +1010,76 @@ pub fn load_asset_summaries_by_ids(
         for row in rows {
             let summary = row?;
             map.insert(summary.id.clone(), summary);
+        }
+    }
+
+    Ok(map)
+}
+
+/// Sortable capture & EXIF fields used to honor `sort_by` in Hybrid, Semantic, and OCR search modes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AssetSortKey {
+    pub capture_at_ms: i64,
+    pub focal_length_mm: Option<f64>,
+    pub aperture_f: Option<f64>,
+    pub iso: Option<i64>,
+    pub shutter_speed_sec: Option<f64>,
+}
+
+/// Loads RBAC-scoped sort keys for a set of matched `asset_ids`.
+pub fn load_asset_sort_keys(
+    conn: &Connection,
+    scope: &RbacScope,
+    asset_ids: &[String],
+) -> DbResult<HashMap<String, AssetSortKey>> {
+    if asset_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut unique_ids: Vec<&str> = Vec::with_capacity(asset_ids.len());
+    let mut seen: HashSet<&str> = HashSet::with_capacity(asset_ids.len());
+    for id in asset_ids {
+        if seen.insert(id.as_str()) {
+            unique_ids.push(id.as_str());
+        }
+    }
+
+    let mut map = HashMap::with_capacity(unique_ids.len());
+    for chunk in unique_ids.chunks(400) {
+        let mut params: Vec<Value> = Vec::with_capacity(chunk.len());
+        let mut placeholders = Vec::with_capacity(chunk.len());
+        for (idx, id) in chunk.iter().enumerate() {
+            params.push(Value::Text((*id).to_string()));
+            placeholders.push(format!("?{}", idx + 1));
+        }
+        let rbac_clause = rbac_sql::folder_clause("v", scope, &mut params);
+        let sql = format!(
+            "SELECT v.id, v.effective_capture_at_ms, dpm.focal_length_mm, dpm.aperture_f, dpm.iso, dpm.shutter_speed_sec
+             FROM v_assets_effective v
+             LEFT JOIN deterministic_photo_meta dpm ON dpm.asset_id = v.id
+             WHERE v.id IN ({})
+               AND v.deleted_at_ms IS NULL
+               AND v.is_hidden = 0
+               AND {rbac_clause}",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                AssetSortKey {
+                    capture_at_ms: row.get::<_, i64>(1)?,
+                    focal_length_mm: row.get::<_, Option<f64>>(2)?,
+                    aperture_f: row.get::<_, Option<f64>>(3)?,
+                    iso: row.get::<_, Option<i64>>(4)?,
+                    shutter_speed_sec: row.get::<_, Option<f64>>(5)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, key) = row?;
+            map.insert(id, key);
         }
     }
 

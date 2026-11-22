@@ -889,7 +889,9 @@ fn is_hdr_stream(stream: &FfprobeStream, bit_depth: Option<u8>) -> bool {
 
 fn run_ffprobe(path: &Path) -> Option<FfprobeOutput> {
     let ffprobe = video::video_capabilities().ffprobe_path.as_deref()?;
-    let out = Command::new(ffprobe)
+    let mut cmd = Command::new(ffprobe);
+    video::hide_console_window(&mut cmd);
+    let out = cmd
         .args([
             "-v",
             "quiet",

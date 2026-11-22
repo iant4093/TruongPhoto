@@ -1362,15 +1362,29 @@ async fn live_vague_ai_eval() {
         ("show me outdoors", "search", 1, 500, &[]),
         ("show me animals", "search", 1, 500, &[]),
         ("show me cool mountain pics", "search", 1, 500, &[]),
-        ("show me graduation stuff", "search", 1, 500, &[]),
+        ("show me graduation stuff", "search", 150, 500, &[]),
+        ("show me Misty", "search", 5, 30, &[]),
+        ("widest angle mountain photos", "search", 1, 500, &[]),
+        ("highest ISO zoo photos", "search", 1, 500, &[]),
         ("show me pics at 12mm", "search", 1, 500, &[]),
+        ("photos shot with 56mm f/1.4", "search", 1, 500, &[]),
+        ("show me summer photos", "search", 1, 500, &[]),
+        (
+            "photos of Elon Musk",
+            "search",
+            0,
+            0,
+            &["elon musk", "known people"],
+        ),
         ("photos of a dinosaur", "search", 0, 0, &[]),
     ];
 
     let mut passed = 0usize;
+    let mut total_ms = 0u64;
+    let mut warm_ms: Vec<u64> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
 
-    for &(prompt, exp_intent, min_hits, max_hits, mention_any) in cases {
+    for (idx, &(prompt, exp_intent, min_hits, max_hits, mention_any)) in cases.iter().enumerate() {
         let (st_c, _, sess_body) = send(TestHarness::req_json(
             Method::POST,
             "/api/chat/sessions",
@@ -1395,6 +1409,10 @@ async fn live_vague_ai_eval() {
         let reply = resp["assistant_message"]["content"].as_str().unwrap_or("");
         let intent = plan["intent"].as_str().unwrap_or("search");
         let ms = resp["elapsed_ms"].as_u64().unwrap_or(0);
+        total_ms += ms;
+        if idx > 0 {
+            warm_ms.push(ms);
+        }
 
         let mut errs: Vec<String> = Vec::new();
         if intent != exp_intent {
@@ -1418,6 +1436,13 @@ async fn live_vague_ai_eval() {
         {
             errs.push(format!("answer turn leaked filters: {plan}"));
         }
+        if prompt == "show me summer photos"
+            && (!plan["focal_length_min_mm"].is_null() || !plan["focal_length_max_mm"].is_null())
+        {
+            errs.push(format!(
+                "substring 'mm' in summer leaked focal length: {plan}"
+            ));
+        }
 
         let tag = if errs.is_empty() {
             passed += 1;
@@ -1440,7 +1465,64 @@ async fn live_vague_ai_eval() {
         }
     }
 
-    println!("\nLIVE EVAL SUMMARY: {passed}/{} passed", cases.len());
+    // Multi-turn stateful refinement & filter removal test in a single session.
+    let (st_c, _, sess_body) = send(TestHarness::req_json(
+        Method::POST,
+        "/api/chat/sessions",
+        &[&cookie],
+        Some(json!({ "title": "Multi-Turn Eval" })),
+    ))
+    .await;
+    assert_eq!(st_c, StatusCode::CREATED);
+    let mt_sid = sess_body["session"]["id"].as_str().unwrap().to_string();
+
+    let mt_steps: &[(&str, &str, i64)] = &[
+        ("who are in my pics", "answer", 0),
+        ("show me photos of Sebastian", "search", 50),
+        ("only at Multnomah Falls", "search", 0),
+        ("remove the location filter", "search", 50),
+    ];
+    let mut mt_passed = 0usize;
+    for &(q, exp_intent, min_hits) in mt_steps {
+        let (st_m, _, resp) = send(TestHarness::req_json(
+            Method::POST,
+            &format!("/api/chat/sessions/{mt_sid}/messages"),
+            &[&cookie],
+            Some(json!({ "content": q })),
+        ))
+        .await;
+        assert_eq!(st_m, StatusCode::OK);
+        let plan = &resp["active_filters"];
+        let hits = resp["total_count"].as_i64().unwrap_or(-1);
+        let intent = plan["intent"].as_str().unwrap_or("search");
+        let ms = resp["elapsed_ms"].as_u64().unwrap_or(0);
+        warm_ms.push(ms);
+        let ok = intent == exp_intent && hits >= min_hits;
+        if ok {
+            mt_passed += 1;
+        } else {
+            failures.push(format!(
+                "MULTI-TURN {q:?} => intent={intent} (exp {exp_intent}), hits={hits} (min {min_hits}), plan={plan}"
+            ));
+        }
+        println!(
+            "[MT {}] ({ms}ms) Q={q:?} intent={intent} hits={hits} loc={:?} people={:?}",
+            if ok { "PASS" } else { "FAIL" },
+            plan["location_query"].as_str(),
+            plan["person_names"],
+        );
+    }
+
+    let avg_warm = if warm_ms.is_empty() {
+        0
+    } else {
+        warm_ms.iter().sum::<u64>() / warm_ms.len() as u64
+    };
+    println!(
+        "\nLIVE EVAL SUMMARY: {passed}/{} single-turn + {mt_passed}/{} multi-turn passed | avg warm latency: {avg_warm}ms (total {total_ms}ms)",
+        cases.len(),
+        mt_steps.len()
+    );
     assert!(
         failures.is_empty(),
         "Live vague AI eval failures:\n{}",

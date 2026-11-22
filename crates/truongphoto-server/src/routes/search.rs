@@ -23,13 +23,114 @@ struct PendingHit {
     ocr_snippet: Option<String>,
 }
 
+fn compare_sort_keys(
+    sort_by: &str,
+    a_id: &str,
+    b_id: &str,
+    a_score: f32,
+    b_score: f32,
+    keys: &HashMap<String, repo::search::AssetSortKey>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ka = keys.get(a_id);
+    let kb = keys.get(b_id);
+    let cmp_opt_f64 = |oa: Option<f64>, ob: Option<f64>, asc: bool| -> Ordering {
+        match (oa, ob) {
+            (Some(x), Some(y)) => {
+                if asc {
+                    x.total_cmp(&y)
+                } else {
+                    y.total_cmp(&x)
+                }
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+    };
+    let cmp_opt_i64 = |oa: Option<i64>, ob: Option<i64>, asc: bool| -> Ordering {
+        match (oa, ob) {
+            (Some(x), Some(y)) => {
+                if asc {
+                    x.cmp(&y)
+                } else {
+                    y.cmp(&x)
+                }
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+    };
+
+    let primary = match sort_by {
+        "capture_desc" => match (ka, kb) {
+            (Some(a), Some(b)) => b.capture_at_ms.cmp(&a.capture_at_ms),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+        "capture_asc" => match (ka, kb) {
+            (Some(a), Some(b)) => a.capture_at_ms.cmp(&b.capture_at_ms),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+        "focal_asc" => cmp_opt_f64(
+            ka.and_then(|k| k.focal_length_mm),
+            kb.and_then(|k| k.focal_length_mm),
+            true,
+        ),
+        "focal_desc" => cmp_opt_f64(
+            ka.and_then(|k| k.focal_length_mm),
+            kb.and_then(|k| k.focal_length_mm),
+            false,
+        ),
+        "iso_desc" => cmp_opt_i64(ka.and_then(|k| k.iso), kb.and_then(|k| k.iso), false),
+        "aperture_asc" => cmp_opt_f64(
+            ka.and_then(|k| k.aperture_f),
+            kb.and_then(|k| k.aperture_f),
+            true,
+        ),
+        "shutter_asc" => cmp_opt_f64(
+            ka.and_then(|k| k.shutter_speed_sec),
+            kb.and_then(|k| k.shutter_speed_sec),
+            true,
+        ),
+        "shutter_desc" => cmp_opt_f64(
+            ka.and_then(|k| k.shutter_speed_sec),
+            kb.and_then(|k| k.shutter_speed_sec),
+            false,
+        ),
+        _ => Ordering::Equal,
+    };
+
+    primary
+        .then_with(|| b_score.total_cmp(&a_score))
+        .then_with(|| a_id.cmp(b_id))
+}
+
 async fn materialize_ocr_hits(
     state: &AppState,
     scope: RbacScope,
-    ocr_hits: Vec<(String, f32, String)>,
+    mut ocr_hits: Vec<(String, f32, String)>,
+    sort_by: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> Result<(Vec<SearchHit>, i64), AppError> {
+    if let Some(sort_key) = sort_by.map(str::trim).filter(|s| !s.is_empty()) {
+        let sort_norm = sort_key.to_ascii_lowercase();
+        let all_ids: Vec<String> = ocr_hits.iter().map(|(id, _, _)| id.clone()).collect();
+        let scope_s = scope.clone();
+        let sort_keys = state
+            .db
+            .read(move |conn| repo::search::load_asset_sort_keys(conn, &scope_s, &all_ids))
+            .await?;
+        ocr_hits.sort_unstable_by(|a, b| {
+            compare_sort_keys(&sort_norm, &a.0, &b.0, a.1, b.1, &sort_keys)
+        });
+    }
+
     let total_count = ocr_hits.len() as i64;
     if offset >= ocr_hits.len() {
         return Ok((Vec::new(), total_count));
@@ -212,8 +313,15 @@ pub(crate) async fn execute_hybrid_search(
             })
             .await?;
 
-        let (items, total_count) =
-            materialize_ocr_hits(state, rbac.scope.clone(), ocr_hits, offset, limit).await?;
+        let (items, total_count) = materialize_ocr_hits(
+            state,
+            rbac.scope.clone(),
+            ocr_hits,
+            req.sort_by.as_deref(),
+            offset,
+            limit,
+        )
+        .await?;
         return Ok(SearchResponse {
             items,
             total_count,
@@ -259,8 +367,15 @@ pub(crate) async fn execute_hybrid_search(
 
     if candidates.vector_ids.is_empty() {
         if want_ocr && !ocr_hits.is_empty() {
-            let (items, total_count) =
-                materialize_ocr_hits(state, rbac.scope.clone(), ocr_hits, offset, limit).await?;
+            let (items, total_count) = materialize_ocr_hits(
+                state,
+                rbac.scope.clone(),
+                ocr_hits,
+                req.sort_by.as_deref(),
+                offset,
+                limit,
+            )
+            .await?;
             return Ok(SearchResponse {
                 items,
                 total_count,
@@ -302,9 +417,15 @@ pub(crate) async fn execute_hybrid_search(
         Err(AiError::ModelNotInstalled(_)) | Err(AiError::Ort(_)) => {
             // Gracefully degrade to OCR / SQL filters when vision model or ORT is not installed.
             if want_ocr && !ocr_hits.is_empty() {
-                let (items, total_count) =
-                    materialize_ocr_hits(state, rbac.scope.clone(), ocr_hits, offset, limit)
-                        .await?;
+                let (items, total_count) = materialize_ocr_hits(
+                    state,
+                    rbac.scope.clone(),
+                    ocr_hits,
+                    req.sort_by.as_deref(),
+                    offset,
+                    limit,
+                )
+                .await?;
                 return Ok(SearchResponse {
                     items,
                     total_count,
@@ -460,11 +581,36 @@ pub(crate) async fn execute_hybrid_search(
     }
 
     let mut combined: Vec<PendingHit> = by_asset.into_values().collect();
-    combined.sort_unstable_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.asset_id.cmp(&b.asset_id))
-    });
+    if let Some(sort_key) = req
+        .sort_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let sort_norm = sort_key.to_ascii_lowercase();
+        let all_ids: Vec<String> = combined.iter().map(|h| h.asset_id.clone()).collect();
+        let scope_s = rbac.scope.clone();
+        let sort_keys = state
+            .db
+            .read(move |conn| repo::search::load_asset_sort_keys(conn, &scope_s, &all_ids))
+            .await?;
+        combined.sort_unstable_by(|a, b| {
+            compare_sort_keys(
+                &sort_norm,
+                &a.asset_id,
+                &b.asset_id,
+                a.score,
+                b.score,
+                &sort_keys,
+            )
+        });
+    } else {
+        combined.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.asset_id.cmp(&b.asset_id))
+        });
+    }
 
     let total_count = combined.len() as i64;
     if offset >= combined.len() {

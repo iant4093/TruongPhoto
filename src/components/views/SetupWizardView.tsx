@@ -6,9 +6,14 @@ import { isTauri, pickFolderDialog } from '../../lib/tauri';
 import { errorMessage, useAppStore } from '../../store/useAppStore';
 import type { AiTier } from '../../types/api';
 import { Badge } from '../ui';
+import { WindowsCaptionButtons, isWindowsPlatform } from '../WindowControls';
 
 const DIGIT_4 = /^\d{4}$/;
 const DIGIT_6 = /^\d{6}$/;
+const nativeMacTitlebar =
+  typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
+const isWin = isWindowsPlatform();
+const winDesktop = isTauri() && !nativeMacTitlebar && isWin;
 
 function basename(path: string): string {
   const normalized = path.replace(/[\\/]+$/, '');
@@ -84,9 +89,16 @@ export const SetupWizardView: React.FC = () => {
     setSelectedVisionTier(setupStatus.hardware.recommended_vision_tier);
   }, [setupStatus]);
 
+  const authViewportClass = `auth-viewport${isTauri() && nativeMacTitlebar ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`;
+
   if (!setupStatus) {
     return (
-      <div className="auth-viewport" data-tauri-drag-region>
+      <div className={authViewportClass} data-tauri-drag-region>
+        {winDesktop && (
+          <div className="windows-auth-chrome" data-tauri-drag-region>
+            <WindowsCaptionButtons />
+          </div>
+        )}
         <div className="auth-shell">
           <div className="card card-body stack">
             <div className="view-loading" role="status">
@@ -251,7 +263,12 @@ export const SetupWizardView: React.FC = () => {
   };
 
   return (
-    <div className="auth-viewport" data-tauri-drag-region>
+    <div className={authViewportClass} data-tauri-drag-region>
+      {winDesktop && (
+        <div className="windows-auth-chrome" data-tauri-drag-region>
+          <WindowsCaptionButtons />
+        </div>
+      )}
       <div className="auth-shell is-wide">
         <div className="auth-header">
           <img src="/app-icon.png" width={36} height={36} alt="" />
@@ -554,7 +571,7 @@ export const SetupWizardView: React.FC = () => {
                 <input
                   className="text-input"
                   type="text"
-                  placeholder="/Users/ian/Pictures"
+                  placeholder={isWin ? 'C:\\Users\\you\\Pictures' : '/Users/you/Pictures'}
                   value={initialFolderPath}
                   onChange={(e) => {
                     const nextPath = e.target.value;

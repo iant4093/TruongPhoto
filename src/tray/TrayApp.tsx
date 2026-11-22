@@ -254,7 +254,7 @@ export const TrayApp: React.FC = () => {
   return (
     <div
       className="app-window-frame tray-shell"
-      style={{ width: 360, height: 480, padding: 14, gap: 10 }}
+      style={{ width: 360, height: 440, padding: 14, gap: 10 }}
     >
       <div className="row" style={{ justifyContent: 'space-between' }}>
         <div className="row">

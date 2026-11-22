@@ -59,8 +59,17 @@ pub fn is_ignored_entry(name: &str) -> bool {
         return true;
     }
     let lower = trimmed.to_ascii_lowercase();
-    matches!(lower.as_str(), "thumbs.db" | "desktop.ini" | "@eadir")
-        || lower.ends_with(".tmp")
+    matches!(
+        lower.as_str(),
+        "thumbs.db"
+            | "desktop.ini"
+            | "@eadir"
+            | "$recycle.bin"
+            | "system volume information"
+            | "recovery"
+            | "$windows.~bt"
+            | "$windows.~ws"
+    ) || lower.ends_with(".tmp")
         || lower.ends_with(".part")
         || lower.ends_with(".crdownload")
 }

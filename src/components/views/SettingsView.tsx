@@ -843,7 +843,11 @@ export const SettingsView: React.FC = () => {
                   <input
                     className="text-input"
                     type="text"
-                    placeholder="/Volumes/Photos"
+                    placeholder={
+                      typeof navigator !== 'undefined' && /Win/i.test(navigator.platform || navigator.userAgent)
+                        ? 'D:\\Photos'
+                        : '/Volumes/Photos'
+                    }
                     aria-label="Folder root path"
                     value={folderPath}
                     onChange={(e) => setFolderPath(e.target.value)}
@@ -1547,24 +1551,26 @@ export const SettingsView: React.FC = () => {
                   No backup snapshots found yet.
                 </div>
               ) : (
-                <table className="backup-table">
-                  <thead>
-                    <tr>
-                      <th>Filename</th>
-                      <th>Size</th>
-                      <th>Created</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {backupHistory.map((snap) => (
-                      <tr key={snap.filename}>
-                        <td>{snap.filename}</td>
-                        <td>{formatBytes(snap.size_bytes)}</td>
-                        <td>{formatDateTime(snap.created_at_ms)}</td>
+                <div style={{ overflowX: 'auto' }}>
+                  <table className="backup-table">
+                    <thead>
+                      <tr>
+                        <th>Filename</th>
+                        <th>Size</th>
+                        <th>Created</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {backupHistory.map((snap) => (
+                        <tr key={snap.filename}>
+                          <td>{snap.filename}</td>
+                          <td>{formatBytes(snap.size_bytes)}</td>
+                          <td>{formatDateTime(snap.created_at_ms)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </div>
           </form>

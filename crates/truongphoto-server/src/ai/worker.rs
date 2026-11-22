@@ -103,7 +103,9 @@ fn sample_video_keyframes_fps_mode(
     let tmp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let pattern = tmp_dir.path().join("kf_%03d.jpg");
 
-    let output = std::process::Command::new(&ffmpeg)
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    truongphoto_media::video::hide_console_window(&mut cmd);
+    let output = cmd
         .args(["-hide_banner", "-loglevel", "info", "-i"])
         .arg(video_path)
         .args([

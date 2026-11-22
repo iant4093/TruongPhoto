@@ -25,7 +25,44 @@ A native macOS and Windows local-first AI photo and video library built in Rust 
 
 TruongPhoto indexes, searches, and streams your photo and video archive directly from your own disks on both macOS and Windows without cloud accounts, telemetry, or external API dependencies. It pairs a high-concurrency SQLite WAL + FTS5 catalog and 3-tier camera RAW and video pipeline with an offline-first AI engine (`SigLIP2` semantic embeddings, `YuNet` + `AuraFace-v1` face clustering, `PP-OCRv6` text recognition, and local GGUF conversational search via `llama.cpp`), all wrapped in an Apple-grade dark studio interface that runs identically as a native desktop app or as a headless server (`http://127.0.0.1:38420`, advertised on LAN via mDNS as `truongphoto.local`) for browsers and mobile PWAs. Releases target Apple Silicon Macs and 64-bit Windows.
 
-Every media folder remains in place on disk while TruongPhoto maintains non-destructive WebP thumbnails, metadata, and memory-mapped vector indices inside its local data directory. Multi-user family profiles enforce folder-scoped access at the SQLite query boundary (`rbac_folder_filter_sql`), while an RBAC-aware hybrid vector engine switches automatically between exact SIMD cosine scans for narrow folder subsets and memory-mapped `USearch` HNSW graph traversal for broad library searches. All AI models are strictly Apache-2.0 or MIT licensed and download on demand only when enabled in **Settings › AI Models**.
+Every media folder remains in place on disk while TruongPhoto maintains non-destructive WebP thumbnails, metadata, and memory-mapped vector indices inside its local data directory. Multi-user family profiles enforce folder-scoped access at the SQLite query boundary (`rbac_folder_filter_sql`), while an RBAC-aware hybrid vector engine switches automatically between exact SIMD cosine scans for narrow folder subsets and memory-mapped `USearch` HNSW graph traversal for broad library searches. All AI models are strictly Apache-2.0 or MIT licensed and download on demand only when enabled in **Settings › Local AI & Models**.
+
+## Screenshots
+
+Screenshots capture the live dark studio UI running locally against a real photography library (Canon EOS R7) with local `SigLIP2` vision indexing and `Gemma 4` conversational routing enabled.
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/timeline.webp" width="100%" alt="TruongPhoto justified Photos timeline showing date-grouped mountain and waterfall photography with clean sidebar navigation and live server readiness status">
+      <p align="center"><sub><b>Photos Timeline</b> · virtualized justified grid, date headers and zero-clutter dark chrome</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/lightbox.webp" width="100%" alt="Full-screen photo viewer displaying an alpenglow mountain shot with EXIF summary bar, zoom controls, live RGB and luminance histogram, and full camera/lens inspector">
+      <p align="center"><sub><b>Photo Viewer &amp; Inspector</b> · directional transitions, click-to-zoom hi-res, EXIF bar and live RGB histogram</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/ask-ai.webp" width="100%" alt="Dedicated Ask AI full-page view powered by local Gemma 4 returning mountain photos with removable filter chips and an Open in Search handoff button">
+      <p align="center"><sub><b>Ask AI (Local Gemma 4)</b> · natural-language search, removable filter chips and Open in Search</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/search.webp" width="100%" alt="Hybrid Search results for 12mm showing Exact SIMD latency telemetry, photographer EXIF filters for camera, lens, focal length, aperture, ISO, orientation and date range">
+      <p align="center"><sub><b>Hybrid &amp; EXIF Search</b> · semantic, OCR and deterministic camera/lens/EXIF filtering</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/status-drawer.webp" width="100%" alt="Slide-over Server Status and Activity drawer showing online badge, library count, database size, AI analysis progress bar, memory and power status, LAN URL and watched folders">
+      <p align="center"><sub><b>Server Status &amp; Telemetry</b> · live AI progress, RAM/power state, LAN address and watched folders</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/settings-ai.webp" width="100%" alt="Settings Local AI and Models panel with one-click presets for Smart Photo Search, People and Face Grouping, Text in Photos OCR, and Ask AI Gemma 4 tiers">
+      <p align="center"><sub><b>Local AI &amp; Models</b> · simple on-demand presets for SigLIP2, AuraFace, PP-OCRv6 and Gemma 4</sub></p>
+    </td>
+  </tr>
+</table>
 
 ## Features
 
@@ -36,7 +73,7 @@ Every media folder remains in place on disk while TruongPhoto maintains non-dest
 - 3-tier camera RAW pipeline (`CR2`, `CR3`, `NEF`, `ARW`, `DNG`, `RAF`, `ORF`, `RW2`, `PEF`) with embedded JPEG preview extraction for instant thumbnails, native OS codecs (`sips` / ImageIO on macOS, WIC on Windows), and dynamic `LibRaw` loading (`libraw.dylib` / `libraw.dll`), plus JPEG XL (`jxl-oxide`) and ICC v2/v4 color management (`moxcms`) to sRGB
 - EXIF, XMP sidecar, and QuickTime metadata extraction (`nom-exif`) with offline reverse geocoding against a bundled GeoNames `cities1000` spatial dataset (nearest city, admin1 region, and country with zero network calls)
 - Hardware-accelerated video poster extraction and on-demand HLS adaptive streaming (`VideoToolbox` on macOS, `NVENC`/`QSV`/`AMF` on Windows, or `libopenh264` fallback) played back seamlessly via `hls.js`
-- Virtualized justified timeline (`@tanstack/react-virtual`) maintaining 60 FPS across 500,000+ assets with a chronological month/year scrubber, live RGB + luminance histogram, and multi-select batch toolbar
+- Virtualized justified timeline (`@tanstack/react-virtual`) maintaining 60 FPS across 500,000+ assets with smooth directional Lightbox transitions, progressive hi-res click-to-zoom, live RGB + luminance histogram, and multi-select batch toolbar
 
 **100% Offline AI: Semantic Search, People Clustering & In-Image OCR**
 
@@ -49,7 +86,7 @@ Every media folder remains in place on disk while TruongPhoto maintains non-dest
 
 **Conversational Query Router & Offline-First Map View**
 
-- Multi-turn **Chat Search Drawer** (`Cmd/Ctrl+J`) that translates conversational requests (e.g., *" sunset portraits in California from lastOctober with Sony A7IV "* followed by *" only 50mm f/1.4 "*) into structured `SearchQuery` filters and vector prompts with removable filter pills
+- Dedicated full-page **Ask AI** workspace (`Cmd/Ctrl+K`) with multi-turn refinement, removable filter chips, `"Open in Search"` handoff, and library-aware conversational answers (e.g., *"who are in my pics"*, *"show me cool mountain pics"*, *"widest angle waterfall shots"*, *"56mm f/1.4"* followed by *"remove the location filter"*)
 - 4-tier local chat routing: Tier 0 zero-RAM deterministic parser (`ClassicChatRouter`), plus Tier 1 (`Gemma 4 E2B` / `Qwen 3.5 4B`), Tier 2 (`Gemma 4 E4B`), and Tier 3 (`Gemma 4 26B-A4B MoE` with multimodal VLM top-24 thumbnail reranking) via a managed `llama-server` sidecar or optional compiled `llama-cpp-2` (`llama-metal` / `llama-vulkan-dl`)
 - Interactive **Map View** powered by `MapLibre GL JS` and SQLite grid-snapped spatial clustering (`asset_geo_index`), updating the photo sidebar live as you pan and zoom
 - Offline-first basemap architecture: bundled Natural Earth 110m vector land/ocean polygons work out of the box, with support for a local `world-z0-z6.pmtiles` world archive and a strict opt-in toggle for online OpenFreeMap detailed street tiles

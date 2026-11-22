@@ -1,7 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { ApiClientError } from '../../lib/api';
+import { isTauri } from '../../lib/tauri';
 import { errorMessage, useAppStore } from '../../store/useAppStore';
 import { Badge } from '../ui';
+import { WindowsCaptionButtons, isWindowsPlatform } from '../WindowControls';
+
+const nativeMacTitlebar =
+  typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
+const winDesktop = isTauri() && !nativeMacTitlebar && isWindowsPlatform();
 
 const DIGIT_4 = /^\d{4}$/;
 const DIGIT_6 = /^\d{6}$/;
@@ -99,7 +105,15 @@ export const PinGateView: React.FC = () => {
   };
 
   return (
-    <div className="auth-viewport" data-tauri-drag-region>
+    <div
+      className={`auth-viewport${isTauri() && nativeMacTitlebar ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
+      data-tauri-drag-region
+    >
+      {winDesktop && (
+        <div className="windows-auth-chrome" data-tauri-drag-region>
+          <WindowsCaptionButtons />
+        </div>
+      )}
       <div className="auth-shell">
         <div className="auth-header">
           <img src="/app-icon.png" width={36} height={36} alt="" />

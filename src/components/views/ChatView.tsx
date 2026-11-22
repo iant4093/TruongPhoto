@@ -7,15 +7,17 @@ import {
   PanelLeft,
   Play,
   Plus,
+  Search,
   Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
 import { mediaOriginalUrl, mediaThumbUrl, warmupChat } from '../../lib/api';
+import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../../lib/escapeStack';
 import { isTauri } from '../../lib/tauri';
 import { notifyError, notifySuccess } from '../../store/feedback';
 import { useAppStore } from '../../store/useAppStore';
-import type { AssetKind, ChatTier, RouterPlan } from '../../types/api';
+import type { AssetKind, ChatTier, RouterPlan, SearchRequest } from '../../types/api';
 import { openContextMenu } from '../ContextMenu';
 import { WindowsCaptionButtons, isWindowsPlatform } from '../WindowControls';
 
@@ -218,6 +220,48 @@ function buildFilterChips(plan: RouterPlan | null): string[] {
   return chips;
 }
 
+function renderInlineFormatting(text: string): React.ReactNode[] {
+  // Safe inline renderer for **bold** and `code` tokens without dangerouslySetInnerHTML.
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  return parts.map((part, idx) => {
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return <strong key={idx}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
+      return (
+        <code key={idx} className="chat-inline-code">
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    return <React.Fragment key={idx}>{part}</React.Fragment>;
+  });
+}
+
+function renderFormattedReply(content: string): React.ReactNode {
+  const lines = content.split('\n');
+  if (lines.length === 1 && !content.includes('**') && !content.includes('`')) {
+    return content;
+  }
+  return lines.map((line, i) => {
+    const bulletMatch = line.match(/^\s*[-*•]\s+(.*)$/);
+    if (bulletMatch) {
+      return (
+        <div key={i} className="chat-reply-bullet">
+          <span aria-hidden="true">•</span>
+          <span>{renderInlineFormatting(bulletMatch[1])}</span>
+        </div>
+      );
+    }
+    return (
+      <React.Fragment key={i}>
+        {i > 0 && <br />}
+        {renderInlineFormatting(line)}
+      </React.Fragment>
+    );
+  });
+}
+
 export const ChatView: React.FC = () => {
   const chatSessions = useAppStore((s) => s.chatSessions);
   const activeChatSessionId = useAppStore((s) => s.activeChatSessionId);
@@ -235,17 +279,50 @@ export const ChatView: React.FC = () => {
   const refreshAiDashboard = useAppStore((s) => s.refreshAiDashboard);
   const openLightbox = useAppStore((s) => s.openLightbox);
   const setActiveNav = useAppStore((s) => s.setActiveNav);
+  const runSearch = useAppStore((s) => s.runSearch);
 
   const [promptInput, setPromptInput] = useState('');
   const [threadsOpen, setThreadsOpen] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 960 : true,
+  );
+  const [isNarrowViewport, setIsNarrowViewport] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth <= 960 : false,
   );
   const [thinkingSecs, setThinkingSecs] = useState(0);
   const [warmingModel, setWarmingModel] = useState(false);
   const [warmupTier, setWarmupTier] = useState<ChatTier | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 960px)');
+    const onChange = (e: MediaQueryListEvent) => setIsNarrowViewport(e.matches);
+    setIsNarrowViewport(mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  // Escape closes mobile threads drawer cleanly.
+  useEffect(() => {
+    if (!threadsOpen || !isNarrowViewport) return;
+    const layer = pushEscapeLayer();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && isTopEscapeLayer(layer)) {
+        event.preventDefault();
+        event.stopPropagation();
+        setThreadsOpen(false);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      popEscapeLayer(layer);
+    };
+  }, [isNarrowViewport, threadsOpen]);
 
   const activeTier: ChatTier = aiDashboard?.state.active_chat_tier ?? warmupTier ?? 'tier0';
   const tierLabel = CHAT_TIER_LABELS[activeTier];
@@ -293,10 +370,47 @@ export const ChatView: React.FC = () => {
     return () => window.clearInterval(id);
   }, [chatPendingStartedAt, chatSending]);
 
-  // Smooth auto-scroll when new messages arrive or thinking starts.
+  // Smooth auto-scroll only when the user is already near the bottom (or just sent a prompt).
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
+    if (stickToBottomRef.current || chatSending) {
+      messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
+    }
   }, [chatMessages.length, chatSending]);
+
+  const handleOpenInSearch = (plan: RouterPlan | null) => {
+    if (!plan) return;
+    const sem = plan.semantic_query?.trim() || undefined;
+    const ocr = plan.ocr_terms?.trim() || undefined;
+    const req: SearchRequest = {
+      query: sem ?? ocr ?? '',
+      ocr_query: sem && ocr ? ocr : undefined,
+      mode: sem ? 'hybrid' : ocr ? 'ocr' : 'filters',
+      folder_id: undefined,
+      person_ids: undefined,
+      has_people: plan.has_people ?? undefined,
+      tags: plan.tags && plan.tags.length > 0 ? plan.tags : undefined,
+      camera_model: plan.camera_model ?? undefined,
+      lens_model: plan.lens_model ?? undefined,
+      focal_length_min_mm: plan.focal_length_min_mm ?? undefined,
+      focal_length_max_mm: plan.focal_length_max_mm ?? undefined,
+      aperture_min_f: plan.aperture_min_f ?? undefined,
+      aperture_max_f: plan.aperture_max_f ?? undefined,
+      iso_min: plan.iso_min ?? undefined,
+      iso_max: plan.iso_max ?? undefined,
+      shutter_speed_min_sec: plan.shutter_speed_min_sec ?? undefined,
+      shutter_speed_max_sec: plan.shutter_speed_max_sec ?? undefined,
+      orientation: plan.orientation ?? undefined,
+      sort_by: plan.sort_by ?? undefined,
+      geo_query: plan.location_query ?? undefined,
+      kind: plan.kind ?? undefined,
+      favorite: plan.favorite ?? undefined,
+      date_from_ms: plan.date_from_ms ?? undefined,
+      date_to_ms: plan.date_to_ms ?? undefined,
+      limit: 60,
+      offset: 0,
+    };
+    void runSearch(req).catch((err) => notifyError(err, 'Could not open search results'));
+  };
 
   // Auto-resize composer textarea cleanly.
   useEffect(() => {
@@ -317,6 +431,7 @@ export const ChatView: React.FC = () => {
     try {
       await sendChatPrompt(trimmed);
     } catch (err) {
+      setPromptInput((cur) => (cur.trim().length === 0 ? trimmed : cur));
       notifyError(err, 'Chat search failed');
     } finally {
       textareaRef.current?.focus();
@@ -476,8 +591,16 @@ export const ChatView: React.FC = () => {
         </aside>
       )}
 
+      {threadsOpen && isNarrowViewport && (
+        <div
+          className="chat-threads-scrim"
+          aria-hidden="true"
+          onClick={() => setThreadsOpen(false)}
+        />
+      )}
+
       <div className="chat-main-pane">
-        <div className="chat-main-topbar">
+        <div className="chat-main-topbar" data-tauri-drag-region>
           <div className="row" style={{ gap: 8, minWidth: 0 }}>
             <button
               type="button"
@@ -488,27 +611,36 @@ export const ChatView: React.FC = () => {
             >
               <PanelLeft size={16} />
             </button>
-            <div className="chat-main-title">
+            <div className="chat-main-title" data-tauri-drag-region>
               {activeSession?.title || 'New Conversation'}
             </div>
             <span className="badge badge-info">{tierLabel}</span>
           </div>
 
-          <div className="row" style={{ gap: 6 }}>
-            <button
-              type="button"
-              className="button"
-              disabled={chatSending}
-              onClick={() => void handleNewChat()}
-            >
-              <Plus size={14} />
-              <span>New Chat</span>
-            </button>
-            {isTauri() && windowsCaption && <WindowsCaptionButtons />}
+          <div className="row chat-topbar-actions" style={{ gap: 6, marginLeft: 'auto' }}>
+            {(!threadsOpen || isNarrowViewport) && (
+              <button
+                type="button"
+                className="button"
+                disabled={chatSending}
+                onClick={() => void handleNewChat()}
+              >
+                <Plus size={14} />
+                <span>New Chat</span>
+              </button>
+            )}
           </div>
+          {isTauri() && windowsCaption && <WindowsCaptionButtons />}
         </div>
 
-        <div className="chat-stream-scroll">
+        <div
+          ref={scrollContainerRef}
+          className="chat-stream-scroll"
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+          }}
+        >
           <div className="chat-stream-inner">
             {chatMessages.length === 0 && !chatSending ? (
               <div className="chat-welcome">
@@ -571,22 +703,44 @@ export const ChatView: React.FC = () => {
                           )}
                         </div>
 
-                        <div className="chat-assistant-text">{msg.content}</div>
+                        <div className="chat-assistant-text">
+                          {renderFormattedReply(msg.content)}
+                        </div>
 
                         {filterChips.length > 0 && (
                           <div className="chat-filter-chips" aria-label="Applied filters">
                             {filterChips.map((chip) => (
-                              <span key={chip} className="chat-filter-chip">
-                                {chip}
-                              </span>
+                              <button
+                                key={chip}
+                                type="button"
+                                className="chat-filter-chip is-removable"
+                                title={`Click to remove ${chip}`}
+                                disabled={chatSending}
+                                onClick={() => void submitPrompt(`Remove the ${chip} filter`)}
+                              >
+                                <span>{chip}</span>
+                                <X size={10} aria-hidden="true" />
+                              </button>
                             ))}
                           </div>
                         )}
 
                         {msg.hits.length > 0 && (
                           <div className="chat-results-block">
-                            <div className="chat-results-meta">
-                              {msg.hits.length} matching {msg.hits.length === 1 ? 'item' : 'items'}
+                            <div className="chat-results-header">
+                              <div className="chat-results-meta">
+                                {msg.hits.length} matching {msg.hits.length === 1 ? 'item' : 'items'}
+                              </div>
+                              {msg.plan && msg.plan.intent !== 'answer' && (
+                                <button
+                                  type="button"
+                                  className="chat-open-search-btn"
+                                  onClick={() => handleOpenInSearch(msg.plan)}
+                                >
+                                  <Search size={11} aria-hidden="true" />
+                                  <span>Open in Search</span>
+                                </button>
+                              )}
                             </div>
                             <div className="chat-hit-grid-full">
                               {msg.hits.map((hit) => {

@@ -53,16 +53,13 @@ function formatThrottlePillLabel(throttle: ThrottleStatus): string {
 export const Sidebar: React.FC = () => {
   const activeNav = useAppStore((s) => s.activeNav);
   const setActiveNav = useAppStore((s) => s.setActiveNav);
-  const systemInfo = useAppStore((s) => s.systemInfo);
+  const assetCount = useAppStore((s) => s.systemInfo?.stats.asset_count ?? 0);
   const wsConnected = useAppStore((s) => s.wsConnected);
   const throttleStatus = useAppStore((s) => s.throttleStatus);
-  const activeJobs = useAppStore((s) => s.activeJobs);
+  const activeJobCount = useAppStore((s) => Object.keys(s.activeJobs).length);
   const inspectorOpen = useAppStore((s) => s.inspectorOpen);
   const toggleInspector = useAppStore((s) => s.toggleInspector);
   const selectAsset = useAppStore((s) => s.selectAsset);
-
-  const assetCount = systemInfo?.stats.asset_count ?? 0;
-  const activeJobCount = Object.keys(activeJobs).length;
 
   const renderNavButton = (
     [key, label, Icon]: readonly [

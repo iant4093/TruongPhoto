@@ -10,6 +10,19 @@ pub struct SampledKeyframe {
     pub image: RgbImage,
 }
 
+fn hide_console_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 fn resolve_binary(env_key: &str, name: &str) -> Option<PathBuf> {
     if let Ok(val) = std::env::var(env_key) {
         let p = PathBuf::from(val.trim());
@@ -17,32 +30,49 @@ fn resolve_binary(env_key: &str, name: &str) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sidecar = dir.join(if cfg!(windows) {
-                format!("{name}.exe")
-            } else {
-                name.to_string()
-            });
-            if sidecar.is_file() {
-                return Some(sidecar);
-            }
-        }
-    }
-    let common_dirs: &[&str] = if cfg!(target_os = "macos") {
-        &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
-    } else if cfg!(target_os = "windows") {
-        &[r"C:\ffmpeg\bin", r"C:\Program Files\ffmpeg\bin"]
-    } else {
-        &["/usr/local/bin", "/usr/bin"]
-    };
     let bin_name = if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
     };
-    for dir in common_dirs {
-        let candidate = Path::new(dir).join(&bin_name);
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for cand in [dir.join(&bin_name), dir.join("resources").join(&bin_name)] {
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    let mut common_dirs: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/bin"),
+        ]
+    } else if cfg!(target_os = "windows") {
+        let mut dirs = vec![
+            PathBuf::from(r"C:\ffmpeg\bin"),
+            PathBuf::from(r"C:\Program Files\ffmpeg\bin"),
+            PathBuf::from(r"C:\ProgramData\chocolatey\bin"),
+        ];
+        if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+            dirs.push(
+                PathBuf::from(local_app)
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links"),
+            );
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            dirs.push(PathBuf::from(profile).join("scoop").join("shims"));
+        }
+        dirs
+    } else {
+        vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")]
+    };
+    for dir in &mut common_dirs {
+        let candidate = dir.join(&bin_name);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -82,7 +112,9 @@ fn parse_showinfo_pts_ms(stderr: &str) -> Vec<i64> {
 }
 
 fn probe_duration_ms(ffprobe: &Path, video_path: &Path) -> Option<i64> {
-    let out = Command::new(ffprobe)
+    let mut cmd = Command::new(ffprobe);
+    hide_console_window(&mut cmd);
+    let out = cmd
         .args([
             "-v",
             "error",
@@ -143,7 +175,9 @@ pub fn sample_video_keyframes(
     let tmp_dir = TempDirGuard::new()?;
     let pattern = tmp_dir.path().join("kf_%03d.jpg");
 
-    let output = Command::new(&ffmpeg)
+    let mut cmd = Command::new(&ffmpeg);
+    hide_console_window(&mut cmd);
+    let output = cmd
         .args(["-hide_banner", "-loglevel", "info", "-i"])
         .arg(video_path)
         .args([
@@ -176,7 +210,9 @@ pub fn sample_video_keyframes(
     // Fallback to frame 0 if the select expression yielded zero frames.
     if frame_paths.is_empty() {
         let fallback_out = tmp_dir.path().join("kf_001.jpg");
-        let fb_status = Command::new(&ffmpeg)
+        let mut fb_cmd = Command::new(&ffmpeg);
+        hide_console_window(&mut fb_cmd);
+        let fb_status = fb_cmd
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(video_path)
             .args(["-frames:v", "1"])

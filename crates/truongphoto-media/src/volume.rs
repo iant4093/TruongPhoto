@@ -169,11 +169,18 @@ mod windows_impl {
     }
 
     pub(super) fn resolve_windows(canonical: &Path) -> VolumeInfo {
-        // Strip extended-length `\\?\` prefix if canonicalize added one; Windows volume APIs accept both,
-        // though stripping simplifies mount-point resolution.
+        // Strip extended-length `\\?\` prefix if canonicalize added one, preserving UNC shares
+        // (`\\?\UNC\server\share` -> `\\server\share`).
         let path_str = canonical.as_os_str().to_string_lossy();
-        let trimmed = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
-        let wide_path: Vec<u16> = OsString::from(trimmed)
+        let trimmed: std::borrow::Cow<'_, str> =
+            if let Some(unc_rest) = path_str.strip_prefix(r"\\?\UNC\") {
+                std::borrow::Cow::Owned(format!(r"\\{unc_rest}"))
+            } else if let Some(local_rest) = path_str.strip_prefix(r"\\?\") {
+                std::borrow::Cow::Borrowed(local_rest)
+            } else {
+                std::borrow::Cow::Borrowed(&path_str)
+            };
+        let wide_path: Vec<u16> = OsString::from(trimmed.as_ref())
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();

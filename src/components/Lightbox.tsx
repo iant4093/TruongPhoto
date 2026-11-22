@@ -21,12 +21,16 @@ import {
 } from '../lib/api';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
 import { formatDateTime } from '../lib/format';
+import { isTauri } from '../lib/tauri';
 import { notifyError, notifySuccess } from '../store/feedback';
 import { errorMessage, useAppStore } from '../store/useAppStore';
 import type { AssetDetail } from '../types/api';
 import { AssetInspector } from './AssetInspector';
 import { openContextMenu } from './ContextMenu';
 import { VideoPlayer } from './VideoPlayer';
+import { WindowsCaptionButtons, isWindowsPlatform } from './WindowControls';
+
+const showWindowsCaption = isTauri() && isWindowsPlatform();
 
 function touchDistance(a: React.Touch, b: React.Touch): number {
   const dx = a.clientX - b.clientX;
@@ -55,12 +59,15 @@ export const Lightbox: React.FC = () => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
+  const [isWheeling, setIsWheeling] = useState(false);
   const [hiResLoadedUrl, setHiResLoadedUrl] = useState<string | null>(null);
   const [hiResLoading, setHiResLoading] = useState(false);
   const [navDir, setNavDir] = useState<'fade' | 'next' | 'prev'>('fade');
 
+  const overlayRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const wheelTimerRef = useRef<number | null>(null);
 
   // Touch & pointer gesture tracking
   const gestureRef = useRef<{
@@ -153,22 +160,48 @@ export const Lightbox: React.FC = () => {
     }
   }, [currentIndex, lightboxAssetId, lightboxAssetIds]);
 
+  const activeDetail = detail?.summary.id === lightboxAssetId ? detail : null;
+
+  const clampPan = useCallback((x: number, y: number, targetZoom: number) => {
+    if (targetZoom <= 1.02) return { x: 0, y: 0 };
+    const stage = stageRef.current;
+    const img = imgRef.current;
+    if (!stage || !img) return { x, y };
+    const maxX = Math.max(0, (img.offsetWidth * targetZoom - stage.clientWidth) / 2 + 48);
+    const maxY = Math.max(0, (img.offsetHeight * targetZoom - stage.clientHeight) / 2 + 48);
+    return {
+      x: Math.max(-maxX, Math.min(maxX, x)),
+      y: Math.max(-maxY, Math.min(maxY, y)),
+    };
+  }, []);
+
+  // Move focus into Lightbox overlay when opened so keyboard navigation stays scoped.
+  useEffect(() => {
+    if (lightboxAssetId) {
+      overlayRef.current?.focus({ preventScroll: true });
+    }
+  }, [lightboxAssetId]);
+
   const handleToggleFavorite = useCallback(async () => {
-    if (!canMutate || !lightboxAssetId || !detail) return;
-    const nextFav = !detail.summary.is_favorite;
+    if (!canMutate || !lightboxAssetId || !activeDetail) return;
+    const nextFav = !activeDetail.summary.is_favorite;
     setDetail((prev) =>
-      prev ? { ...prev, summary: { ...prev.summary, is_favorite: nextFav } } : prev,
+      prev && prev.summary.id === lightboxAssetId
+        ? { ...prev, summary: { ...prev.summary, is_favorite: nextFav } }
+        : prev,
     );
     try {
       await setAssetFavorite(lightboxAssetId, nextFav);
       bumpLibraryRevision();
     } catch (err) {
       setDetail((prev) =>
-        prev ? { ...prev, summary: { ...prev.summary, is_favorite: !nextFav } } : prev,
+        prev && prev.summary.id === lightboxAssetId
+          ? { ...prev, summary: { ...prev.summary, is_favorite: !nextFav } }
+          : prev,
       );
       notifyError(err, 'Could not update favorite');
     }
-  }, [bumpLibraryRevision, canMutate, detail, lightboxAssetId]);
+  }, [activeDetail, bumpLibraryRevision, canMutate, lightboxAssetId]);
 
   const handleMoveToTrash = useCallback(async () => {
     if (!canMutate || !lightboxAssetId) return;
@@ -229,6 +262,20 @@ export const Lightbox: React.FC = () => {
         case 'ArrowRight':
           event.preventDefault();
           goNext();
+          break;
+        case 'Home':
+          if (lightboxAssetIds.length > 0 && currentIndex !== 0) {
+            event.preventDefault();
+            setNavDir('prev');
+            setLightboxAsset(lightboxAssetIds[0]);
+          }
+          break;
+        case 'End':
+          if (lightboxAssetIds.length > 0 && currentIndex !== lightboxAssetIds.length - 1) {
+            event.preventDefault();
+            setNavDir('next');
+            setLightboxAsset(lightboxAssetIds[lightboxAssetIds.length - 1]);
+          }
           break;
         case 'f':
         case 'F':
@@ -293,23 +340,24 @@ export const Lightbox: React.FC = () => {
   ]);
 
   const isVideo =
-    detail?.summary.kind === 'video' ||
-    detail?.playback.mode === 'direct' ||
-    detail?.playback.mode === 'hls';
+    activeDetail?.summary.kind === 'video' ||
+    activeDetail?.playback.mode === 'direct' ||
+    activeDetail?.playback.mode === 'hls';
 
   const hasRaw = Boolean(
-    detail?.playback.has_raw ||
-      detail?.summary.kind === 'raw_jpg_stack' ||
-      detail?.files.some((f) => f.file_role === 'raw'),
+    activeDetail?.playback.has_raw ||
+      activeDetail?.summary.kind === 'raw_jpg_stack' ||
+      activeDetail?.files.some((f) => f.file_role === 'raw'),
   );
 
   const hasLiveClip = Boolean(
-    detail?.playback.live_video_url ||
-      detail?.summary.kind === 'live_photo' ||
-      detail?.summary.kind === 'motion_photo',
+    activeDetail?.playback.live_video_url ||
+      activeDetail?.summary.kind === 'live_photo' ||
+      activeDetail?.summary.kind === 'motion_photo',
   );
 
-  const primaryFile = detail?.files.find((f) => f.file_role === 'primary') ?? detail?.files[0];
+  const primaryFile =
+    activeDetail?.files.find((f) => f.file_role === 'primary') ?? activeDetail?.files[0];
   const primaryExt = primaryFile?.rel_path.split('.').pop()?.toLowerCase() ?? '';
   const browserNativeOriginal = ['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif'].includes(primaryExt);
 
@@ -370,9 +418,47 @@ export const Lightbox: React.FC = () => {
     };
   }, [fullResUrl, hiResLoadedUrl, isVideo, lightboxAssetId, rawDemosaic, zoom]);
 
+  // Native non-passive wheel zoom listener so preventDefault works cleanly without console warnings
+  // and wheel ticks zoom smoothly without CSS transition stutter.
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el || !lightboxAssetId) return;
+    const onNativeWheel = (e: WheelEvent) => {
+      if (isVideo) return;
+      if (Math.abs(e.deltaY) < 1) return;
+      e.preventDefault();
+      setIsWheeling(true);
+      if (wheelTimerRef.current !== null) {
+        window.clearTimeout(wheelTimerRef.current);
+      }
+      wheelTimerRef.current = window.setTimeout(() => {
+        setIsWheeling(false);
+        wheelTimerRef.current = null;
+      }, 140);
+
+      const factor = e.deltaY < 0 ? 1.14 : 1 / 1.14;
+      setZoom((prev) => {
+        const next = Math.min(5, Math.max(1, Number((prev * factor).toFixed(2))));
+        if (next <= 1.02) {
+          setPan({ x: 0, y: 0 });
+          return 1;
+        }
+        setPan((cur) => clampPan(cur.x, cur.y, next));
+        return next;
+      });
+    };
+    el.addEventListener('wheel', onNativeWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onNativeWheel);
+      if (wheelTimerRef.current !== null) {
+        window.clearTimeout(wheelTimerRef.current);
+        wheelTimerRef.current = null;
+      }
+    };
+  }, [clampPan, isVideo, lightboxAssetId]);
+
   if (!lightboxAssetId) return null;
 
-  const activeDetail = detail?.summary.id === lightboxAssetId ? detail : null;
   const titleText =
     activeDetail?.overrides?.title ||
     activeDetail?.summary.title ||
@@ -389,7 +475,7 @@ export const Lightbox: React.FC = () => {
       ? fullResUrl!
       : previewUrl;
 
-  const liveVideoUrl = detail?.playback.live_video_url ?? mediaLiveVideoUrl(lightboxAssetId);
+  const liveVideoUrl = activeDetail?.playback.live_video_url ?? mediaLiveVideoUrl(lightboxAssetId);
 
   const clearLongPress = () => {
     if (gestureRef.current.longPressTimer !== null) {
@@ -441,10 +527,7 @@ export const Lightbox: React.FC = () => {
       const t = e.touches[0];
       const dx = t.clientX - gestureRef.current.startX;
       const dy = t.clientY - gestureRef.current.startY;
-      setPan({
-        x: gestureRef.current.startPanX + dx,
-        y: gestureRef.current.startPanY + dy,
-      });
+      setPan(clampPan(gestureRef.current.startPanX + dx, gestureRef.current.startPanY + dy, zoom));
     }
   };
 
@@ -485,10 +568,7 @@ export const Lightbox: React.FC = () => {
     if (Math.hypot(dx, dy) > 4) {
       gestureRef.current.didDrag = true;
     }
-    setPan({
-      x: gestureRef.current.startPanX + dx,
-      y: gestureRef.current.startPanY + dy,
-    });
+    setPan(clampPan(gestureRef.current.startPanX + dx, gestureRef.current.startPanY + dy, zoom));
   };
 
   const handleMouseUp = () => {
@@ -514,29 +594,17 @@ export const Lightbox: React.FC = () => {
       const cy = rect.top + rect.height / 2;
       const offsetX = e.clientX - cx;
       const offsetY = e.clientY - cy;
-      setPan({
-        x: Math.round(-offsetX * (targetZoom - 1) * 0.75),
-        y: Math.round(-offsetY * (targetZoom - 1) * 0.75),
-      });
+      setPan(
+        clampPan(
+          Math.round(-offsetX * (targetZoom - 1) * 0.75),
+          Math.round(-offsetY * (targetZoom - 1) * 0.75),
+          targetZoom,
+        ),
+      );
     } else {
       setPan({ x: 0, y: 0 });
     }
     setZoom(targetZoom);
-  };
-
-  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    if (isVideo) return;
-    if (Math.abs(e.deltaY) < 1) return;
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-    setZoom((prev) => {
-      const next = Math.min(5, Math.max(1, Number((prev * factor).toFixed(2))));
-      if (next <= 1.02) {
-        setPan({ x: 0, y: 0 });
-        return 1;
-      }
-      return next;
-    });
   };
 
   const handleMediaContextMenu = (e: React.MouseEvent) => {
@@ -560,11 +628,11 @@ export const Lightbox: React.FC = () => {
             },
           ]
         : []),
-      ...(canMutate && detail
+      ...(canMutate && activeDetail
         ? [
             {
               id: 'lb-fav',
-              label: detail.summary.is_favorite ? 'Remove from Favorites' : 'Add to Favorites',
+              label: activeDetail.summary.is_favorite ? 'Remove from Favorites' : 'Add to Favorites',
               icon: <Star size={14} />,
               shortcut: 'F',
               onSelect: () => handleToggleFavorite(),
@@ -603,6 +671,8 @@ export const Lightbox: React.FC = () => {
 
   return (
     <div
+      ref={overlayRef}
+      tabIndex={-1}
       className="lightbox-overlay"
       role="dialog"
       aria-modal="true"
@@ -631,7 +701,7 @@ export const Lightbox: React.FC = () => {
             >
               {titleText}
             </div>
-            {detail && (
+            {activeDetail && (
               <div
                 className="view-subtitle"
                 style={{
@@ -643,20 +713,20 @@ export const Lightbox: React.FC = () => {
                 }}
               >
                 {[
-                  formatDateTime(detail.summary.capture_at_ms),
-                  detail.photo_meta?.focal_length_mm != null
-                    ? `${Math.round(detail.photo_meta.focal_length_mm)}mm`
+                  formatDateTime(activeDetail.summary.capture_at_ms),
+                  activeDetail.photo_meta?.focal_length_mm != null
+                    ? `${Math.round(activeDetail.photo_meta.focal_length_mm)}mm`
                     : null,
-                  detail.photo_meta?.aperture_f != null
-                    ? `f/${Number(detail.photo_meta.aperture_f.toFixed(1))}`
+                  activeDetail.photo_meta?.aperture_f != null
+                    ? `f/${Number(activeDetail.photo_meta.aperture_f.toFixed(1))}`
                     : null,
-                  detail.photo_meta?.shutter_speed_sec != null &&
-                  detail.photo_meta.shutter_speed_sec > 0
-                    ? detail.photo_meta.shutter_speed_sec >= 1
-                      ? `${Number(detail.photo_meta.shutter_speed_sec.toFixed(1))}s`
-                      : `1/${Math.max(1, Math.round(1 / detail.photo_meta.shutter_speed_sec))}s`
+                  activeDetail.photo_meta?.shutter_speed_sec != null &&
+                  activeDetail.photo_meta.shutter_speed_sec > 0
+                    ? activeDetail.photo_meta.shutter_speed_sec >= 1
+                      ? `${Number(activeDetail.photo_meta.shutter_speed_sec.toFixed(1))}s`
+                      : `1/${Math.max(1, Math.round(1 / activeDetail.photo_meta.shutter_speed_sec))}s`
                     : null,
-                  detail.photo_meta?.iso != null ? `ISO ${detail.photo_meta.iso}` : null,
+                  activeDetail.photo_meta?.iso != null ? `ISO ${activeDetail.photo_meta.iso}` : null,
                   lightboxAssetIds.length > 1 && currentIndex >= 0
                     ? `${currentIndex + 1} / ${lightboxAssetIds.length}`
                     : null,
@@ -698,7 +768,7 @@ export const Lightbox: React.FC = () => {
               onClick={() => setLivePlaying((prev) => !prev)}
             >
               <Play size={11} fill="currentColor" />
-              <span>{detail?.summary.kind === 'motion_photo' ? 'MOTION' : 'LIVE'}</span>
+              <span>{activeDetail?.summary.kind === 'motion_photo' ? 'MOTION' : 'LIVE'}</span>
             </button>
           )}
 
@@ -718,16 +788,16 @@ export const Lightbox: React.FC = () => {
             </button>
           )}
 
-          {canMutate && detail && (
+          {canMutate && activeDetail && (
             <button
               type="button"
               className="icon-button"
-              aria-label={detail.summary.is_favorite ? 'Remove favorite' : 'Favorite'}
-              aria-pressed={detail.summary.is_favorite}
-              style={detail.summary.is_favorite ? { color: '#f2cf6b' } : undefined}
+              aria-label={activeDetail.summary.is_favorite ? 'Remove favorite' : 'Favorite'}
+              aria-pressed={activeDetail.summary.is_favorite}
+              style={activeDetail.summary.is_favorite ? { color: '#f2cf6b' } : undefined}
               onClick={() => void handleToggleFavorite()}
             >
-              <Star size={16} fill={detail.summary.is_favorite ? 'currentColor' : 'none'} />
+              <Star size={16} fill={activeDetail.summary.is_favorite ? 'currentColor' : 'none'} />
             </button>
           )}
 
@@ -764,6 +834,7 @@ export const Lightbox: React.FC = () => {
             <span>Info</span>
           </button>
         </div>
+        {showWindowsCaption && <WindowsCaptionButtons />}
       </header>
 
       <div className="lightbox-body">
@@ -777,7 +848,6 @@ export const Lightbox: React.FC = () => {
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
           onMouseLeave={handleMouseUp}
-          onWheel={handleWheel}
           onContextMenu={handleMediaContextMenu}
         >
           {hasPrev && (
@@ -795,13 +865,13 @@ export const Lightbox: React.FC = () => {
             <div className="error-banner" role="alert">
               {error}
             </div>
-          ) : isVideo && detail && detail.summary.id === lightboxAssetId ? (
+          ) : isVideo && activeDetail ? (
             <div
               key={lightboxAssetId}
               className={`lightbox-media-frame is-nav-${navDir}`}
             >
               <VideoPlayer
-                playback={detail.playback}
+                playback={activeDetail.playback}
                 posterUrl={mediaThumbUrl(lightboxAssetId)}
                 initialTimestampSec={lightboxInitialTimestampSec}
                 className="lightbox-media"
@@ -823,9 +893,10 @@ export const Lightbox: React.FC = () => {
                   transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
                   cursor: zoom > 1.05 ? (isDragging ? 'grabbing' : 'grab') : 'zoom-in',
                   opacity: livePlaying ? 0 : 1,
-                  transition: isDragging
-                    ? 'opacity 180ms ease-out'
-                    : 'transform 200ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out',
+                  transition:
+                    isDragging || isWheeling
+                      ? 'opacity 180ms ease-out'
+                      : 'transform 200ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out',
                 }}
               />
 
@@ -877,7 +948,7 @@ export const Lightbox: React.FC = () => {
             </div>
             <AssetInspector
               assetId={lightboxAssetId}
-              initialDetail={detail}
+              initialDetail={activeDetail}
               onAssetUpdated={(updated) => setDetail(updated)}
             />
           </aside>

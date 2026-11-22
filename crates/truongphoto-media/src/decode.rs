@@ -104,7 +104,9 @@ fn decode_via_ffmpeg_png(path: &Path) -> Result<RgbImage, MediaError> {
             tool: "ffmpeg",
             message: "ffmpeg executable not found for fallback decode".to_string(),
         })?;
-    let out = std::process::Command::new(ffmpeg)
+    let mut cmd = std::process::Command::new(ffmpeg);
+    video::hide_console_window(&mut cmd);
+    let out = cmd
         .args(["-v", "error", "-i"])
         .arg(path)
         .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])

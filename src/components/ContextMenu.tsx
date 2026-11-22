@@ -89,7 +89,8 @@ export const ContextMenuHost: React.FC = () => {
           id: 'ctx-ask-ai',
           label: 'Ask AI Assistant',
           icon: <Sparkles size={14} />,
-          shortcut: '⌘K',
+          shortcut:
+            typeof navigator !== 'undefined' && /Mac/.test(navigator.platform) ? '⌘K' : 'Ctrl+K',
           onSelect: () => store.setActiveNav('chat'),
         },
         {

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Image as ImageIcon, Play, Search } from 'lucide-react';
 import { mediaThumbUrl } from '../lib/api';
 import { formatDateTime } from '../lib/format';
@@ -34,6 +34,9 @@ const SearchHitCard: React.FC<{
   onOpen: (hit: SearchHit) => void;
 }> = ({ hit, onOpen }) => {
   const [imgFailed, setImgFailed] = useState(false);
+  useEffect(() => {
+    setImgFailed(false);
+  }, [hit.asset.id]);
   const title = hit.asset.title || hit.asset.camera_model || 'Media item';
   const showTimestamp = hit.timestamp_sec != null && hit.timestamp_sec > 0;
 
@@ -147,7 +150,10 @@ export const SearchResultsView: React.FC = () => {
         </div>
       ) : hits.length > 0 ? (
         <>
-          <div className="search-hit-grid">
+          <div
+            className="search-hit-grid"
+            style={searchLoading ? { opacity: 0.6, transition: 'opacity 140ms ease' } : undefined}
+          >
             {hits.map((hit) => (
               <SearchHitCard
                 key={`${hit.asset.id}-${hit.timestamp_sec ?? 'photo'}`}

@@ -705,8 +705,8 @@ export const AiModelsPanel: React.FC = () => {
             </Badge>
           </div>
           <p className="view-subtitle" style={{ margin: 0 }}>
-            Powers conversational search in the Ask AI drawer. Instant Rules work out-of-the-box
-            with zero download.
+            Powers conversational photo search in Ask AI. Instant Rules work out-of-the-box with
+            zero download.
           </p>
 
           <div className="preset-pill-grid">
@@ -731,6 +731,29 @@ export const AiModelsPanel: React.FC = () => {
               );
             })}
           </div>
+
+          {activeChatModel && activeChatModel.status === 'downloading' && (() => {
+            const denom = Math.max(1, activeChatModel.bytes_total || activeChatModel.approx_bytes);
+            const pct = Math.min(100, Math.max(0, Math.round((activeChatModel.bytes_downloaded / denom) * 100)));
+            return (
+              <div style={{ paddingTop: 4 }}>
+                <div className="row" style={{ justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span className="view-subtitle" style={{ marginTop: 0 }}>
+                    Downloading {activeChatModel.name}…
+                  </span>
+                  <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                    {pct}%
+                  </span>
+                </div>
+                <div className="progress-track">
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${Math.max(4, pct)}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })()}
 
           {activeChatModel &&
             (activeChatModel.status === 'not_installed' || activeChatModel.status === 'error') && (

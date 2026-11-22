@@ -18,6 +18,20 @@ pub struct VideoCapabilities {
 
 static VIDEO_CAPS: OnceLock<VideoCapabilities> = OnceLock::new();
 
+/// Prevents flashing black console windows when spawning external CLI tools on Windows.
+pub fn hide_console_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 fn resolve_tool_binary(env_key: &str, name: &str) -> Option<PathBuf> {
     if let Ok(val) = std::env::var(env_key) {
         let p = PathBuf::from(val.trim());
@@ -39,31 +53,54 @@ fn resolve_tool_binary(env_key: &str, name: &str) -> Option<PathBuf> {
         }
     }
 
-    let common_dirs: &[&str] = if cfg!(target_os = "macos") {
-        &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
-    } else if cfg!(target_os = "windows") {
-        &[r"C:\ffmpeg\bin", r"C:\Program Files\ffmpeg\bin"]
+    let bin_name = if cfg!(windows) {
+        format!("{name}.exe")
     } else {
-        &["/usr/local/bin", "/usr/bin"]
+        name.to_string()
     };
 
-    for dir in common_dirs {
-        let candidate = Path::new(dir).join(if cfg!(windows) {
-            format!("{name}.exe")
-        } else {
-            name.to_string()
-        });
+    let mut search_dirs: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/bin"),
+        ]
+    } else if cfg!(target_os = "windows") {
+        let mut dirs = vec![
+            PathBuf::from(r"C:\ffmpeg\bin"),
+            PathBuf::from(r"C:\Program Files\ffmpeg\bin"),
+            PathBuf::from(r"C:\ProgramData\chocolatey\bin"),
+        ];
+        if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+            dirs.push(
+                PathBuf::from(local_app)
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links"),
+            );
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            dirs.push(PathBuf::from(profile).join("scoop").join("shims"));
+        }
+        dirs
+    } else {
+        vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")]
+    };
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_dirs.push(dir.join("resources"));
+        }
+    }
+
+    for dir in &search_dirs {
+        let candidate = dir.join(&bin_name);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
 
     if let Ok(path_var) = std::env::var("PATH") {
-        let bin_name = if cfg!(windows) {
-            format!("{name}.exe")
-        } else {
-            name.to_string()
-        };
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join(&bin_name);
             if candidate.is_file() {
@@ -75,25 +112,63 @@ fn resolve_tool_binary(env_key: &str, name: &str) -> Option<PathBuf> {
     None
 }
 
+fn is_hardware_encoder(enc: &str) -> bool {
+    matches!(
+        enc,
+        "h264_nvenc" | "h264_qsv" | "h264_amf" | "h264_videotoolbox"
+    )
+}
+
+fn smoke_test_encoder(ffmpeg: &Path, encoder: &str) -> bool {
+    let mut cmd = Command::new(ffmpeg);
+    hide_console_window(&mut cmd);
+    cmd.args([
+        "-hide_banner",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=64x64:d=0.1",
+        "-frames:v",
+        "1",
+        "-c:v",
+        encoder,
+        "-f",
+        "null",
+        "-",
+    ])
+    .status()
+    .is_ok_and(|s| s.success())
+}
+
 fn probe_h264_encoder(ffmpeg: &Path) -> String {
     let preferred: &[&str] = if cfg!(target_os = "macos") {
         &["h264_videotoolbox", "libopenh264", "libx264"]
     } else if cfg!(target_os = "windows") {
-        &["h264_nvenc", "h264_qsv", "libopenh264", "libx264"]
+        &[
+            "h264_nvenc",
+            "h264_qsv",
+            "h264_amf",
+            "libx264",
+            "libopenh264",
+        ]
     } else {
-        &["libopenh264", "libx264"]
+        &["libx264", "libopenh264"]
     };
 
-    let Ok(out) = Command::new(ffmpeg)
-        .args(["-hide_banner", "-encoders"])
-        .output()
-    else {
-        return preferred[preferred.len() - 1].to_string();
+    let mut cmd = Command::new(ffmpeg);
+    hide_console_window(&mut cmd);
+    let Ok(out) = cmd.args(["-hide_banner", "-encoders"]).output() else {
+        return "libx264".to_string();
     };
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     for enc in preferred {
         if stdout.contains(enc) {
+            if is_hardware_encoder(enc) && !smoke_test_encoder(ffmpeg, enc) {
+                continue;
+            }
             return (*enc).to_string();
         }
     }
@@ -101,10 +176,9 @@ fn probe_h264_encoder(ffmpeg: &Path) -> String {
 }
 
 fn probe_zscale_tonemap(ffmpeg: &Path) -> bool {
-    let Ok(out) = Command::new(ffmpeg)
-        .args(["-hide_banner", "-filters"])
-        .output()
-    else {
+    let mut cmd = Command::new(ffmpeg);
+    hide_console_window(&mut cmd);
+    let Ok(out) = cmd.args(["-hide_banner", "-filters"]).output() else {
         return false;
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -176,6 +250,7 @@ pub fn extract_video_poster_frame(src: &Path) -> Result<RgbImage, MediaError> {
     let ffmpeg = require_ffmpeg()?;
     for seek in [Some("00:00:00.500"), None] {
         let mut cmd = Command::new(ffmpeg);
+        hide_console_window(&mut cmd);
         cmd.args(["-v", "error"]);
         if let Some(ts) = seek {
             cmd.args(["-ss", ts]);
@@ -245,45 +320,57 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
     let seg_pattern = tmp_dir.join("seg_%04d.ts");
     let playlist_path = tmp_dir.join("index.m3u8");
 
-    let output = Command::new(ffmpeg)
-        .args(["-y", "-v", "error", "-i"])
-        .arg(src)
-        .args([
-            "-vf",
-            vf,
-            "-c:v",
-            &caps.h264_encoder,
-            "-b:v",
-            "6M",
-            "-maxrate",
-            "8M",
-            "-bufsize",
-            "12M",
-            "-c:a",
-            "aac",
-            "-ac",
-            "2",
-            "-b:a",
-            "128k",
-            "-hls_time",
-            "4",
-            "-hls_playlist_type",
-            "vod",
-            "-hls_flags",
-            "independent_segments",
-            "-hls_segment_filename",
-        ])
-        .arg(&seg_pattern)
-        .arg(&playlist_path)
-        .output();
+    let run_hls = |encoder: &str| {
+        let mut cmd = Command::new(ffmpeg);
+        hide_console_window(&mut cmd);
+        cmd.args(["-y", "-v", "error", "-i"])
+            .arg(src)
+            .args([
+                "-vf",
+                vf,
+                "-c:v",
+                encoder,
+                "-b:v",
+                "6M",
+                "-maxrate",
+                "8M",
+                "-bufsize",
+                "12M",
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+                "-b:a",
+                "128k",
+                "-hls_time",
+                "4",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_flags",
+                "independent_segments",
+                "-hls_segment_filename",
+            ])
+            .arg(&seg_pattern)
+            .arg(&playlist_path)
+            .output()
+    };
 
-    let output = match output {
+    let mut output = match run_hls(&caps.h264_encoder) {
         Ok(out) => out,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(MediaError::Io(e));
         }
     };
+
+    // Automatic software fallback if a hardware encoder fails at runtime (e.g. driver/profile limits).
+    if (!output.status.success() || !playlist_path.is_file())
+        && is_hardware_encoder(&caps.h264_encoder)
+    {
+        if let Ok(fallback) = run_hls("libx264") {
+            output = fallback;
+        }
+    }
 
     if !output.status.success() || !playlist_path.is_file() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

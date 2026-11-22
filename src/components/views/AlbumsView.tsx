@@ -299,14 +299,19 @@ export const AlbumsView: React.FC = () => {
 
   const handleDetailAssetsTrashed = useCallback((assetIds: string[]) => {
     const removed = new Set(assetIds);
-    setDetail((prev) =>
-      prev
-        ? {
-            ...prev,
-            assets: prev.assets.filter((a) => !removed.has(a.id)),
-          }
-        : prev,
-    );
+    setDetail((prev) => {
+      if (!prev) return prev;
+      const nextAssets = prev.assets.filter((a) => !removed.has(a.id));
+      const delta = prev.assets.length - nextAssets.length;
+      return {
+        ...prev,
+        album: {
+          ...prev.album,
+          asset_count: Math.max(0, prev.album.asset_count - delta),
+        },
+        assets: nextAssets,
+      };
+    });
   }, []);
 
   // Render Album Detail view

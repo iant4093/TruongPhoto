@@ -41,7 +41,7 @@ export const TrashView: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await listTrash({ limit: 100 });
+      const res = await listTrash();
       setItems(res.items);
       setTotalCount(res.total_count);
       setSelectedIds(new Set());
@@ -317,7 +317,10 @@ export const TrashView: React.FC = () => {
                   if (entries.length > 0) openContextMenu(e, entries);
                 }}
               >
-                <div style={{ position: 'relative' }}>
+                <div
+                  style={{ position: 'relative', cursor: canRestore ? 'pointer' : undefined }}
+                  onClick={canRestore ? () => toggleSelect(asset.id) : undefined}
+                >
                   <Thumb
                     src={mediaThumbUrl(asset.id)}
                     alt={asset.title ?? 'Trashed asset'}
@@ -332,7 +335,10 @@ export const TrashView: React.FC = () => {
                       style={{ opacity: 1 }}
                       aria-label={isSelected ? 'Deselect trashed item' : 'Select trashed item'}
                       aria-pressed={isSelected}
-                      onClick={() => toggleSelect(asset.id)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleSelect(asset.id);
+                      }}
                     >
                       {isSelected && <Check size={12} strokeWidth={2.5} />}
                     </button>
@@ -342,7 +348,7 @@ export const TrashView: React.FC = () => {
                     className="trash-countdown-badge"
                     style={{ position: 'absolute', left: 8, bottom: 8 }}
                   >
-                    {daysLeft} days left
+                    {plural(daysLeft, 'day')} left
                   </span>
                 </div>
 

@@ -374,6 +374,12 @@ pub async fn delete_ai_model(
 
     state.ai.cancel_download(spec.id);
     let _ = state.ai.pipeline().ort.evict_all_sessions();
+    // Stop any running llama-server sidecar holding GGUF file locks (required on Windows before delete).
+    let _ = state
+        .ai
+        .pipeline()
+        .chat
+        .evict_idle(std::time::Duration::ZERO);
 
     let dir = model_dir(state.ai.models_dir(), spec.id);
     if dir.exists() {

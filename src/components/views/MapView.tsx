@@ -13,6 +13,7 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { Protocol } from 'pmtiles';
 import { Globe, MapPin, Maximize2, X } from 'lucide-react';
 import { getMapClusters, getMapConfig, getMapPoints, mediaThumbUrl } from '../../lib/api';
+import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../../lib/escapeStack';
 import { formatDateTime, plural } from '../../lib/format';
 import { WORLD_GRATICULE_GEOJSON, WORLD_LAND_GEOJSON } from '../../lib/worldGeoJson';
 import { notifyError } from '../../store/feedback';
@@ -378,6 +379,24 @@ export const MapView: React.FC = () => {
   const stripAssetIds = useMemo(() => stripAssets.map((a) => a.id), [stripAssets]);
   const modeLabel = formatModePillLabel(config);
   const totalGeotagged = config?.total_geotagged ?? 0;
+
+  useEffect(() => {
+    if (!selectedCluster) return;
+    const layer = pushEscapeLayer();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && isTopEscapeLayer(layer)) {
+        event.preventDefault();
+        event.stopPropagation();
+        setSelectedCluster(null);
+        setStripAssets([]);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      popEscapeLayer(layer);
+    };
+  }, [selectedCluster]);
 
   return (
     <div className="map-view-shell">

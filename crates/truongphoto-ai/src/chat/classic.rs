@@ -29,6 +29,51 @@ impl ClassicChatRouter {
             return merged;
         }
 
+        // 0. Informational meta-questions ("who are in my pics", "what's in my library", "hi", etc.)
+        let lower_raw = text.to_ascii_lowercase();
+        let trimmed_punct =
+            lower_raw.trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace());
+        let is_explicit_show = [
+            "show me",
+            "show ",
+            "find ",
+            "search ",
+            "pics of",
+            "photos of",
+        ]
+        .iter()
+        .any(|kw| lower_raw.contains(kw));
+        let is_meta_info = matches!(
+            trimmed_punct,
+            "hi" | "hello" | "hey" | "yo" | "thanks" | "thank you" | "help"
+        ) || (!is_explicit_show
+            && [
+                "who are in my",
+                "who is in my",
+                "who's in my",
+                "who are the people",
+                "what's in my library",
+                "what is in my library",
+                "tell me about my",
+                "how many photo",
+                "how many pic",
+                "what folder",
+                "what trip",
+                "what camera",
+                "what lens",
+                "what gear",
+                "what can you do",
+            ]
+            .iter()
+            .any(|kw| lower_raw.contains(kw)));
+        if is_meta_info {
+            return RouterPlan {
+                intent: Some("answer".to_string()),
+                clear_prior_filters: true,
+                ..Default::default()
+            };
+        }
+
         // 1. Clear / reset triggers.
         let (cleared, after_clear) = extract_clear_trigger(&text);
         turn.clear_prior_filters = cleared;
@@ -443,6 +488,30 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
         }
     }
 
+    // Standalone month name ("in June", "October") -> most recent occurrence of that month.
+    for (word, s, e) in &tokens {
+        if let Some(m_num) = parse_month_name(word) {
+            // Avoid consuming short ambiguous words like "may" unless preceded by a date preposition.
+            let prefix_before = text[..*s].trim_end();
+            let has_prep = ["in", "during", "from", "of", "on"]
+                .iter()
+                .any(|p| prefix_before.strip_suffix_ci_word(p).is_some());
+            if word.eq_ignore_ascii_case("may") && !has_prep {
+                continue;
+            }
+            let target_year = if m_num <= month { year } else { year - 1 };
+            let span_start = strip_optional_leading_prep(text, *s);
+            let start = NaiveDate::from_ymd_opt(target_year, m_num, 1).unwrap();
+            let end =
+                NaiveDate::from_ymd_opt(target_year, m_num, days_in_month(target_year, m_num))
+                    .unwrap();
+            return (
+                Some(date_range_ms(start, end)),
+                remove_span(text, span_start, *e),
+            );
+        }
+    }
+
     (None, text.to_string())
 }
 
@@ -497,13 +566,53 @@ fn extract_known_people(text: &str, known_names: &[String]) -> (Vec<String>, Str
     let mut current = text.to_string();
     let mut matched = Vec::new();
 
-    for name in sorted {
+    for name in &sorted {
         if let Some((start, end)) = find_word_phrase_ci(&current, name) {
             if !matched
                 .iter()
                 .any(|m: &String| m.eq_ignore_ascii_case(name))
             {
-                matched.push(name.to_string());
+                matched.push((*name).to_string());
+            }
+            let prefix = current[..start].trim_end();
+            let mut span_start = start;
+            for prep in ["featuring", "with", "of", "by"] {
+                if let Some(stripped) = prefix.strip_suffix_ci_word(prep) {
+                    span_start = stripped.len();
+                    break;
+                }
+            }
+            current = remove_span(&current, span_start, end);
+        }
+    }
+
+    // Fallback: unique first-name match (e.g. "Nate" -> "Nate Higgers").
+    for name in &sorted {
+        let Some(first) = name.split_whitespace().next() else {
+            continue;
+        };
+        if first.len() < 2 || first.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let is_unique = sorted
+            .iter()
+            .filter(|other| {
+                other
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|w| w.eq_ignore_ascii_case(first))
+            })
+            .count()
+            == 1;
+        if !is_unique {
+            continue;
+        }
+        if let Some((start, end)) = find_word_phrase_ci(&current, first) {
+            if !matched
+                .iter()
+                .any(|m: &String| m.eq_ignore_ascii_case(name))
+            {
+                matched.push((*name).to_string());
             }
             let prefix = current[..start].trim_end();
             let mut span_start = start;

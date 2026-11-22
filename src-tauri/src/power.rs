@@ -262,7 +262,8 @@ mod platform {
                 PBT_APMPOWERSTATUSCHANGE => query_and_emit_battery(),
                 PBT_POWERSETTINGCHANGE if lparam.0 != 0 => {
                     let setting = &*(lparam.0 as *const POWERBROADCAST_SETTING);
-                    if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE {
+                    if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE && setting.DataLength >= 1
+                    {
                         match setting.Data[0] {
                             0 => emit(PowerEvent::DisplaySleep),
                             1 => emit(PowerEvent::DisplayWake),

@@ -54,9 +54,14 @@ impl TailscaleRunner for SystemTailscaleRunner {
             return Some(macos_standalone.to_path_buf());
         }
 
-        let windows_default = Path::new(r"C:\Program Files\Tailscale\tailscale.exe");
-        if windows_default.is_file() {
-            return Some(windows_default.to_path_buf());
+        for windows_cand in [
+            r"C:\Program Files\Tailscale\tailscale.exe",
+            r"C:\Program Files\Tailscale IPN\tailscale.exe",
+        ] {
+            let p = Path::new(windows_cand);
+            if p.is_file() {
+                return Some(p.to_path_buf());
+            }
         }
 
         for bin in ["tailscale", "tailscale.exe"] {
@@ -74,7 +79,13 @@ impl TailscaleRunner for SystemTailscaleRunner {
         args: &'a [&'a str],
     ) -> Pin<Box<dyn Future<Output = Result<TailscaleCmdOutput, String>> + Send + 'a>> {
         Box::pin(async move {
-            let fut = tokio::process::Command::new(cli).args(args).output();
+            let mut cmd = tokio::process::Command::new(cli);
+            #[cfg(windows)]
+            {
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let fut = cmd.args(args).output();
             let output = tokio::time::timeout(CLI_TIMEOUT, fut)
                 .await
                 .map_err(|_| format!("Tailscale CLI timed out after {}s", CLI_TIMEOUT.as_secs()))?

@@ -89,6 +89,15 @@ jobs:
           cargo +1.94.0 fmt --all -- --check
           cargo +1.94.0 clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Install FFmpeg for media & video tests
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install ffmpeg
+          else
+            choco install ffmpeg --no-progress -y
+          fi
+
       - name: Rust tests
         working-directory: .
         run: cargo test --workspace --locked

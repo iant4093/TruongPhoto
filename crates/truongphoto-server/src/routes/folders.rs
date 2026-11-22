@@ -293,9 +293,20 @@ pub async fn scan_all_folders(
 
 fn normalize_folder_path(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.len() > 1 {
-        trimmed.trim_end_matches(['/', '\\']).to_string()
+    if trimmed.len() <= 1 {
+        return trimmed.to_string();
+    }
+    let stripped = trimmed.trim_end_matches(['/', '\\']);
+    // Preserve Windows drive roots (`D:\` -> `D:\`, never drive-relative `D:`).
+    if stripped.len() == 2
+        && stripped.as_bytes()[0].is_ascii_alphabetic()
+        && stripped.as_bytes()[1] == b':'
+    {
+        return format!("{stripped}\\");
+    }
+    if stripped.is_empty() {
+        "/".to_string()
     } else {
-        trimmed.to_string()
+        stripped.to_string()
     }
 }

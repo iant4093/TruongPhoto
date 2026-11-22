@@ -375,7 +375,7 @@ describe('SetupWizardView', () => {
     expect((screen.getByLabelText('Managed Uploads Directory') as HTMLInputElement).value).toBe(
       '/data/uploads',
     );
-    fireEvent.change(screen.getByPlaceholderText('/Users/ian/Pictures'), {
+    fireEvent.change(screen.getByPlaceholderText(/Pictures/i), {
       target: { value: '/Users/ian/Pictures' },
     });
 

@@ -290,8 +290,18 @@ impl OrtRuntimeManager {
             {
                 let ep = ort::ep::DirectML::default().build();
                 hw_builder = hw_builder
+                    .with_memory_pattern(false)
+                    .map_err(|e| AiError::Ort(e.to_string()))?
+                    .with_parallel_execution(false)
+                    .map_err(|e| AiError::Ort(e.to_string()))?
                     .with_execution_providers([ep])
-                    .unwrap_or_else(|e| e.recover());
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "DirectML execution provider registration failed; falling back to CPU EP"
+                        );
+                        e.recover()
+                    });
             }
 
             match hw_builder.commit_from_file(model_path) {

@@ -43,21 +43,24 @@ function formatTierShort(tier: string | undefined): string {
   }
 }
 
+const EMPTY_JOBS: Record<string, never> = {};
+const EMPTY_FOLDERS: never[] = [];
+
 export const InspectorDrawer: React.FC<{
   open: boolean;
   closeRef: React.RefObject<HTMLButtonElement | null>;
   onClose: () => void;
 }> = ({ open, closeRef, onClose }) => {
   const user = useAppStore((s) => s.user);
-  const folders = useAppStore((s) => s.folders);
-  const systemInfo = useAppStore((s) => s.systemInfo);
-  const liveMetrics = useAppStore((s) => s.liveMetrics);
-  const powerState = useAppStore((s) => s.powerState);
-  const throttleStatus = useAppStore((s) => s.throttleStatus);
+  const folders = useAppStore((s) => (open ? s.folders : EMPTY_FOLDERS));
+  const systemInfo = useAppStore((s) => (open ? s.systemInfo : null));
+  const liveMetrics = useAppStore((s) => (open ? s.liveMetrics : null));
+  const powerState = useAppStore((s) => (open ? s.powerState : null));
+  const throttleStatus = useAppStore((s) => (open ? s.throttleStatus : null));
   const wsConnected = useAppStore((s) => s.wsConnected);
-  const activeJobs = useAppStore((s) => s.activeJobs);
-  const aiDashboard = useAppStore((s) => s.aiDashboard);
-  const selectedAssetId = useAppStore((s) => s.selectedAssetId);
+  const activeJobs = useAppStore((s) => (open ? s.activeJobs : EMPTY_JOBS));
+  const aiDashboard = useAppStore((s) => (open ? s.aiDashboard : null));
+  const selectedAssetId = useAppStore((s) => (open ? s.selectedAssetId : null));
 
   const selectAsset = useAppStore((s) => s.selectAsset);
   const refreshSystemInfo = useAppStore((s) => s.refreshSystemInfo);

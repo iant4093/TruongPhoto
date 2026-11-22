@@ -58,7 +58,7 @@ export const App: React.FC = () => {
   const lightboxAssetId = useAppStore((s) => s.lightboxAssetId);
   const chatDrawerOpen = useAppStore((s) => s.chatDrawerOpen);
   const wsConnected = useAppStore((s) => s.wsConnected);
-  const activeJobs = useAppStore((s) => s.activeJobs);
+  const activeJobCount = useAppStore((s) => Object.keys(s.activeJobs).length);
 
   const bootstrap = useAppStore((s) => s.bootstrap);
   const logout = useAppStore((s) => s.logout);
@@ -76,7 +76,6 @@ export const App: React.FC = () => {
   const showSearchOmnibar = searchActive || MEDIA_GRID_TABS.has(activeNav);
   const showUploadControl = canUpload && (searchActive || UPLOAD_TABS.has(activeNav));
   const hideWorkspaceHeader = !searchActive && activeNav === 'chat';
-  const activeJobCount = Object.keys(activeJobs).length;
 
   const [windowDragActive, setWindowDragActive] = useState(false);
   const [droppedFiles, setDroppedFiles] = useState<File[]>([]);
@@ -174,10 +173,19 @@ export const App: React.FC = () => {
   }, [setUploadModalOpen]);
 
   const macDesktop = isTauri() && nativeMacTitlebar;
+  const winDesktop = isTauri() && windowsCaption;
 
   if (bootstrapping) {
     return (
-      <div className={`auth-viewport${macDesktop ? ' native-titlebar' : ''}`} data-tauri-drag-region>
+      <div
+        className={`auth-viewport${macDesktop ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
+        data-tauri-drag-region
+      >
+        {winDesktop && (
+          <div className="windows-auth-chrome" data-tauri-drag-region>
+            <WindowsCaptionButtons />
+          </div>
+        )}
         <div className="auth-shell">
           <div className="auth-header" role="status">
             <img src="/app-icon.png" width={36} height={36} alt="" />
@@ -191,7 +199,15 @@ export const App: React.FC = () => {
 
   if (bootstrapError && !authenticated) {
     return (
-      <div className={`auth-viewport${macDesktop ? ' native-titlebar' : ''}`} data-tauri-drag-region>
+      <div
+        className={`auth-viewport${macDesktop ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
+        data-tauri-drag-region
+      >
+        {winDesktop && (
+          <div className="windows-auth-chrome" data-tauri-drag-region>
+            <WindowsCaptionButtons />
+          </div>
+        )}
         <div className="auth-shell">
           <div className="auth-header">
             <img src="/app-icon.png" width={36} height={36} alt="" />
@@ -412,9 +428,8 @@ export const App: React.FC = () => {
                   {activeJobCount > 0 ? 'Indexing…' : 'Status'}
                 </span>
               </button>
-
-              {isTauri() && windowsCaption && <WindowsCaptionButtons />}
             </div>
+            {winDesktop && <WindowsCaptionButtons />}
           </header>
         )}
 

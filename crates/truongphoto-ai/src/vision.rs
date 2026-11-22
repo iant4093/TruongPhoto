@@ -14,6 +14,7 @@ use tokenizers::Tokenizer;
 use truongphoto_core::AiTier;
 
 const SIGLIP2_MAX_SEQ_LEN: usize = 64;
+const MAX_TEXT_EMBED_CACHE_ENTRIES: usize = 128;
 
 type TagEmbeddingBank = Vec<(String, Vec<f32>)>;
 
@@ -42,6 +43,7 @@ pub struct OrtSiglip2Backend {
     ort: Arc<OrtRuntimeManager>,
     tokenizers: RwLock<HashMap<AiTier, Arc<Tokenizer>>>,
     tag_bank_cache: RwLock<HashMap<AiTier, TagEmbeddingBank>>,
+    text_embed_cache: RwLock<HashMap<(AiTier, String), Vec<f32>>>,
 }
 
 impl std::fmt::Debug for OrtSiglip2Backend {
@@ -59,6 +61,7 @@ impl OrtSiglip2Backend {
             ort,
             tokenizers: RwLock::new(HashMap::new()),
             tag_bank_cache: RwLock::new(HashMap::new()),
+            text_embed_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -245,8 +248,13 @@ impl VisionBackend for OrtSiglip2Backend {
     }
 
     fn embed_text(&self, tier: AiTier, query: &str) -> Result<Vec<f32>, AiError> {
-        let tokenizer = self.get_or_load_tokenizer(tier)?;
         let normalized_query = query.trim().to_lowercase();
+        let cache_key = (tier, normalized_query.clone());
+        if let Some(cached) = self.text_embed_cache.read().get(&cache_key) {
+            return Ok(cached.clone());
+        }
+
+        let tokenizer = self.get_or_load_tokenizer(tier)?;
         let encoding = tokenizer
             .encode(normalized_query, true)
             .map_err(|e| AiError::Tokenizer(e.to_string()))?;
@@ -267,28 +275,36 @@ impl VisionBackend for OrtSiglip2Backend {
         let shape = [1usize, SIGLIP2_MAX_SEQ_LEN];
         let dim = tier.dim();
 
-        self.ort
-            .with_session(SessionKey::VisionText(tier), &model_path, |session| {
-                let tensor = TensorRef::from_array_view((&shape[..], input_ids.as_slice()))
-                    .map_err(|e| AiError::Ort(e.to_string()))?;
-                let outputs = session
-                    .run(ort::inputs!["input_ids" => tensor])
-                    .map_err(|e| AiError::Ort(e.to_string()))?;
-                let value = outputs
-                    .get("pooler_output")
-                    .or_else(|| outputs.get("text_embeds"))
-                    .unwrap_or(&outputs[0]);
-                let (_out_shape, data) = value
-                    .try_extract_tensor::<f32>()
-                    .map_err(|e| AiError::Ort(e.to_string()))?;
-                if data.len() < dim {
-                    return Err(AiError::Ort(format!(
-                        "text output too short: expected >= {dim}, got {}",
-                        data.len()
-                    )));
-                }
-                Ok(l2_normalize(&data[..dim]))
-            })
+        let vec_out =
+            self.ort
+                .with_session(SessionKey::VisionText(tier), &model_path, |session| {
+                    let tensor = TensorRef::from_array_view((&shape[..], input_ids.as_slice()))
+                        .map_err(|e| AiError::Ort(e.to_string()))?;
+                    let outputs = session
+                        .run(ort::inputs!["input_ids" => tensor])
+                        .map_err(|e| AiError::Ort(e.to_string()))?;
+                    let value = outputs
+                        .get("pooler_output")
+                        .or_else(|| outputs.get("text_embeds"))
+                        .unwrap_or(&outputs[0]);
+                    let (_out_shape, data) = value
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| AiError::Ort(e.to_string()))?;
+                    if data.len() < dim {
+                        return Err(AiError::Ort(format!(
+                            "text output too short: expected >= {dim}, got {}",
+                            data.len()
+                        )));
+                    }
+                    Ok(l2_normalize(&data[..dim]))
+                })?;
+
+        let mut cache = self.text_embed_cache.write();
+        if cache.len() >= MAX_TEXT_EMBED_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(cache_key, vec_out.clone());
+        Ok(vec_out)
     }
 
     fn score_zero_shot_tags(

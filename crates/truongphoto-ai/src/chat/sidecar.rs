@@ -6,7 +6,7 @@ use crate::chat::{
 };
 use crate::models::{find_model_spec, model_dir};
 use crate::AiError;
-use chrono::{Datelike, NaiveDate};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use truongphoto_core::{ChatRole, ChatTier, RouterPlan};
 
@@ -107,7 +108,18 @@ impl SidecarLlamaRouter {
         }
 
         let port = pick_ephemeral_port()?;
+        let ctx_size = if mmproj_path.is_some() {
+            "8192"
+        } else {
+            "4096"
+        };
         let mut cmd = Command::new(&bin_path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         cmd.arg("-m")
             .arg(&gguf_path)
             .arg("--host")
@@ -117,7 +129,16 @@ impl SidecarLlamaRouter {
             .arg("--reasoning-budget")
             .arg("0")
             .arg("-c")
-            .arg("4096")
+            .arg(ctx_size)
+            .arg("-np")
+            .arg("1")
+            .arg("--cache-reuse")
+            .arg("256")
+            .arg("-fa")
+            .arg("on")
+            .arg("-ngl")
+            .arg("99")
+            .arg("--no-webui")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -192,6 +213,9 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         let payload = json!({
             "model": tier.chat_model_id().unwrap_or("gemma4"),
             "temperature": 0.0,
+            "max_tokens": 512,
+            "cache_prompt": true,
+            "id_slot": 0,
             "messages": messages,
             "response_format": {
                 "type": "json_schema",
@@ -214,7 +238,13 @@ impl ChatRouterBackend for SidecarLlamaRouter {
 
         match parse_and_validate_router_plan(&content) {
             Ok(mut parsed) => {
-                sanitize_sidecar_plan(&input.user_message, &input.prior_filters, &mut parsed);
+                sanitize_sidecar_plan(
+                    &input.user_message,
+                    &input.prior_filters,
+                    &input.library.known_folders,
+                    input.current_date_utc,
+                    &mut parsed,
+                );
                 Ok(merge_router_plan(&input.prior_filters, &parsed))
             }
             Err(err) => {
@@ -412,7 +442,11 @@ fn discover_llama_server_bin_opt(models_dir: Option<&Path>) -> Option<PathBuf> {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for cand in [dir.join(bin_name), dir.join("llama").join(bin_name)] {
+            for cand in [
+                dir.join(bin_name),
+                dir.join("llama").join(bin_name),
+                dir.join("resources").join("llama").join(bin_name),
+            ] {
                 if cand.is_file() {
                     return Some(cand);
                 }
@@ -489,8 +523,83 @@ fn shift_calendar_month(year: i32, month: u32, delta_months: i32) -> (i32, u32) 
     (y, m)
 }
 
+fn compact_prior_filters_json(prior: &RouterPlan) -> String {
+    let mut map = serde_json::Map::new();
+    if let Some(v) = &prior.semantic_query {
+        map.insert("semantic_query".into(), json!(v));
+    }
+    if let Some(v) = &prior.ocr_terms {
+        map.insert("ocr_terms".into(), json!(v));
+    }
+    if !prior.person_names.is_empty() {
+        map.insert("person_names".into(), json!(prior.person_names));
+    }
+    if let Some(v) = &prior.location_query {
+        map.insert("location_query".into(), json!(v));
+    }
+    if let Some(v) = &prior.camera_model {
+        map.insert("camera_model".into(), json!(v));
+    }
+    if let Some(v) = &prior.lens_model {
+        map.insert("lens_model".into(), json!(v));
+    }
+    if let Some(v) = prior.focal_length_min_mm {
+        map.insert("focal_length_min_mm".into(), json!(v));
+    }
+    if let Some(v) = prior.focal_length_max_mm {
+        map.insert("focal_length_max_mm".into(), json!(v));
+    }
+    if let Some(v) = prior.aperture_min_f {
+        map.insert("aperture_min_f".into(), json!(v));
+    }
+    if let Some(v) = prior.aperture_max_f {
+        map.insert("aperture_max_f".into(), json!(v));
+    }
+    if let Some(v) = prior.iso_min {
+        map.insert("iso_min".into(), json!(v));
+    }
+    if let Some(v) = prior.iso_max {
+        map.insert("iso_max".into(), json!(v));
+    }
+    if let Some(v) = prior.shutter_speed_min_sec {
+        map.insert("shutter_speed_min_sec".into(), json!(v));
+    }
+    if let Some(v) = prior.shutter_speed_max_sec {
+        map.insert("shutter_speed_max_sec".into(), json!(v));
+    }
+    if let Some(v) = &prior.orientation {
+        map.insert("orientation".into(), json!(v));
+    }
+    if let Some(v) = prior.has_people {
+        map.insert("has_people".into(), json!(v));
+    }
+    if let Some(v) = &prior.sort_by {
+        map.insert("sort_by".into(), json!(v));
+    }
+    if !prior.tags.is_empty() {
+        map.insert("tags".into(), json!(prior.tags));
+    }
+    if let Some(v) = prior.kind {
+        map.insert("kind".into(), json!(v));
+    }
+    if let Some(v) = prior.favorite {
+        map.insert("favorite".into(), json!(v));
+    }
+    if let Some(ms) = prior.date_from_ms {
+        if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
+            map.insert("date_from".into(), json!(dt.format("%Y-%m-%d").to_string()));
+        }
+    }
+    if let Some(ms) = prior.date_to_ms {
+        if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
+            map.insert("date_to".into(), json!(dt.format("%Y-%m-%d").to_string()));
+        }
+    }
+    serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".into())
+}
+
 fn build_router_system_prompt(input: &ChatTurnInput) -> String {
-    let prior_json = serde_json::to_string(&input.prior_filters).unwrap_or_else(|_| "{}".into());
+    let prior_json = compact_prior_filters_json(&input.prior_filters);
     let cur_y = input.current_date_utc.year();
     let cur_m = input.current_date_utc.month();
     let (this_m_from, this_m_to) = calendar_month_range(cur_y, cur_m);
@@ -514,53 +623,48 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
         input.known_person_names.clone()
     };
 
+    // Static instructions FIRST so llama-server reuses the KV prompt cache (>90% prefix hit) across turns!
     format!(
-        "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a strict RouterPlan JSON object.\n\
-         Library Overview (RBAC-visible to this user):\n\
-         - Current UTC date: {} (today is {})\n\
-         - Calendar month reference: \"this month\" = {} to {}; \"last month\" = {} to {}; \"two months ago\" = {} to {}\n\
-         - Total items: {} (capture date span: {})\n\
-         - Folders / Events: {:?}\n\
-         - Known RBAC-visible people (with photo counts): {:?}\n\
-         - Known camera bodies: {:?}\n\
-         - Known lenses: {:?}\n\
-         - Top tags: {:?}\n\
-         - Prior active filters JSON: {}\n\
+        "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a compact RouterPlan JSON object. ALWAYS include the 7 required keys (intent, semantic_query, person_names, location_query, clear_prior_filters, assistant_reply, follow_up_suggestions), and include optional EXIF/date/sort/camera/lens/has_people/ocr/kind/favorite keys whenever the user asks for them (omit unused optional keys for speed).\n\
+         Examples:\n\
+         - \"show me photos of Sebastian\" -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[\"Sebastian\"],\"location_query\":null,\"clear_prior_filters\":true,\"assistant_reply\":\"Here are your photos of Sebastian.\",\"follow_up_suggestions\":[\"Sebastian at Portland Zoo\",\"Wide-open portraits of Sebastian\"]}}\n\
+         - \"photos shot with 56mm f/1.4\" -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[],\"location_query\":null,\"focal_length_min_mm\":56,\"focal_length_max_mm\":56,\"aperture_min_f\":1.4,\"aperture_max_f\":1.4,\"clear_prior_filters\":true,\"assistant_reply\":\"Here are your 56mm f/1.4 shots.\",\"follow_up_suggestions\":[\"Photos at 12mm\",\"Widest aperture shots\"]}}\n\
+         - \"who are in my pics\" -> {{\"intent\":\"answer\",\"semantic_query\":null,\"person_names\":[],\"location_query\":null,\"clear_prior_filters\":true,\"assistant_reply\":\"Your library features ...\",\"follow_up_suggestions\":[\"Show me photos of ...\"]}}\n\
          Rules:\n\
          - Choose \"intent\" FIRST:\n\
-           * Set \"intent\": \"answer\" for ANY conversational message or meta-question ABOUT the library itself — e.g. \"who are in my pics\", \"who is in my photos\", \"what's in my library\", \"tell me about my photos\", \"what trips or folders do I have\", \"how many photos do I have\", \"what gear / cameras / lenses do I use\", \"when were my photos taken\", \"hi\", \"what can you do?\". Answer directly, warmly, and concretely in \"assistant_reply\" using the exact names, counts, dates, folders, and gear from Library Overview above, set clear_prior_filters=true, and leave ALL filter fields null / [] so NO search runs!\n\
-           * Set \"intent\": \"search\" whenever the user wants to view, browse, or find photos/videos (including casual or vague requests like \"show me cool pics\", \"best photos\", \"surprise me\", \"what did I shoot recently\", \"show me people\", \"graduation stuff\").\n\
+           * \"intent\": \"answer\" for ANY conversational message or meta-question ABOUT the library itself (e.g. \"who are in my pics\", \"what's in my library\", \"tell me about my photos\", \"what trips or folders do I have\", \"how many photos do I have\", \"what gear do I use\", \"when were my photos taken\", \"hi\", \"what can you do?\"). Answer concretely in \"assistant_reply\" using the exact names, counts, dates, folders, and gear in Library Overview below, set clear_prior_filters=true, and omit ALL filter keys so NO search runs.\n\
+           * \"intent\": \"search\" whenever the user wants to view, browse, or find photos/videos.\n\
          - Vague & exploratory photo requests (intent=\"search\"):\n\
-           * For subjective or open browsing requests (\"cool pics\", \"best photos\", \"something interesting\", \"surprise me\", \"good shots\"), set \"semantic_query\": null, \"has_people\": null, and \"sort_by\": \"aperture_asc\" (or \"capture_desc\" for \"recent\", \"latest\", \"what did I shoot recently\", \"everything\", \"my photos\"). For concrete visual subjects (\"animals\", \"nature\", \"mountain\", \"graduation\"), leave \"sort_by\": null and \"has_people\": null! NEVER put subjective filler words (\"cool\", \"nice\", \"best\", \"good\", \"awesome\", \"interesting\", \"random\", \"stuff\", \"pics\", \"photos\") into \"semantic_query\"!\n\
-           * For broad people requests without a specific name (\"show me people\", \"show me my friends\", \"pics with people\"), set \"has_people\": true, \"person_names\": [], \"semantic_query\": null, \"sort_by\": null.\n\
-           * When the user casually references an event or trip from Folders/Events (e.g. \"graduation stuff\", \"zoo pics\", \"bald mountain\"), put a clean proper place name into \"location_query\" (e.g. \"Portland Zoo\", \"Bald Mountain\", \"Multnomah Falls\") OR a clean single visual concept into \"semantic_query\" (e.g. \"graduation\", \"animals\").\n\
-         - Put ONLY positive visual subjects, animals, objects, scenes, or moods into \"semantic_query\" (e.g. \"waterfall in forest\", \"ape or monkey behind a fence\", \"mountain\", \"Eiffel Tower\", \"mountain sunrise\"). NEVER put negations like \"not graduation\" or \"without people\" into \"semantic_query\", and NEVER put generic terrain like \"mountain\", \"beach\", \"forest\", \"lake\", \"waterfall\", \"sunset\" into \"location_query\"! Do NOT put technical EXIF adjectives (\"low light\", \"high ISO\", \"crisp\", \"sharp\", \"wide open\", \"telephoto\") into \"semantic_query\" when filtering by EXIF numbers.\n\
-         - Reserve \"location_query\" strictly for proper named places, cities, countries, parks, zoos, or specific landmarks (e.g. \"Multnomah Falls\", \"Portland Zoo\", \"Mount Saint Helens\", \"Bald Mountain\", \"Tokyo\", \"Antarctica\"). When filtering by a named place, leave \"semantic_query\": null UNLESS they also asked for a specific visual subject there (e.g. \"monkeys at Portland Zoo\" -> location_query: \"Portland Zoo\", semantic_query: \"monkey\").\n\
-         - Put specific words/phrases that literally appear inside an image (e.g. \"receipt saying Target\", \"sign with Oregon\") into \"ocr_terms\". If the user asks generally for \"photos with signs or readable text\" without specifying a word, put \"sign or banner with readable text\" into \"semantic_query\" and leave \"ocr_terms\": null.\n\
-         - Match named people (including typos/first names) against Known RBAC-visible people into \"person_names\". NEVER put all people into \"person_names\" unless the user explicitly asked for a group photo containing all of them. For \"without people\" / \"no people\" / \"empty landscapes\", set \"has_people\": false (and leave \"person_names\": []).\n\
-         - Superlatives & sorting (\"sort_by\"): NEVER leave all filters and sort_by null for superlative requests!\n\
-           * \"widest angle / widest shots\" -> sort_by: \"focal_asc\" (leave semantic_query null unless a subject was also asked).\n\
-           * \"most zoomed in / longest focal length / telephoto extremes\" -> sort_by: \"focal_desc\".\n\
-           * \"highest ISO / grainiest / most sensitive\" -> sort_by: \"iso_desc\".\n\
-           * \"widest aperture / shallowest depth of field\" -> sort_by: \"aperture_asc\".\n\
-           * \"fastest shutter speed\" -> sort_by: \"shutter_asc\".\n\
-           * \"longest exposure / slowest shutter\" -> sort_by: \"shutter_desc\".\n\
-           * \"oldest photos\" -> sort_by: \"capture_asc\"; \"newest / most recent\" -> sort_by: \"capture_desc\".\n\
-         - Camera, Orientation & EXIF fields (NEVER invent EXIF or orientation filters unless the user explicitly mentioned them; NEVER put focal length/lens/aperture/ISO/shutter into \"camera_model\"; framing words like \"close up\" are NOT apertures):\n\
-           * \"camera_model\": camera body only (match Known camera bodies, e.g. \"Canon R7\" / \"cannon r7\" -> \"Canon EOS R7\").\n\
-           * \"lens_model\": lens name only (match Known lenses, e.g. \"17-40 Art\" -> \"17-40mm F1.8 DC | Art 025\", \"100-400\" -> \"RF100-400mm F5.6-8 IS USM\").\n\
-           * \"focal_length_min_mm\" / \"focal_length_max_mm\": numeric mm range. For an EXACT focal length like \"at 12mm\" or \"56mm shots\", set BOTH min AND max to that exact number (e.g. \"12mm\" -> min: 12, max: 12). For bounds: \"under 15mm\" -> max: 15 (min: null); \"over 300mm\" -> min: 300 (max: null).\n\
-           * \"aperture_min_f\" / \"aperture_max_f\": numeric f-stop range. For an EXACT f-stop like \"f/1.4\" or \"f/8\", set BOTH min AND max to that exact number. For \"wide open / bokeh / shallow depth of field\" WITHOUT a specific f-stop number, set aperture_min_f: null AND aperture_max_f: 2.0 (NEVER set min=2.0, max=2.0!). For \"f/8 or narrower\" -> min: 8.0, max: null.\n\
-           * \"iso_min\" / \"iso_max\": integer ISO range (exact \"ISO 100\" -> min: 100, max: 100; \"above 3200 / ISO 3200+\" -> min: 3200, max: null).\n\
-           * \"shutter_speed_min_sec\" / \"shutter_speed_max_sec\": decimal seconds! Faster shutter = SMALLER number (\"1/1000s or faster\" -> shutter_speed_min_sec: null, shutter_speed_max_sec: 0.001). Slower / long exposure = LARGER number (\"long exposure / slow shutter / silky water\" -> shutter_speed_min_sec: 0.05, shutter_speed_max_sec: null — NEVER set max=0.05!).\n\
-           * \"orientation\": \"portrait\" (for vertical / tall / phone wallpaper), \"landscape\" (for horizontal / desktop wallpaper), \"square\", or null.\n\
-         - For dates, months, or years, output ISO strings in \"date_from\" and \"date_to\" (format \"YYYY-MM-DD\"). Use full calendar months for \"this month\", \"last month\", and \"two months ago\" matching the Calendar month reference above! Leave both null if no date was mentioned.\n\
-         - Leave \"tags\": [] UNLESS the user explicitly asks for a tag (e.g. \"tagged X\" or \"#X\"). Never invent speculative tags.\n\
-         - Leave \"kind\": null unless the user explicitly asks for only photos, only videos, raw files, or live photos.\n\
-         - Set clear_prior_filters=true when the user starts over, switches topic, or asks to remove a prior filter (re-emit the remaining filters you want to keep); set false when narrowing the previous search.\n\
-         - Write a crisp, natural \"assistant_reply\" in active voice (1–2 sentences for informational answers, 1 sentence for searches). Avoid repeating boilerplate.\n\
-         - Provide 2-3 short, varied \"follow_up_suggestions\" grounded in the actual people, folders, or subjects in Library Overview. Never invent file paths or extra JSON keys.",
-        input.current_date_utc.to_rfc3339(),
+           * For subjective or open browsing requests (\"cool pics\", \"best photos\", \"something interesting\", \"surprise me\", \"good shots\"), omit \"semantic_query\" and \"has_people\", and set \"sort_by\": \"aperture_asc\" (or \"capture_desc\" for \"recent\", \"latest\", \"what did I shoot recently\", \"everything\", \"my photos\"). For concrete visual subjects (\"animals\", \"nature\", \"mountain\"), omit \"sort_by\" and \"has_people\". NEVER put subjective filler words (\"cool\", \"nice\", \"best\", \"good\", \"awesome\", \"interesting\", \"random\", \"stuff\", \"pics\", \"photos\") into \"semantic_query\".\n\
+           * For broad people requests without a specific name (\"show me people\", \"show me my friends\", \"pics with people\"), set \"has_people\": true and omit \"person_names\", \"semantic_query\", and \"sort_by\".\n\
+         - Folders, Events & Named Places (\"location_query\"):\n\
+           * \"location_query\" matches BOTH GPS places AND folder/event collection names! Check Folders / Events in Library Overview: if the user asks for a trip, folder, or event (e.g. \"graduation stuff\" -> \"CS Grad Pics 2026\", \"zoo pics\" -> \"Portland Zoo\", \"Misty\" -> \"Misty\", \"bald mountain\" -> \"Bald Mountain\", \"multnomah falls\" -> \"Multnomah Falls\"), put that matching folder/place name into \"location_query\" and omit \"semantic_query\" UNLESS they also asked for a specific visual subject inside it (e.g. \"monkeys at Portland Zoo\" -> location_query: \"Portland Zoo\", semantic_query: \"monkey\").\n\
+           * NEVER put generic terrain (\"mountain\", \"beach\", \"forest\", \"lake\", \"waterfall\", \"sunset\") into \"location_query\" unless it matches a named place/folder.\n\
+         - Visual subjects (\"semantic_query\"): Put ONLY positive visual subjects, animals, objects, scenes, or moods (e.g. \"waterfall in forest\", \"monkey behind a fence\", \"mountain sunrise\", \"Eiffel Tower\"). NEVER put negations (\"not graduation\", \"without people\") or EXIF adjectives (\"high ISO\", \"wide open\", \"telephoto\") into \"semantic_query\".\n\
+         - Text in images (\"ocr_terms\"): Put specific literal words/phrases inside an image (e.g. \"receipt saying Target\" -> \"Target\"). For general \"photos with signs or readable text\", put \"sign or banner with readable text\" in \"semantic_query\".\n\
+         - People: Match named people (including typos/first names) against Known RBAC-visible people into \"person_names\". NEVER list all people in \"person_names\" unless asked for a group photo of all of them. For \"without people\" / \"no people\" / \"empty landscapes\", set \"has_people\": false.\n\
+         - Superlatives & sorting (\"sort_by\"): \"widest angle\" -> \"focal_asc\"; \"most zoomed in / longest focal\" -> \"focal_desc\"; \"highest ISO\" -> \"iso_desc\"; \"widest aperture\" -> \"aperture_asc\"; \"fastest shutter\" -> \"shutter_asc\"; \"longest exposure / slowest shutter\" -> \"shutter_desc\"; \"oldest\" -> \"capture_asc\"; \"newest / most recent\" -> \"capture_desc\".\n\
+         - Camera, Orientation & EXIF (ONLY include when explicitly mentioned; NEVER put focal/lens/aperture/ISO/shutter into \"camera_model\"; \"close up\" is NOT an aperture):\n\
+           * \"camera_model\": body only (match Known camera bodies, e.g. \"Canon R7\" -> \"Canon EOS R7\").\n\
+           * \"lens_model\": lens only (match Known lenses, e.g. \"17-40 Art\" -> \"17-40mm F1.8 DC | Art 025\").\n\
+           * \"focal_length_min_mm\" / \"focal_length_max_mm\": exact \"12mm\" -> both 12; \"under 15mm\" -> max 15; \"over 300mm\" -> min 300.\n\
+           * \"aperture_min_f\" / \"aperture_max_f\": exact \"f/1.4\" -> both 1.4; \"wide open / bokeh / shallow\" without a number -> max 2.0 only; \"f/8 or narrower\" -> min 8.0 only.\n\
+           * \"iso_min\" / \"iso_max\": exact \"ISO 100\" -> both 100; \"ISO 3200+\" -> min 3200.\n\
+           * \"shutter_speed_min_sec\" / \"shutter_speed_max_sec\": decimal seconds! Faster = smaller (\"1/1000s or faster\" -> max 0.001); slower/long exposure = larger (\"long exposure / silky water\" -> min 0.05 only).\n\
+           * \"orientation\": \"portrait\" (vertical/tall/phone wallpaper), \"landscape\" (horizontal/desktop wallpaper), or \"square\".\n\
+         - Dates: output ISO \"date_from\" / \"date_to\" (\"YYYY-MM-DD\"). Use Calendar month reference for \"this month\", \"last month\", \"two months ago\"; open-ended bounds like \"before October\" -> date_to only, \"after September\" -> date_from only; standalone month like \"in June\" -> that month in the current/most recent year.\n\
+         - Omit \"tags\" unless user explicitly asks for a tag (\"tagged X\" / \"#X\"). Omit \"kind\" unless explicitly asking for only photos/videos/raw/live photos.\n\
+         - Set clear_prior_filters=true when switching topic, starting over, or removing a prior filter (re-emit the remaining filters you want to keep); set false when narrowing prior active filters.\n\
+         - Write a crisp, natural \"assistant_reply\" (1–2 sentences for answers, 1 sentence for searches) and 2–3 short grounded \"follow_up_suggestions\". Never invent file paths or extra JSON keys.\n\
+         Library Overview (RBAC-visible):\n\
+         - Today (UTC): {} | \"this month\": {}..{} | \"last month\": {}..{} | \"two months ago\": {}..{}\n\
+         - Total items: {} (capture span: {})\n\
+         - Folders / Events: {:?}\n\
+         - People (photo counts): {:?}\n\
+         - Cameras: {:?}\n\
+         - Lenses: {:?}\n\
+         - Top tags: {:?}\n\
+         - Prior active filters: {}",
         input.current_date_utc.format("%Y-%m-%d"),
         this_m_from,
         this_m_to,
@@ -697,19 +801,192 @@ fn strip_semantic_filler(raw: &str) -> Option<String> {
     }
 }
 
-/// Deterministic post-parse safety net for small local LLMs:
-/// 1. Routes informational/meta-questions about the library cleanly to `intent = "answer"` with
-///    all search filters cleared so they never trigger impossible multi-person AND queries.
-/// 2. Strips hallucinated EXIF/orientation bounds when the user never asked about them
-///    (while preserving filters carried forward from `prior` on filter-removal turns).
-/// 3. Fixes common small-LLM exact-equality slips on open-ended bounds ("wide open" -> `<= 2.0`,
-///    "long exposure" -> `>= 0.05s`) and completes one-sided exact EXIF bounds ("at 12mm" -> `12..12`).
-/// 4. Cleans subjective filler words from `semantic_query` and rescues vague exploratory queries
-///    ("cool pics", "best photos", "surprise me", "what did I shoot recently?", "show me people")
-///    so they always return meaningful results.
-fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut RouterPlan) {
+/// Word-boundary check on an already-lowercased string so short tokens like `"mm"`, `"sec"`,
+/// `"top"`, `"nice"`, `"cool"`, or `"tall"` never match inside `"summer"`, `"second"`, `"rooftop"`,
+/// `"Venice"`, `"school"`, or `"install"`.
+fn has_word(lower: &str, word: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(word) {
+        let start = from + rel;
+        let end = start + word.len();
+        let left_ok = lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let right_ok = lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Checks whether a lowercase string contains a numeric measurement with unit suffix like `12mm`, `50mm`, `0.5s`, `2sec`.
+fn has_numeric_unit(lower: &str, suffix: &str) -> bool {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+        .any(|tok| {
+            tok.strip_suffix(suffix).is_some_and(|num| {
+                !num.is_empty()
+                    && num.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    && num.chars().any(|c| c.is_ascii_digit())
+            })
+        })
+}
+
+/// Deterministic single-filter removal for turns like `"remove the location filter"`,
+/// `"remove the Location: Portland Zoo filter"`, or `"drop the date filter"`.
+fn try_apply_filter_removal(lower: &str, prior: &RouterPlan, plan: &mut RouterPlan) -> bool {
+    let is_removal = lower.contains("remove the")
+        || lower.contains("remove filter")
+        || lower.contains("drop the")
+        || lower.contains("clear the");
+    if !is_removal || !plan_has_any_criteria(prior) {
+        return false;
+    }
+
+    let mut updated = prior.clone();
+    updated.intent = Some("search".to_string());
+    updated.clear_prior_filters = true;
+    updated.assistant_reply = plan.assistant_reply.clone();
+    updated.follow_up_suggestions = plan.follow_up_suggestions.clone();
+
+    let mut removed_any = false;
+    if lower.contains("location") || lower.contains("place") || lower.contains("folder") {
+        updated.location_query = None;
+        removed_any = true;
+    }
+    if lower.contains("person") || lower.contains("people") {
+        updated.person_names.clear();
+        updated.has_people = None;
+        removed_any = true;
+    }
+    if lower.contains("date") || lower.contains("month") || lower.contains("year") {
+        updated.date_from_ms = None;
+        updated.date_to_ms = None;
+        removed_any = true;
+    }
+    if lower.contains("camera") {
+        updated.camera_model = None;
+        removed_any = true;
+    }
+    if lower.contains("lens") {
+        updated.lens_model = None;
+        removed_any = true;
+    }
+    if lower.contains("focal") || has_word(lower, "mm") {
+        updated.focal_length_min_mm = None;
+        updated.focal_length_max_mm = None;
+        removed_any = true;
+    }
+    if lower.contains("aperture") || lower.contains("f/") {
+        updated.aperture_min_f = None;
+        updated.aperture_max_f = None;
+        removed_any = true;
+    }
+    if has_word(lower, "iso") {
+        updated.iso_min = None;
+        updated.iso_max = None;
+        removed_any = true;
+    }
+    if lower.contains("shutter") || lower.contains("exposure") {
+        updated.shutter_speed_min_sec = None;
+        updated.shutter_speed_max_sec = None;
+        removed_any = true;
+    }
+    if lower.contains("orientation") || lower.contains("portrait") || lower.contains("landscape") {
+        updated.orientation = None;
+        removed_any = true;
+    }
+    if lower.contains("sort") {
+        updated.sort_by = None;
+        removed_any = true;
+    }
+    if lower.contains("tag") {
+        updated.tags.clear();
+        removed_any = true;
+    }
+    if lower.contains("kind") || lower.contains("video") {
+        updated.kind = None;
+        removed_any = true;
+    }
+    if lower.contains("favorite") || lower.contains("favourite") {
+        updated.favorite = None;
+        removed_any = true;
+    }
+    if lower.contains("ocr") || lower.contains("text") {
+        updated.ocr_terms = None;
+        removed_any = true;
+    }
+
+    if removed_any {
+        *plan = updated;
+        true
+    } else {
+        false
+    }
+}
+
+/// Strips count suffix `"CS Grad Pics 2026 (236)"` -> `"CS Grad Pics 2026"`.
+fn strip_folder_count(entry: &str) -> &str {
+    entry
+        .rsplit_once(" (")
+        .map(|(name, _)| name.trim())
+        .unwrap_or_else(|| entry.trim())
+}
+
+fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64)> {
+    let today = now_utc.date_naive();
+    let y = today.year();
+    let m = today.month();
+    let (start, end) = if has_word(lower, "summer") {
+        let sy = if m >= 6 { y } else { y - 1 };
+        (
+            NaiveDate::from_ymd_opt(sy, 6, 1)?,
+            NaiveDate::from_ymd_opt(sy, 8, 31)?,
+        )
+    } else if has_word(lower, "spring") {
+        let sy = if m >= 3 { y } else { y - 1 };
+        (
+            NaiveDate::from_ymd_opt(sy, 3, 1)?,
+            NaiveDate::from_ymd_opt(sy, 5, 31)?,
+        )
+    } else if has_word(lower, "fall") || has_word(lower, "autumn") {
+        let sy = if m >= 9 { y } else { y - 1 };
+        (
+            NaiveDate::from_ymd_opt(sy, 9, 1)?,
+            NaiveDate::from_ymd_opt(sy, 11, 30)?,
+        )
+    } else if has_word(lower, "winter") {
+        let end_y = if m >= 3 { y } else { y - 1 };
+        let feb_last = NaiveDate::from_ymd_opt(end_y, 3, 1)?.pred_opt()?;
+        (NaiveDate::from_ymd_opt(end_y - 1, 12, 1)?, feb_last)
+    } else {
+        return None;
+    };
+    let s_dt = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0)?);
+    let e_dt = Utc.from_utc_datetime(&end.and_hms_milli_opt(23, 59, 59, 999)?);
+    Some((s_dt.timestamp_millis(), e_dt.timestamp_millis()))
+}
+
+fn sanitize_sidecar_plan(
+    user_message: &str,
+    prior: &RouterPlan,
+    known_folders: &[String],
+    now_utc: DateTime<Utc>,
+    plan: &mut RouterPlan,
+) {
     let lower = user_message.trim().to_ascii_lowercase();
     let trimmed_punct = lower.trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace());
+
+    // 0. Deterministic single-filter removal ("remove the location filter", clickable chip removal).
+    if try_apply_filter_removal(&lower, prior, plan) {
+        return;
+    }
 
     // 1. Broad informational / meta-question guard.
     let is_explicit_show_search = [
@@ -798,7 +1075,9 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
             .iter()
             .any(|kw| lower.contains(kw)));
 
-    if is_meta_info_question || plan.intent.as_deref() == Some("answer") {
+    if is_meta_info_question
+        || (plan.intent.as_deref() == Some("answer") && !is_explicit_show_search)
+    {
         plan.intent = Some("answer".to_string());
         clear_all_search_filters(plan);
         plan.clear_prior_filters = true;
@@ -806,6 +1085,31 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
     }
 
     plan.intent = Some("search".to_string());
+
+    // Strip speculative tags when the user never asked for a tag ("tagged X" / "#X").
+    // If a stripped tag matches a known folder or was the only subject cue (e.g. "highest ISO zoo photos"
+    // -> tags: ["zoo"]), promote it to `location_query` so the search succeeds instead of returning 0 hits!
+    let has_explicit_tag_cue = has_word(&lower, "tag")
+        || has_word(&lower, "tagged")
+        || has_word(&lower, "tags")
+        || lower.contains('#');
+    if !has_explicit_tag_cue && !plan.tags.is_empty() && prior.tags.is_empty() {
+        let dropped = std::mem::take(&mut plan.tags);
+        if plan.location_query.is_none() && plan.semantic_query.is_none() {
+            if let Some(first_tag) = dropped.first() {
+                let low_tag = first_tag.to_ascii_lowercase();
+                let folder_match = known_folders
+                    .iter()
+                    .map(|f| strip_folder_count(f))
+                    .find(|fname| fname.to_ascii_lowercase().contains(&low_tag));
+                if let Some(matched_folder) = folder_match {
+                    plan.location_query = Some(matched_folder.to_string());
+                } else {
+                    plan.semantic_query = Some(first_tag.clone());
+                }
+            }
+        }
+    }
 
     let has_lower_bound_cue = [
         "over ",
@@ -897,10 +1201,11 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
         }
     }
 
-    let has_iso_cue = lower.contains("iso")
+    let has_iso_cue = has_word(&lower, "iso")
+        || has_numeric_unit(&lower, "iso")
         || lower.contains("grain")
-        || lower.contains("noisy")
-        || lower.contains("noise");
+        || has_word(&lower, "noisy")
+        || has_word(&lower, "noise");
     let prior_had_iso = prior.iso_min.is_some() || prior.iso_max.is_some();
 
     if !has_iso_cue && !prior_had_iso {
@@ -919,9 +1224,13 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
     }
 
     let lower_no_wide_open = lower.replace("wide open", "").replace("wide-open", "");
-    let has_focal_cue = lower_no_wide_open.contains("mm")
+    let has_focal_cue = has_numeric_unit(&lower_no_wide_open, "mm")
+        || has_word(&lower_no_wide_open, "mm")
         || lower_no_wide_open.contains("focal")
-        || lower_no_wide_open.contains("wide")
+        || has_word(&lower_no_wide_open, "wide")
+        || has_word(&lower_no_wide_open, "widest")
+        || lower_no_wide_open.contains("ultrawide")
+        || lower_no_wide_open.contains("ultra-wide")
         || lower_no_wide_open.contains("telephoto")
         || lower_no_wide_open.contains("zoom")
         || lower_no_wide_open.contains("fisheye");
@@ -938,7 +1247,7 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
             }
         } else if let (None, Some(hi)) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
             if !has_upper_bound_cue
-                && !lower_no_wide_open.contains("wide")
+                && !has_word(&lower_no_wide_open, "wide")
                 && !lower_no_wide_open.contains("fisheye")
             {
                 plan.focal_length_min_mm = Some(hi);
@@ -956,7 +1265,11 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
         || has_long_exp_phrase
         || lower.contains("freeze")
         || has_explicit_shutter_frac
-        || lower.contains("sec");
+        || has_numeric_unit(&lower, "sec")
+        || has_numeric_unit(&lower, "s")
+        || has_word(&lower, "sec")
+        || has_word(&lower, "secs")
+        || has_word(&lower, "seconds");
     let prior_had_shutter =
         prior.shutter_speed_min_sec.is_some() || prior.shutter_speed_max_sec.is_some();
 
@@ -978,17 +1291,26 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
             {
                 plan.shutter_speed_max_sec = Some(v);
                 plan.shutter_speed_min_sec = None;
+            } else if has_explicit_shutter_frac && !has_lower_bound_cue {
+                // Exact shutter speed like "at 1/500s" -> tight band (min == max).
+                plan.shutter_speed_max_sec = Some(v);
+            }
+        } else if let (None, Some(v)) = (plan.shutter_speed_min_sec, plan.shutter_speed_max_sec) {
+            if has_explicit_shutter_frac && !has_upper_bound_cue && !lower.contains("faster") {
+                plan.shutter_speed_min_sec = Some(v);
             }
         }
     }
 
-    let has_orientation_cue = lower.contains("vertical")
-        || lower.contains("portrait")
-        || lower.contains("tall")
+    let has_orientation_cue = has_word(&lower, "vertical")
+        || has_word(&lower, "portrait")
+        || has_word(&lower, "portraits")
+        || has_word(&lower, "tall")
         || lower.contains("wallpaper")
-        || lower.contains("horizontal")
-        || lower.contains("landscape")
-        || lower.contains("square");
+        || has_word(&lower, "horizontal")
+        || has_word(&lower, "landscape")
+        || has_word(&lower, "landscapes")
+        || has_word(&lower, "square");
 
     if !has_orientation_cue && prior.orientation.is_none() {
         plan.orientation = None;
@@ -1025,9 +1347,9 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
     let wants_no_people = lower.contains("without people")
         || lower.contains("without any people")
         || lower.contains("no people")
-        || lower.contains("nobody")
+        || has_word(&lower, "nobody")
         || lower.contains("empty landscape")
-        || lower.contains("unpeopled")
+        || has_word(&lower, "unpeopled")
         || lower.contains("no faces")
         || lower.contains("without faces");
     if wants_no_people {
@@ -1051,19 +1373,92 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
         "surprise",
         "random",
         "highlight",
+        "highlights",
         "standout",
         "top",
         "something",
         "anything",
     ]
     .iter()
-    .any(|kw| lower.contains(kw));
+    .any(|kw| has_word(&lower, kw));
     if plan.sort_by.as_deref() == Some("aperture_asc")
         && !has_aperture_cue
         && !wants_exploratory
         && prior.sort_by.as_deref() != Some("aperture_asc")
     {
         plan.sort_by = None;
+    }
+
+    // Strip generic terrain/scene words that LLMs occasionally misplace into `location_query`
+    // (e.g. "outdoor", "mountains", "nature", "beach") and promote them to `semantic_query`.
+    const GENERIC_SCENE_LOCATIONS: &[&str] = &[
+        "outdoor",
+        "outdoors",
+        "indoor",
+        "indoors",
+        "nature",
+        "mountain",
+        "mountains",
+        "beach",
+        "beaches",
+        "forest",
+        "woods",
+        "lake",
+        "river",
+        "waterfall",
+        "waterfalls",
+        "sunset",
+        "sunrise",
+        "sky",
+        "clouds",
+        "ocean",
+        "sea",
+        "city",
+        "street",
+        "night",
+        "landscape",
+        "landscapes",
+        "park",
+        "garden",
+        "snow",
+        "winter",
+        "summer",
+        "spring",
+        "fall",
+        "autumn",
+    ];
+    if let Some(loc) = plan.location_query.as_deref() {
+        let loc_low = loc.trim().to_ascii_lowercase();
+        if GENERIC_SCENE_LOCATIONS.contains(&loc_low.as_str()) {
+            let moved = plan.location_query.take();
+            if plan.semantic_query.is_none() {
+                plan.semantic_query = match loc_low.as_str() {
+                    "outdoor" | "outdoors" => Some("outdoor nature landscape".to_string()),
+                    "indoor" | "indoors" => Some("indoor room interior".to_string()),
+                    _ => moved,
+                };
+            }
+        }
+    }
+
+    // Season date rescue: if the user asked for "summer/spring/fall/winter photos" and the LLM
+    // left dates and semantic_query empty, map cleanly to the most recent matching season range.
+    if plan.date_from_ms.is_none() && plan.date_to_ms.is_none() && !plan_has_any_criteria(plan) {
+        if let Some((from_ms, to_ms)) = season_date_range_ms(&lower, now_utc) {
+            plan.date_from_ms = Some(from_ms);
+            plan.date_to_ms = Some(to_ms);
+            plan.clear_prior_filters = true;
+            let season_name = if has_word(&lower, "summer") {
+                "summer"
+            } else if has_word(&lower, "spring") {
+                "spring"
+            } else if has_word(&lower, "fall") || has_word(&lower, "autumn") {
+                "fall"
+            } else {
+                "winter"
+            };
+            plan.assistant_reply = format!("Here are your {season_name} photos.");
+        }
     }
 
     // Strip subjective filler words ("cool", "best", "nice", "stuff", "pics") from semantic_query.
@@ -1075,10 +1470,12 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
     if !wants_no_people
         && plan.person_names.is_empty()
         && plan.has_people.is_none()
-        && (lower.contains("people")
-            || lower.contains("friends")
-            || lower.contains("everyone")
-            || lower.contains("folks"))
+        && (has_word(&lower, "people")
+            || has_word(&lower, "friends")
+            || has_word(&lower, "everyone")
+            || has_word(&lower, "folks"))
+        && !lower.contains("friends'")
+        && !lower.contains("everyone's")
     {
         plan.has_people = Some(true);
         if let Some(sq) = plan.semantic_query.as_deref() {
@@ -1132,23 +1529,46 @@ fn sanitize_sidecar_plan(user_message: &str, prior: &RouterPlan, plan: &mut Rout
     }
 }
 
+static SIDECAR_HTTP: OnceLock<Result<(tokio::runtime::Runtime, reqwest::Client), String>> =
+    OnceLock::new();
+
+fn sidecar_http_client() -> Result<&'static (tokio::runtime::Runtime, reqwest::Client), AiError> {
+    let init = SIDECAR_HTTP.get_or_init(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("tp-sidecar-http")
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(2)
+            .build()
+            .map_err(|e| format!("reqwest client: {e}"))?;
+        Ok((rt, client))
+    });
+    init.as_ref().map_err(|e| AiError::ExternalTool(e.clone()))
+}
+
 fn run_blocking_http<F, T>(fut_fn: F) -> Result<T, AiError>
 where
-    F: FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, AiError>> + Send>>
-        + Send,
-    T: Send,
+    F: FnOnce(
+            reqwest::Client,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, AiError>> + Send>>
+        + Send
+        + 'static,
+    T: Send + 'static,
 {
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| AiError::ExternalTool(format!("tokio runtime: {e}")))?;
-            rt.block_on(fut_fn())
-        })
-        .join()
-        .map_err(|_| AiError::ExternalTool("sidecar HTTP thread panicked".to_string()))?
-    })
+    let (rt, client) = sidecar_http_client()?;
+    let client_clone = client.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    rt.spawn(async move {
+        let res = fut_fn(client_clone).await;
+        let _ = tx.send(res);
+    });
+    rx.recv()
+        .map_err(|_| AiError::ExternalTool("sidecar HTTP channel closed".to_string()))?
 }
 
 fn wait_for_server_health(port: u16, child: &mut Child, timeout: Duration) -> Result<(), AiError> {
@@ -1164,15 +1584,12 @@ fn wait_for_server_health(port: u16, child: &mut Child, timeout: Duration) -> Re
             )));
         }
 
-        let ok = run_blocking_http(|| {
-            let url = url.clone();
+        let url_req = url.clone();
+        let ok = run_blocking_http(move |client| {
             Box::pin(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_millis(500))
-                    .build()
-                    .map_err(|e| AiError::ExternalTool(e.to_string()))?;
                 Ok(client
-                    .get(&url)
+                    .get(&url_req)
+                    .timeout(Duration::from_millis(500))
                     .send()
                     .await
                     .is_ok_and(|r| r.status().is_success()))
@@ -1195,13 +1612,8 @@ fn post_chat_completion(port: u16, payload: &Value) -> Result<String, AiError> {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let body = payload.clone();
 
-    run_blocking_http(|| {
+    run_blocking_http(move |client| {
         Box::pin(async move {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .map_err(|e| AiError::ExternalTool(e.to_string()))?;
-
             let resp = client
                 .post(&url)
                 .json(&body)
@@ -1265,6 +1677,10 @@ fn encode_base64(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 22, 12, 0, 0).unwrap()
+    }
+
     #[test]
     fn sanitize_routes_meta_questions_to_answer_and_clears_filters() {
         let mut plan = RouterPlan {
@@ -1273,7 +1689,13 @@ mod tests {
             has_people: Some(true),
             ..Default::default()
         };
-        sanitize_sidecar_plan("who are in my pics", &RouterPlan::default(), &mut plan);
+        sanitize_sidecar_plan(
+            "who are in my pics",
+            &RouterPlan::default(),
+            &[],
+            fixed_now(),
+            &mut plan,
+        );
         assert_eq!(plan.intent.as_deref(), Some("answer"));
         assert!(plan.person_names.is_empty());
         assert_eq!(plan.has_people, None);
@@ -1289,7 +1711,13 @@ mod tests {
             sort_by: Some("aperture_asc".to_string()),
             ..Default::default()
         };
-        sanitize_sidecar_plan("show me animals", &RouterPlan::default(), &mut plan);
+        sanitize_sidecar_plan(
+            "show me animals",
+            &RouterPlan::default(),
+            &[],
+            fixed_now(),
+            &mut plan,
+        );
         assert_eq!(plan.intent.as_deref(), Some("search"));
         assert_eq!(plan.semantic_query.as_deref(), Some("animals"));
         assert_eq!(plan.has_people, None);
@@ -1303,6 +1731,8 @@ mod tests {
         sanitize_sidecar_plan(
             "mountain photos without people",
             &RouterPlan::default(),
+            &[],
+            fixed_now(),
             &mut no_people,
         );
         assert_eq!(no_people.has_people, Some(false));
@@ -1317,6 +1747,8 @@ mod tests {
         sanitize_sidecar_plan(
             "show me cool mountain pics",
             &RouterPlan::default(),
+            &[],
+            fixed_now(),
             &mut mountain,
         );
         assert_eq!(mountain.semantic_query.as_deref(), Some("mountain"));
@@ -1325,7 +1757,13 @@ mod tests {
             semantic_query: Some("cool pics".to_string()),
             ..Default::default()
         };
-        sanitize_sidecar_plan("show me cool pics", &RouterPlan::default(), &mut cool);
+        sanitize_sidecar_plan(
+            "show me cool pics",
+            &RouterPlan::default(),
+            &[],
+            fixed_now(),
+            &mut cool,
+        );
         assert_eq!(cool.semantic_query, None);
         assert_eq!(cool.sort_by.as_deref(), Some("aperture_asc"));
 
@@ -1333,8 +1771,77 @@ mod tests {
         sanitize_sidecar_plan(
             "what did I shoot recently?",
             &RouterPlan::default(),
+            &[],
+            fixed_now(),
             &mut recent,
         );
         assert_eq!(recent.sort_by.as_deref(), Some("capture_desc"));
+    }
+
+    #[test]
+    fn sanitize_handles_single_filter_removal_and_speculative_tag_promotion() {
+        let prior = RouterPlan {
+            intent: Some("search".to_string()),
+            person_names: vec!["Sebastian".to_string()],
+            location_query: Some("Multnomah Falls".to_string()),
+            ..Default::default()
+        };
+        let mut removed = RouterPlan::default();
+        sanitize_sidecar_plan(
+            "remove the location filter",
+            &prior,
+            &[],
+            fixed_now(),
+            &mut removed,
+        );
+        assert_eq!(removed.location_query, None);
+        assert_eq!(removed.person_names, vec!["Sebastian".to_string()]);
+        assert!(removed.clear_prior_filters);
+
+        let mut zoo_tag = RouterPlan {
+            tags: vec!["zoo".to_string()],
+            sort_by: Some("iso_desc".to_string()),
+            ..Default::default()
+        };
+        let folders = vec!["Portland Zoo 6-21 (146)".to_string()];
+        sanitize_sidecar_plan(
+            "highest ISO zoo photos",
+            &RouterPlan::default(),
+            &folders,
+            fixed_now(),
+            &mut zoo_tag,
+        );
+        assert!(zoo_tag.tags.is_empty());
+        assert_eq!(zoo_tag.location_query.as_deref(), Some("Portland Zoo 6-21"));
+
+        // Generic terrain misplaced into location_query -> moved to semantic_query.
+        let mut outdoors = RouterPlan {
+            location_query: Some("outdoor".to_string()),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "show me outdoors",
+            &RouterPlan::default(),
+            &[],
+            fixed_now(),
+            &mut outdoors,
+        );
+        assert_eq!(outdoors.location_query, None);
+        assert_eq!(
+            outdoors.semantic_query.as_deref(),
+            Some("outdoor nature landscape")
+        );
+
+        // Season query rescued to date range when LLM left filters empty.
+        let mut summer = RouterPlan::default();
+        sanitize_sidecar_plan(
+            "show me summer photos",
+            &RouterPlan::default(),
+            &[],
+            fixed_now(),
+            &mut summer,
+        );
+        assert!(summer.date_from_ms.is_some());
+        assert!(summer.date_to_ms.is_some());
     }
 }

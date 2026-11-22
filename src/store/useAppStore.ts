@@ -767,15 +767,16 @@ export const useAppStore = create<AppState>((set, get) => {
               active_jobs: event.active_jobs,
               updated_at_ms: Date.now(),
             },
-            systemInfo: state.systemInfo
-              ? {
-                  ...state.systemInfo,
-                  stats: {
-                    ...state.systemInfo.stats,
-                    db_size_bytes: event.db_size_bytes,
-                  },
-                }
-              : null,
+            systemInfo:
+              state.systemInfo && state.systemInfo.stats.db_size_bytes !== event.db_size_bytes
+                ? {
+                    ...state.systemInfo,
+                    stats: {
+                      ...state.systemInfo.stats,
+                      db_size_bytes: event.db_size_bytes,
+                    },
+                  }
+                : state.systemInfo,
           }));
           break;
         case 'power_state_changed':
