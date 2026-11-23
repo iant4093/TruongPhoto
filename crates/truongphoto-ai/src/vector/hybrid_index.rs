@@ -66,6 +66,34 @@ impl HybridVectorIndex {
             None
         };
         let delta = create_rw_index(dim, 1024)?;
+        let mut delta_ids = RoaringBitmap::new();
+
+        // Replay any uncompacted non-tombstoned vectors present in `vectors.f16` that are not yet
+        // covered by the persisted `.usearch` base index so newly indexed assets survive restart
+        // even in large (>35k) libraries using the HNSW query path.
+        if let Some(ref base_idx) = base {
+            let flat_count = flat.count();
+            for id_u64 in 0..flat_count {
+                let id = id_u64 as u32;
+                if tombstones.contains(id) || base_idx.contains(id_u64) {
+                    continue;
+                }
+                if let Some(vec_f32) = flat.get_f32(id) {
+                    if vec_f32.iter().any(|&v| v != 0.0) {
+                        if delta.size() >= delta.capacity() {
+                            let next_cap = (delta.capacity().saturating_mul(2)).max(1024);
+                            delta
+                                .reserve(next_cap)
+                                .map_err(|e| AiError::VectorIndex(format!("delta reserve: {e}")))?;
+                        }
+                        delta
+                            .add(id_u64, &vec_f32)
+                            .map_err(|e| AiError::VectorIndex(format!("delta replay add: {e}")))?;
+                        delta_ids.insert(id);
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             dim,
@@ -74,7 +102,7 @@ impl HybridVectorIndex {
             flat,
             base: RwLock::new(base),
             delta: RwLock::new(delta),
-            delta_ids: RwLock::new(RoaringBitmap::new()),
+            delta_ids: RwLock::new(delta_ids),
             tombstones: RwLock::new(tombstones),
         })
     }
@@ -155,10 +183,11 @@ impl HybridVectorIndex {
                 persist_tombstones(&self.tombstone_path, &tombstones)?;
             }
         }
+        // Acquire `delta` before `delta_ids` (matching `add` and `rebuild_from_flat`) to prevent AB-BA deadlocks.
         {
+            let delta = self.delta.write();
             let mut delta_ids = self.delta_ids.write();
             if delta_ids.remove(vector_id) {
-                let delta = self.delta.write();
                 let _ = delta.remove(vector_id as u64);
             }
         }
@@ -236,25 +265,9 @@ impl HybridVectorIndex {
         {
             let mut base_guard = self.base.write();
             *base_guard = None;
-            let mut rename_err = None;
-            let attempts = if cfg!(windows) { 5 } else { 1 };
-            for attempt in 0..attempts {
-                match std::fs::rename(&tmp_path, &self.base_path) {
-                    Ok(()) => {
-                        rename_err = None;
-                        break;
-                    }
-                    Err(e) => {
-                        rename_err = Some(e);
-                        if attempt + 1 < attempts {
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                40 * (attempt as u64 + 1),
-                            ));
-                        }
-                    }
-                }
-            }
-            if let Some(e) = rename_err {
+            if let Err(e) =
+                truongphoto_core::process::rename_with_windows_retry(&tmp_path, &self.base_path)
+            {
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err(e.into());
             }
@@ -448,6 +461,9 @@ fn persist_tombstones(path: &Path, tombstones: &RoaringBitmap) -> Result<(), AiE
         use std::io::Write;
         writer.flush()?;
     }
-    std::fs::rename(&tmp_path, path)?;
+    if let Err(e) = truongphoto_core::process::rename_with_windows_retry(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
     Ok(())
 }

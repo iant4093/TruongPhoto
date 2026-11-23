@@ -266,11 +266,13 @@ describe('Lightbox', () => {
     expect(rawBtn).toBeTruthy();
     expect(livePill).toBeTruthy();
 
-    // Verify switching to RAW 100% requests mode=raw_demosaic
+    // Verify switching to RAW 100% keeps base preview mounted (zero flash) while loading mode=raw_demosaic overlay
     const img = screen.getByAltText('Tokyo Dusk') as HTMLImageElement;
     expect(img.getAttribute('src')).toContain('/api/media/asset-raw-live/preview');
     fireEvent.click(rawBtn);
-    expect(img.getAttribute('src')).toContain('/api/media/asset-raw-live/original?mode=raw_demosaic');
+    const rawOverlay = await screen.findByTestId('lightbox-hires-layer');
+    expect(rawOverlay.getAttribute('src')).toContain('/api/media/asset-raw-live/original?mode=raw_demosaic');
+    expect(img.getAttribute('src')).toContain('/api/media/asset-raw-live/preview');
 
     // Toggle Info drawer open and verify Histogram SVG mounts
     fireEvent.click(screen.getByRole('button', { name: 'Toggle info' }));

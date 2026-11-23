@@ -90,14 +90,18 @@ export const AlbumsView: React.FC = () => {
   const listSeqRef = useRef(0);
   const detailSeqRef = useRef(0);
   const shareSeqRef = useRef(0);
+  const hasLoadedOnceRef = useRef(false);
 
   const loadList = useCallback(async () => {
     const seq = ++listSeqRef.current;
-    setLoading(true);
+    if (!hasLoadedOnceRef.current) {
+      setLoading(true);
+    }
     setError(null);
     try {
       const res = await listAlbums();
       if (seq !== listSeqRef.current) return;
+      hasLoadedOnceRef.current = true;
       setItems(res.items);
     } catch (err) {
       if (seq !== listSeqRef.current) return;

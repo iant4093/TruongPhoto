@@ -199,7 +199,8 @@ pub async fn get_pmtiles_tile(
         .await?;
 
     let pmtiles_dir = resolve_pmtiles_dir(&state, &settings);
-    let tile_path = pmtiles_dir.join(&name);
+    let tile_path = crate::ingest::cache_mgr::safe_join_no_symlinks(&pmtiles_dir, &name)
+        .ok_or_else(|| AppError::not_found("PMTiles archive not found."))?;
 
     let meta = tokio::fs::metadata(&tile_path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {

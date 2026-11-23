@@ -71,7 +71,10 @@ fn backup_blocking(db_path: &Path, backup_dir: &Path, keep_count: usize) -> DbRe
         }
     };
 
-    std::fs::rename(&tmp_path, &final_path)?;
+    if let Err(err) = truongphoto_core::process::rename_with_windows_retry(&tmp_path, &final_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(DbError::Io(err));
+    }
 
     let pruned_files = prune_old_backups(backup_dir, keep_count.max(1))?;
 

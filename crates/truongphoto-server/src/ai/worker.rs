@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::ingest::cache_mgr::safe_join_relative;
+use crate::ingest::cache_mgr::safe_join_no_symlinks;
 use crate::state::AppState;
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -55,7 +55,7 @@ fn resolve_source_path(folder: &FolderRecord, file: &AssetFileView) -> Option<Pa
     if folder.is_offline || file.is_missing {
         return None;
     }
-    let full = safe_join_relative(Path::new(&folder.root_path), &file.rel_path)?;
+    let full = safe_join_no_symlinks(Path::new(&folder.root_path), &file.rel_path)?;
     if full.is_file() {
         Some(full)
     } else {
@@ -105,8 +105,7 @@ fn sample_video_keyframes_fps_mode(
 
     let mut cmd = std::process::Command::new(&ffmpeg);
     truongphoto_media::video::hide_console_window(&mut cmd);
-    let output = cmd
-        .args(["-hide_banner", "-loglevel", "info", "-i"])
+    cmd.args(["-hide_banner", "-loglevel", "info", "-i"])
         .arg(video_path)
         .args([
             "-vf",
@@ -116,9 +115,10 @@ fn sample_video_keyframes_fps_mode(
             "-frames:v",
         ])
         .arg(max_frames.to_string())
-        .arg(&pattern)
-        .output()
-        .map_err(|e| e.to_string())?;
+        .arg(&pattern);
+    let output =
+        truongphoto_core::process::run_command_with_timeout(&mut cmd, Duration::from_secs(300))
+            .map_err(|e| e.to_string())?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -501,6 +501,14 @@ async fn process_staging_tier_batch(
         .await?;
 
     if remaining == 0 {
+        // Persist/compact the staging HNSW base index before cutting over so the new active tier
+        // immediately survives restarts and serves HNSW queries cleanly.
+        if let Ok(staging_idx) = state.ai.vision_index(staging_tier) {
+            if staging_idx.delta_len() > 0 {
+                let idx_compact = Arc::clone(&staging_idx);
+                let _ = tokio::task::spawn_blocking(move || idx_compact.compact_and_swap()).await;
+            }
+        }
         let now_ms = Utc::now().timestamp_millis();
         let updated = state
             .db
@@ -583,17 +591,22 @@ async fn process_active_stage2_batch(
         }
 
         let aid_lookup = asset_id.clone();
-        let (asset_opt, has_existing_faces) = state
+        let (asset_opt, has_existing_faces, has_existing_ocr) = state
             .db
             .read(move |conn| {
                 let asset =
                     repo::assets::get_asset_with_files(conn, &RbacScope::AdminAll, &aid_lookup)?;
                 let face_count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM faces WHERE asset_id = ?1",
-                    truongphoto_db::rusqlite::params![aid_lookup],
+                    truongphoto_db::rusqlite::params![&aid_lookup],
                     |row| row.get(0),
                 )?;
-                Ok((asset, face_count > 0))
+                let ocr_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM ocr_documents WHERE asset_id = ?1",
+                    truongphoto_db::rusqlite::params![&aid_lookup],
+                    |row| row.get(0),
+                )?;
+                Ok((asset, face_count > 0, ocr_count > 0))
             })
             .await?;
 
@@ -669,13 +682,17 @@ async fn process_active_stage2_batch(
                     }
                 };
 
-                let ocr = match pipe.ocr.recognize(primary_img) {
-                    Ok(res) if res.full_text.trim().chars().count() >= 2 => Some(res),
-                    Ok(_) => None,
-                    Err(e) if is_unavailable_engine_err(&e) => None,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "OCR skipped for asset");
-                        None
+                let ocr = if has_existing_ocr {
+                    None
+                } else {
+                    match pipe.ocr.recognize(primary_img) {
+                        Ok(res) if res.full_text.trim().chars().count() >= 2 => Some(res),
+                        Ok(_) => None,
+                        Err(e) if is_unavailable_engine_err(&e) => None,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "OCR skipped for asset");
+                            None
+                        }
                     }
                 };
 

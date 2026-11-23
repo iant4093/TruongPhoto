@@ -253,7 +253,12 @@ fn should_ignore_watch_path(root: &Path, path: &Path) -> bool {
             return false;
         }
     } else {
-        path
+        // When `path` was just deleted, `canonicalize` fails; inspect ONLY the basename so
+        // hidden ancestor directories outside `root` (e.g. `~/.config/...`) never suppress rescans.
+        return path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_ignored_entry);
     };
     for comp in rel.components() {
         if let std::path::Component::Normal(s) = comp {

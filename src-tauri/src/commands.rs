@@ -102,3 +102,40 @@ pub async fn check_update_feed(app: tauri::AppHandle) -> Result<UpdateFeedStatus
         }
     }
 }
+
+/// Downloads and installs a signed desktop update while guaranteeing graceful embedded server
+/// and SQLite WAL shutdown before Windows NSIS (or macOS/Linux relaunch) terminates the process.
+#[tauri::command]
+pub async fn install_native_update(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    use tauri_plugin_updater::UpdaterExt;
+
+    let exit_handle = app.clone();
+    let updater = app
+        .updater_builder()
+        .on_before_exit(move || {
+            if let Some(coord) = exit_handle.try_state::<crate::ShutdownCoordinator>() {
+                coord.shutdown_blocking();
+            }
+        })
+        .build()
+        .map_err(|e| format!("Updater unavailable: {e}"))?;
+
+    let Some(update) = updater
+        .check()
+        .await
+        .map_err(|e| format!("Failed to check for updates: {e}"))?
+    else {
+        return Err("No update available.".to_string());
+    };
+
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| format!("Failed to install update: {e}"))?;
+
+    if let Some(coord) = app.try_state::<crate::ShutdownCoordinator>() {
+        coord.shutdown_blocking();
+    }
+    app.restart();
+}

@@ -30,6 +30,7 @@
     "allow-get-power-state",
     "allow-show-main-window",
     "allow-quit-app",
-    "allow-check-update-feed"
+    "allow-check-update-feed",
+    "allow-install-native-update"
   ]
 }

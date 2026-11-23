@@ -44,6 +44,7 @@ const PersonAvatar: React.FC<{
           src={faceThumbUrl(faceId!)}
           alt={person.name || 'Unnamed'}
           loading="lazy"
+          decoding="async"
           onError={() => setFailedFaceId(faceId)}
         />
       ) : (
@@ -304,15 +305,19 @@ export const PeopleView: React.FC = () => {
   // Admin clustering state
   const [clustering, setClustering] = useState(false);
   const listSeqRef = useRef(0);
+  const hasLoadedOnceRef = useRef(false);
 
   const load = useCallback(
     async (includeHidden = showHidden) => {
       const seq = ++listSeqRef.current;
-      setLoading(true);
+      if (!hasLoadedOnceRef.current) {
+        setLoading(true);
+      }
       setError(null);
       try {
         const res = await listPeople(isAdmin && includeHidden ? { include_hidden: true } : undefined);
         if (seq !== listSeqRef.current) return;
+        hasLoadedOnceRef.current = true;
         setItems(res.items);
       } catch (err) {
         if (seq !== listSeqRef.current) return;

@@ -8,11 +8,14 @@ use truongphoto_db::{repo, DbHandle};
 
 const TOUCH_THROTTLE_MS: i64 = 60_000;
 
-/// Manages singleflight generation locks and bounded LRU disk cache eviction for `cache_dir`.
+/// Manages singleflight generation locks, bounded transcode/decode concurrency, and LRU disk cache eviction for `cache_dir`.
 pub struct CacheManager {
     db: DbHandle,
     locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     last_touched: Mutex<HashMap<String, i64>>,
+    image_decode_sem: Arc<tokio::sync::Semaphore>,
+    raw_demosaic_sem: Arc<tokio::sync::Semaphore>,
+    hls_transcode_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl CacheManager {
@@ -21,7 +24,22 @@ impl CacheManager {
             db,
             locks: Mutex::new(HashMap::new()),
             last_touched: Mutex::new(HashMap::new()),
+            image_decode_sem: Arc::new(tokio::sync::Semaphore::new(4)),
+            raw_demosaic_sem: Arc::new(tokio::sync::Semaphore::new(2)),
+            hls_transcode_sem: Arc::new(tokio::sync::Semaphore::new(2)),
         }
+    }
+
+    pub async fn acquire_image_decode_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.image_decode_sem.clone().acquire_owned().await.ok()
+    }
+
+    pub async fn acquire_raw_demosaic_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.raw_demosaic_sem.clone().acquire_owned().await.ok()
+    }
+
+    pub async fn acquire_hls_transcode_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.hls_transcode_sem.clone().acquire_owned().await.ok()
     }
 
     /// Acquires an async singleflight mutex guard for `key` to prevent duplicate concurrent work.
@@ -42,7 +60,8 @@ impl CacheManager {
         mutex.lock_owned().await
     }
 
-    /// Upserts an `lru_cache_entries` row and evicts oldest entries down to 85% of `cache_limit_gb` if exceeded.
+    /// Upserts an `lru_cache_entries` row and atomically evicts oldest entries down to 85% of
+    /// `cache_limit_gb` if exceeded (never self-evicting the newly recorded entry).
     pub async fn record_and_evict(
         &self,
         entry: LruCacheEntry,
@@ -51,44 +70,53 @@ impl CacheManager {
     ) -> anyhow::Result<()> {
         let key = entry.cache_key.clone();
         let now_ms = entry.last_accessed_ms;
-        self.db
-            .write(move |conn| repo::cache::upsert_cache_entry(conn, &entry))
+        let limit_bytes = (u64::from(cache_limit_gb.max(1))).saturating_mul(1024 * 1024 * 1024);
+
+        let victims = self
+            .db
+            .write(move |conn| {
+                let tx = conn.transaction()?;
+                repo::cache::upsert_cache_entry(&tx, &entry)?;
+                let total = repo::cache::total_cache_bytes(&tx)?;
+                let popped = if total > limit_bytes {
+                    let target_bytes = (limit_bytes * 85) / 100;
+                    let bytes_to_free = total.saturating_sub(target_bytes);
+                    if bytes_to_free > 0 {
+                        repo::cache::pop_oldest_entries_to_free(
+                            &tx,
+                            bytes_to_free,
+                            Some(&entry.cache_key),
+                        )?
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                tx.commit()?;
+                Ok(popped)
+            })
             .await?;
 
-        self.last_touched.lock().insert(key, now_ms);
+        {
+            let mut touched = self.last_touched.lock();
+            touched.insert(key, now_ms);
+            for v in &victims {
+                touched.remove(&v.cache_key);
+            }
+        }
 
-        let limit_bytes = (u64::from(cache_limit_gb.max(1))).saturating_mul(1024 * 1024 * 1024);
-        let total = self.db.read(repo::cache::total_cache_bytes).await?;
-
-        if total > limit_bytes {
-            let target_bytes = (limit_bytes * 85) / 100;
-            let bytes_to_free = total.saturating_sub(target_bytes);
-            if bytes_to_free > 0 {
-                let victims = self
-                    .db
-                    .write(move |conn| repo::cache::pop_oldest_entries_to_free(conn, bytes_to_free))
-                    .await?;
-
-                let cache_root = cache_dir.to_path_buf();
-                let victim_paths: Vec<String> =
-                    victims.iter().map(|v| v.rel_path.clone()).collect();
-
-                {
-                    let mut touched = self.last_touched.lock();
-                    for v in &victims {
-                        touched.remove(&v.cache_key);
+        if !victims.is_empty() {
+            let cache_root = cache_dir.to_path_buf();
+            let victim_paths: Vec<String> = victims.into_iter().map(|v| v.rel_path).collect();
+            tokio::task::spawn_blocking(move || {
+                for rel in victim_paths {
+                    if let Some(abs) = safe_join_relative(&cache_root, &rel) {
+                        remove_cache_target(&abs);
                     }
                 }
-
-                tokio::task::spawn_blocking(move || {
-                    for rel in victim_paths {
-                        if let Some(abs) = safe_join_relative(&cache_root, &rel) {
-                            remove_cache_target(&abs);
-                        }
-                    }
-                })
-                .await?;
-            }
+            })
+            .await?;
         }
 
         Ok(())

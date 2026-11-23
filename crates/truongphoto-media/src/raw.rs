@@ -65,6 +65,20 @@ fn libraw_candidate_paths() -> Vec<String> {
     }
     #[cfg(target_os = "macos")]
     {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for cand in [
+                    dir.join("libraw.dylib"),
+                    dir.parent()
+                        .map(|p| p.join("Resources").join("libraw.dylib"))
+                        .unwrap_or_default(),
+                ] {
+                    if cand.is_file() {
+                        candidates.push(cand.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
         candidates.extend([
             "libraw.dylib".to_string(),
             "/opt/homebrew/lib/libraw.dylib".to_string(),
@@ -453,41 +467,41 @@ pub(crate) fn sips_convert_to_jpeg(path: &Path, quality: u8) -> Result<Vec<u8>, 
     let srgb_icc = Path::new("/System/Library/ColorSync/Profiles/sRGB Profile.icc");
     let q_str = quality.to_string();
 
-    let status = if srgb_icc.exists() {
-        std::process::Command::new("/usr/bin/sips")
-            .args([
-                "-s",
-                "format",
-                "jpeg",
-                "-s",
-                "formatOptions",
-                &q_str,
-                "--matchTo",
-                "/System/Library/ColorSync/Profiles/sRGB Profile.icc",
-            ])
-            .arg(path)
-            .arg("--out")
-            .arg(out_path)
-            .output()
+    let mut cmd = std::process::Command::new("/usr/bin/sips");
+    if srgb_icc.exists() {
+        cmd.args([
+            "-s",
+            "format",
+            "jpeg",
+            "-s",
+            "formatOptions",
+            &q_str,
+            "--matchTo",
+            "/System/Library/ColorSync/Profiles/sRGB Profile.icc",
+        ]);
     } else {
-        std::process::Command::new("/usr/bin/sips")
-            .args(["-s", "format", "jpeg", "-s", "formatOptions", &q_str])
-            .arg(path)
-            .arg("--out")
-            .arg(out_path)
-            .output()
-    };
+        cmd.args(["-s", "format", "jpeg", "-s", "formatOptions", &q_str]);
+    }
+    cmd.arg(path).arg("--out").arg(out_path);
+    let status = truongphoto_core::process::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(30),
+    );
 
     let output = match status {
         Ok(out) if out.status.success() => out,
         Ok(out) => {
             // Retry without --matchTo in case sips rejects profile matching on some inputs
-            let retry = std::process::Command::new("/usr/bin/sips")
+            let mut retry_cmd = std::process::Command::new("/usr/bin/sips");
+            retry_cmd
                 .args(["-s", "format", "jpeg", "-s", "formatOptions", &q_str])
                 .arg(path)
                 .arg("--out")
-                .arg(out_path)
-                .output()?;
+                .arg(out_path);
+            let retry = truongphoto_core::process::run_command_with_timeout(
+                &mut retry_cmd,
+                std::time::Duration::from_secs(30),
+            )?;
             if !retry.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 return Err(MediaError::ExternalTool {

@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use truongphoto_core::AiTier;
 
@@ -359,6 +359,8 @@ impl ModelDownloader {
     pub fn new() -> Result<Self, AiError> {
         let client = reqwest::Client::builder()
             .user_agent("TruongPhoto/0.1")
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_secs(120))
             .build()
             .map_err(|e| AiError::ModelDownload(e.to_string()))?;
         Ok(Self { client })
@@ -461,15 +463,41 @@ impl ModelDownloader {
         if let Some(parent) = final_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        // Remove any stale `.part` file before starting.
-        let _ = tokio::fs::remove_file(&part_path).await;
 
-        let resp = tokio::select! {
+        // Check whether a partial download exists so large model files can resume via HTTP Range.
+        let mut existing_part_len = tokio::fs::metadata(&part_path)
+            .await
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let mut req = self.client.get(url);
+        if existing_part_len > 0 {
+            req = req.header(
+                reqwest::header::RANGE,
+                format!("bytes={existing_part_len}-"),
+            );
+        }
+
+        let mut resp = tokio::select! {
             _ = cancel.cancelled() => return Err(AiError::Cancelled),
-            res = self.client.get(url).send() => {
+            res = req.send() => {
                 res.map_err(|e| AiError::ModelDownload(format!("GET {url}: {e}")))?
             }
         };
+
+        // If the existing `.part` exceeded the remote file (416), discard it and retry from byte 0.
+        if existing_part_len > 0 && resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            existing_part_len = 0;
+            resp = tokio::select! {
+                _ = cancel.cancelled() => return Err(AiError::Cancelled),
+                res = self.client.get(url).send() => {
+                    res.map_err(|e| AiError::ModelDownload(format!("GET {url}: {e}")))?
+                }
+            };
+        }
 
         if !resp.status().is_success() {
             return Err(AiError::ModelDownload(format!(
@@ -478,20 +506,50 @@ impl ModelDownloader {
             )));
         }
 
-        let exact_content_len = resp.content_length();
-        let content_len = exact_content_len.unwrap_or(approx_bytes);
+        let is_resumed =
+            existing_part_len > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        let resumed_offset = if is_resumed { existing_part_len } else { 0 };
+
+        let exact_content_len = resp
+            .content_length()
+            .map(|rem| rem.saturating_add(resumed_offset));
+        let content_len = exact_content_len.unwrap_or(approx_bytes.max(resumed_offset));
         let effective_total = total_hint.max(prior_bytes.saturating_add(content_len));
 
-        let mut file = tokio::fs::File::create(&part_path).await?;
-        let mut stream = resp.bytes_stream();
         let mut hasher = Sha256::new();
-        let mut downloaded_this_file: u64 = 0;
+        let mut downloaded_this_file: u64 = resumed_offset;
+
+        let mut file = if is_resumed {
+            // Hash existing partial bytes so end-to-end SHA-256 verification remains exact.
+            let mut reader = tokio::fs::File::open(&part_path).await?;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            drop(reader);
+            on_progress(
+                prior_bytes.saturating_add(downloaded_this_file),
+                effective_total,
+            );
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&part_path)
+                .await?
+        } else {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            tokio::fs::File::create(&part_path).await?
+        };
+        let mut stream = resp.bytes_stream();
 
         loop {
             let next_chunk = tokio::select! {
                 _ = cancel.cancelled() => {
                     drop(file);
-                    let _ = tokio::fs::remove_file(&part_path).await;
+                    // Keep `.part` on cancellation so resuming later does not re-download GBs.
                     return Err(AiError::Cancelled);
                 }
                 chunk = stream.next() => chunk,
@@ -505,7 +563,6 @@ impl ModelDownloader {
                 Ok(c) => c,
                 Err(e) => {
                     drop(file);
-                    let _ = tokio::fs::remove_file(&part_path).await;
                     return Err(AiError::ModelDownload(format!(
                         "stream error for {url}: {e}"
                     )));
@@ -532,6 +589,13 @@ impl ModelDownloader {
         }
         drop(file);
 
+        if downloaded_this_file == 0 {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(AiError::ModelDownload(format!(
+                "empty 0-byte download for {url}"
+            )));
+        }
+
         if let Some(expected_len) = exact_content_len {
             if downloaded_this_file != expected_len {
                 let _ = tokio::fs::remove_file(&part_path).await;
@@ -553,7 +617,20 @@ impl ModelDownloader {
             }
         }
 
-        tokio::fs::rename(&part_path, &final_path).await?;
+        let part_for_rename = part_path.clone();
+        let final_for_rename = final_path.clone();
+        let rename_res = tokio::task::spawn_blocking(move || {
+            truongphoto_core::process::rename_with_windows_retry(
+                &part_for_rename,
+                &final_for_rename,
+            )
+        })
+        .await
+        .map_err(|e| AiError::ModelDownload(format!("rename join error: {e}")))?;
+        if let Err(e) = rename_res {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(AiError::Io(e));
+        }
         Ok((actual_sha256, downloaded_this_file))
     }
 }

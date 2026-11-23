@@ -746,20 +746,22 @@ fn populate_from_exif(
         if let Some(gps) = exif.gps_info() {
             let raw_lat = gps.latitude_decimal();
             let raw_lon = gps.longitude_decimal();
-            // Reject zeroed Null Island (0.0, 0.0) GPS placeholders written by cameras without a fix.
-            let is_null_island = matches!(
-                (raw_lat, raw_lon),
-                (Some(la), Some(lo)) if la.abs() < 1e-6 && lo.abs() < 1e-6
-            );
-            let (lat, lon) = if is_null_island {
-                (None, None)
-            } else {
-                (raw_lat, raw_lon)
+            let (lat, lon) = match (raw_lat, raw_lon) {
+                (Some(la), Some(lo))
+                    if la.is_finite()
+                        && lo.is_finite()
+                        && (-90.0..=90.0).contains(&la)
+                        && (-180.0..=180.0).contains(&lo)
+                        && !(la.abs() < 1e-6 && lo.abs() < 1e-6) =>
+                {
+                    (Some(la), Some(lo))
+                }
+                _ => (None, None),
             };
-            let alt = if is_null_island {
-                None
+            let alt = if lat.is_some() && lon.is_some() {
+                gps.altitude_meters().filter(|a| a.is_finite())
             } else {
-                gps.altitude_meters()
+                None
             };
             let geo = match (lat, lon) {
                 (Some(la), Some(lo)) => geocode::reverse_geocode(la, lo),
@@ -927,18 +929,20 @@ fn run_ffprobe(path: &Path) -> Option<FfprobeOutput> {
     let ffprobe = video::video_capabilities().ffprobe_path.as_deref()?;
     let mut cmd = Command::new(ffprobe);
     video::hide_console_window(&mut cmd);
-    let out = cmd
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
+    cmd.args([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+    ])
+    .arg(path);
+    let out = truongphoto_core::process::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(30),
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -980,14 +984,18 @@ fn extract_video_metadata(path: &Path) -> ExtractedMetadata {
             match track.get(TrackInfoTag::CreateDate) {
                 Some(EntryValue::DateTime(dt)) => {
                     let ms = dt.timestamp_millis();
-                    video_meta.taken_at_ms = Some(ms);
-                    meta.capture_at_ms = Some(ms);
-                    meta.capture_tz_offset_m = Some(dt.offset().local_minus_utc() / 60);
+                    if ms > 0 {
+                        video_meta.taken_at_ms = Some(ms);
+                        meta.capture_at_ms = Some(ms);
+                        meta.capture_tz_offset_m = Some(dt.offset().local_minus_utc() / 60);
+                    }
                 }
                 Some(EntryValue::NaiveDateTime(naive)) => {
                     let ms = naive.and_utc().timestamp_millis();
-                    video_meta.taken_at_ms = Some(ms);
-                    meta.capture_at_ms = Some(ms);
+                    if ms > 0 {
+                        video_meta.taken_at_ms = Some(ms);
+                        meta.capture_at_ms = Some(ms);
+                    }
                 }
                 _ => {}
             }
@@ -1155,7 +1163,7 @@ fn extract_video_metadata(path: &Path) -> ExtractedMetadata {
     meta
 }
 
-fn extract_image_metadata(path: &Path, ext: &str) -> ExtractedMetadata {
+fn extract_image_metadata(path: &Path, ext: &str, is_raw: bool) -> ExtractedMetadata {
     let mut meta = ExtractedMetadata::default();
     let mut parser = MediaParser::new();
 
@@ -1167,9 +1175,15 @@ fn extract_image_metadata(path: &Path, ext: &str) -> ExtractedMetadata {
             meta.capture_tz_offset_m = tz_offset;
             meta.content_identifier = content_id;
 
-            let (mut w, mut h) = match image::image_dimensions(path) {
-                Ok((iw, ih)) => (Some(iw), Some(ih)),
-                Err(_) => (exif_w, exif_h),
+            // For TIFF-based camera RAWs (CR2/NEF/ARW/DNG), `image::image_dimensions` reads IFD0
+            // which is frequently a 160×120 thumbnail. Prefer EXIF full-resolution dimensions first.
+            let (mut w, mut h) = if is_raw && exif_w.is_some() && exif_h.is_some() {
+                (exif_w, exif_h)
+            } else {
+                match image::image_dimensions(path) {
+                    Ok((iw, ih)) => (Some(iw), Some(ih)),
+                    Err(_) => (exif_w, exif_h),
+                }
             };
             if photo_meta.orientation.is_some_and(|o| (5..=8).contains(&o)) {
                 std::mem::swap(&mut w, &mut h);
@@ -1287,7 +1301,8 @@ pub fn extract_metadata(path: &Path) -> Result<ExtractedMetadata, MediaError> {
     let ext = classify::normalized_extension(path).unwrap_or_default();
 
     match category {
-        MediaCategory::Photo | MediaCategory::Raw => Ok(extract_image_metadata(path, &ext)),
+        MediaCategory::Photo => Ok(extract_image_metadata(path, &ext, false)),
+        MediaCategory::Raw => Ok(extract_image_metadata(path, &ext, true)),
         MediaCategory::Video => Ok(extract_video_metadata(path)),
         MediaCategory::Livp => extract_livp_metadata(path),
     }

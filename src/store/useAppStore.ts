@@ -97,6 +97,7 @@ export interface AppState {
   searchRequest: SearchRequest;
   searchResponse: SearchResponse | null;
   searchLoading: boolean;
+  searchLoadingMore: boolean;
   searchError: string | null;
   aiDashboard: AiModelsDashboardResponse | null;
 
@@ -198,6 +199,7 @@ const initialDataState = {
   searchRequest: defaultSearchRequest(),
   searchResponse: null as SearchResponse | null,
   searchLoading: false,
+  searchLoadingMore: false,
   searchError: null as string | null,
   aiDashboard: null as AiModelsDashboardResponse | null,
   chatDrawerOpen: false,
@@ -244,6 +246,7 @@ const signedOutState = () => ({
   searchRequest: defaultSearchRequest(),
   searchResponse: null as SearchResponse | null,
   searchLoading: false,
+  searchLoadingMore: false,
   searchError: null as string | null,
   aiDashboard: null as AiModelsDashboardResponse | null,
   chatDrawerOpen: false,
@@ -320,6 +323,7 @@ export const useAppStore = create<AppState>((set, get) => {
                 searchRequest: defaultSearchRequest(),
                 searchResponse: null,
                 searchLoading: false,
+                searchLoadingMore: false,
                 searchError: null,
               }
             : {}),
@@ -399,6 +403,7 @@ export const useAppStore = create<AppState>((set, get) => {
       set({
         searchActive: true,
         searchLoading: true,
+        searchLoadingMore: false,
         searchError: null,
         searchRequest: merged,
         searchQuery: nextQuery,
@@ -423,7 +428,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     loadMoreSearch: async () => {
       const state = get();
-      if (state.searchLoading || !state.searchResponse) return;
+      if (state.searchLoading || state.searchLoadingMore || !state.searchResponse) return;
       const loadedCount = state.searchResponse.items.length;
       if (loadedCount >= state.searchResponse.total_count) return;
       const seq = searchSeq;
@@ -431,7 +436,7 @@ export const useAppStore = create<AppState>((set, get) => {
         ...state.searchRequest,
         offset: loadedCount,
       };
-      set({ searchLoading: true, searchRequest: nextReq });
+      set({ searchLoadingMore: true, searchRequest: nextReq });
       try {
         const res = await searchLibrary(nextReq);
         if (seq === searchSeq) {
@@ -447,13 +452,13 @@ export const useAppStore = create<AppState>((set, get) => {
                 items: [...existing, ...extra],
                 total_count: Math.max(res.total_count, existing.length + extra.length),
               },
-              searchLoading: false,
+              searchLoadingMore: false,
             };
           });
         }
       } catch (err) {
         if (seq === searchSeq) {
-          set({ searchLoading: false });
+          set({ searchLoadingMore: false });
         }
         throw err;
       }
@@ -476,6 +481,7 @@ export const useAppStore = create<AppState>((set, get) => {
         searchRequest: defaultSearchRequest(),
         searchResponse: null,
         searchLoading: false,
+        searchLoadingMore: false,
         searchError: null,
       });
     },
@@ -610,10 +616,14 @@ export const useAppStore = create<AppState>((set, get) => {
 
         const res = await sendChatMessage(sessionId, content, limit);
         if (seq === chatSeq) {
+          // Preserve stable React key from optimistic user bubble so it never remounts/re-animates on reply.
+          const confirmedUserMsg = Object.assign({}, res.user_message, {
+            _clientKey: optimisticId,
+          }) as ChatMessageView;
           set((state) => ({
             chatMessages: [
               ...state.chatMessages.filter((m) => m.id !== optimisticId),
-              res.user_message,
+              confirmedUserMsg,
               res.assistant_message,
             ],
             chatActiveFilters: res.active_filters,

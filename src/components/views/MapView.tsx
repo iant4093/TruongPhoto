@@ -204,7 +204,19 @@ export const MapView: React.FC = () => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<MapLibreMap | null>(null);
   const [mapInstanceVersion, setMapInstanceVersion] = useState(0);
-  const markersRef = useRef<Marker[]>([]);
+  const markersByIdRef = useRef<
+    Map<
+      string,
+      {
+        marker: Marker;
+        el: HTMLButtonElement;
+        img: HTMLImageElement;
+        badge: HTMLSpanElement;
+        cluster: MapCluster;
+      }
+    >
+  >(new Map());
+  const selectClusterRef = useRef<(c: MapCluster) => void>(() => {});
   const pointsSeqRef = useRef(0);
   const clustersSeqRef = useRef(0);
 
@@ -350,26 +362,43 @@ export const MapView: React.FC = () => {
 
     return () => {
       map.off('moveend', onMoveEnd);
-      for (const marker of markersRef.current) {
-        marker.remove();
+      for (const entry of markersByIdRef.current.values()) {
+        entry.marker.remove();
       }
-      markersRef.current = [];
+      markersByIdRef.current.clear();
       map.remove();
       mapInstanceRef.current = null;
     };
   }, [webglAvailable, mapTileMode, mapPmtilesUrl, mapOnlineStyleUrl]);
 
-  // Sync Codex DOM cluster markers onto MapLibre map
+  selectClusterRef.current = (c) => {
+    void handleSelectCluster(c);
+  };
+
+  // Reconcile DOM cluster markers in-place by cluster.id so panning/zooming never blinks stationary markers.
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!webglAvailable || !map) return;
 
-    for (const marker of markersRef.current) {
-      marker.remove();
-    }
-    markersRef.current = [];
+    const mapEntries = markersByIdRef.current;
+    const nextIds = new Set<string>();
 
     for (const cluster of clusters) {
+      nextIds.add(cluster.id);
+      const existing = mapEntries.get(cluster.id);
+      if (existing) {
+        existing.cluster = cluster;
+        existing.marker.setLngLat([cluster.lon, cluster.lat]);
+        const nextLabel = `${clusterDisplayLabel(cluster)} (${plural(cluster.count, 'photo')})`;
+        existing.el.setAttribute('aria-label', nextLabel);
+        const nextSrc = mediaThumbUrl(cluster.cover_asset_id);
+        if (existing.img.getAttribute('src') !== nextSrc) {
+          existing.img.src = nextSrc;
+        }
+        existing.badge.textContent = String(cluster.count);
+        continue;
+      }
+
       const el = document.createElement('button');
       el.type = 'button';
       el.className = 'map-cluster-marker';
@@ -382,6 +411,7 @@ export const MapView: React.FC = () => {
       img.src = mediaThumbUrl(cluster.cover_asset_id);
       img.alt = clusterDisplayLabel(cluster);
       img.loading = 'lazy';
+      img.decoding = 'async';
       el.appendChild(img);
 
       const badge = document.createElement('span');
@@ -389,16 +419,23 @@ export const MapView: React.FC = () => {
       badge.textContent = String(cluster.count);
       el.appendChild(badge);
 
-      el.addEventListener('click', () => {
-        void handleSelectCluster(cluster);
-      });
-
       const marker = new Marker({ element: el })
         .setLngLat([cluster.lon, cluster.lat])
         .addTo(map);
-      markersRef.current.push(marker);
+      const entry = { marker, el, img, badge, cluster };
+      el.addEventListener('click', () => {
+        selectClusterRef.current(entry.cluster);
+      });
+      mapEntries.set(cluster.id, entry);
     }
-  }, [webglAvailable, clusters, handleSelectCluster, mapInstanceVersion]);
+
+    for (const [id, entry] of mapEntries.entries()) {
+      if (!nextIds.has(id)) {
+        entry.marker.remove();
+        mapEntries.delete(id);
+      }
+    }
+  }, [webglAvailable, clusters, mapInstanceVersion]);
 
   const stripAssetIds = useMemo(() => stripAssets.map((a) => a.id), [stripAssets]);
   const modeLabel = formatModePillLabel(config);
@@ -534,14 +571,19 @@ export const MapView: React.FC = () => {
             </button>
           </div>
 
-          {loadingStrip ? (
-            <div className="view-subtitle" role="status">
+          {loadingStrip && stripAssets.length === 0 ? (
+            <div className="view-subtitle" role="status" style={{ minHeight: 76, display: 'flex', alignItems: 'center' }}>
               Loading cluster photos…
             </div>
           ) : stripAssets.length === 0 ? (
-            <div className="view-subtitle">No photos found in this cluster.</div>
+            <div className="view-subtitle" style={{ minHeight: 76, display: 'flex', alignItems: 'center' }}>
+              No photos found in this cluster.
+            </div>
           ) : (
-            <div className="map-photo-strip-grid">
+            <div
+              className="map-photo-strip-grid"
+              style={{ opacity: loadingStrip ? 0.65 : 1, transition: 'opacity 140ms ease' }}
+            >
               {stripAssets.map((asset) => {
                 const title = asset.title || formatDateTime(asset.capture_at_ms);
                 return (
@@ -553,7 +595,12 @@ export const MapView: React.FC = () => {
                     aria-label={`Open ${title}`}
                     onClick={() => openLightbox(asset.id, stripAssetIds)}
                   >
-                    <img src={mediaThumbUrl(asset.id)} alt={title} loading="lazy" />
+                    <img
+                      src={mediaThumbUrl(asset.id)}
+                      alt={title}
+                      loading="lazy"
+                      decoding="async"
+                    />
                   </button>
                 );
               })}

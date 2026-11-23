@@ -97,7 +97,11 @@ export const TimelineView: React.FC = () => {
     <div>
       <ViewHeader
         title="Photos"
-        subtitle={`${plural(totalCount, 'photo')} in ${plural(folders.length, 'folder')}`}
+        subtitle={
+          loading && !hasLoadedOnceRef.current
+            ? '\u00A0'
+            : `${plural(totalCount, 'photo')} in ${plural(folders.length, 'folder')}`
+        }
       />
 
       {error && (

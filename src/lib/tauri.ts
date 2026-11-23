@@ -105,8 +105,7 @@ export async function checkNativeUpdater(): Promise<NativeDesktopUpdate | null> 
       version: update.version,
       body: update.body ?? null,
       installAndRestart: async () => {
-        await update.downloadAndInstall();
-        await restartApp();
+        await invokeTauri<void>('install_native_update');
       },
     };
   } catch {

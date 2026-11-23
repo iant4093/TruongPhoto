@@ -146,20 +146,20 @@ export const TrayApp: React.FC = () => {
         await desktopBootstrap(info.desktop_bootstrap_token);
         if (!mountedRef.current || seq !== loadSeqRef.current) return;
       }
-      const sys = await getSystemInfo();
+      const [sys, ai] = await Promise.all([
+        getSystemInfo(),
+        getAiModelsDashboard().catch(() => null),
+      ]);
       if (!mountedRef.current || seq !== loadSeqRef.current) return;
       setSystemInfo(sys);
       setPowerState(sys.power);
       setThrottleState(sys.throttle ?? null);
       setTailscaleUrl(sys.tailscale_url ?? null);
-      setStatusLabel('Online');
-      connectLiveSocket();
-
-      const ai = await getAiModelsDashboard().catch(() => null);
-      if (!mountedRef.current || seq !== loadSeqRef.current) return;
       if (ai) {
         setAiDashboard(ai);
       }
+      setStatusLabel('Online');
+      connectLiveSocket();
     } catch (err) {
       if (!mountedRef.current || seq !== loadSeqRef.current) return;
       if (

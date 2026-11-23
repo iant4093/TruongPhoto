@@ -81,9 +81,12 @@ pub fn total_cache_bytes(conn: &Connection) -> DbResult<u64> {
 /// Pops and deletes the oldest cache entries until at least `bytes_to_free` bytes are reclaimed.
 ///
 /// Entries are ordered oldest-first by `(last_accessed_ms ASC, created_at_ms ASC, cache_key ASC)`.
+/// When `exclude_key` is provided, that key is never evicted (preventing self-eviction of a
+/// newly inserted cache entry whose size exceeds the configured cap).
 pub fn pop_oldest_entries_to_free(
     conn: &Connection,
     bytes_to_free: u64,
+    exclude_key: Option<&str>,
 ) -> DbResult<Vec<LruCacheEntry>> {
     if bytes_to_free == 0 {
         return Ok(Vec::new());
@@ -102,6 +105,9 @@ pub fn pop_oldest_entries_to_free(
         let mut freed: u64 = 0;
         for row in rows {
             let entry = row?;
+            if exclude_key.is_some_and(|k| k == entry.cache_key) {
+                continue;
+            }
             freed = freed.saturating_add(entry.size_bytes);
             victims.push(entry);
             if freed >= bytes_to_free {
@@ -110,10 +116,11 @@ pub fn pop_oldest_entries_to_free(
         }
         drop(stmt);
 
-        if !victims.is_empty() {
-            let mut params: Vec<Value> = Vec::with_capacity(victims.len());
-            let mut placeholders = Vec::with_capacity(victims.len());
-            for (i, entry) in victims.iter().enumerate() {
+        const CHUNK_SIZE: usize = 400;
+        for chunk in victims.chunks(CHUNK_SIZE) {
+            let mut params: Vec<Value> = Vec::with_capacity(chunk.len());
+            let mut placeholders = Vec::with_capacity(chunk.len());
+            for (i, entry) in chunk.iter().enumerate() {
                 params.push(Value::Text(entry.cache_key.clone()));
                 placeholders.push(format!("?{}", i + 1));
             }

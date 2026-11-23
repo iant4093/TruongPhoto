@@ -169,14 +169,22 @@ mod windows_impl {
     }
 
     pub(super) fn resolve_windows(canonical: &Path) -> VolumeInfo {
-        // Strip extended-length `\\?\` prefix if canonicalize added one, preserving UNC shares
-        // (`\\?\UNC\server\share` -> `\\server\share`).
+        // Strip extended-length `\\?\` prefix only when within Win32 MAX_PATH (< 248 chars),
+        // preserving UNC shares (`\\?\UNC\server\share` -> `\\server\share`) and long paths.
         let path_str = canonical.as_os_str().to_string_lossy();
         let trimmed: std::borrow::Cow<'_, str> =
             if let Some(unc_rest) = path_str.strip_prefix(r"\\?\UNC\") {
-                std::borrow::Cow::Owned(format!(r"\\{unc_rest}"))
+                if unc_rest.len() + 2 < 248 {
+                    std::borrow::Cow::Owned(format!(r"\\{unc_rest}"))
+                } else {
+                    std::borrow::Cow::Borrowed(&path_str)
+                }
             } else if let Some(local_rest) = path_str.strip_prefix(r"\\?\") {
-                std::borrow::Cow::Borrowed(local_rest)
+                if local_rest.len() < 248 {
+                    std::borrow::Cow::Borrowed(local_rest)
+                } else {
+                    std::borrow::Cow::Borrowed(&path_str)
+                }
             } else {
                 std::borrow::Cow::Borrowed(&path_str)
             };

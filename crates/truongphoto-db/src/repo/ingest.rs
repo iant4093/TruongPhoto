@@ -856,6 +856,19 @@ fn merge_temp_video_into_still_asset(
 pub fn reconcile_ingested_file(conn: &Connection, data: &IngestedFileData) -> DbResult<String> {
     with_savepoint(conn, "reconcile_ingested_file", || {
         let asset_id = reconcile_ingested_file_inner(conn, data)?;
+        // Keep `assets.capture_at_ms` synchronized with effective metadata/overrides so indexed
+        // timeline keyset pagination and bucket queries remain consistent with `v_assets_effective`.
+        conn.execute(
+            "UPDATE assets
+             SET capture_at_ms = COALESCE(
+                 (SELECT o.capture_at_ms FROM user_overrides o WHERE o.asset_id = assets.id),
+                 (SELECT p.taken_at_ms FROM deterministic_photo_meta p WHERE p.asset_id = assets.id),
+                 (SELECT v.taken_at_ms FROM deterministic_video_meta v WHERE v.asset_id = assets.id),
+                 capture_at_ms
+             )
+             WHERE id = ?1",
+            params![&asset_id],
+        )?;
         crate::repo::map::sync_asset_geo(conn, &asset_id)?;
         Ok(asset_id)
     })

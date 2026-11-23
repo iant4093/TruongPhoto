@@ -187,28 +187,76 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let autostart_launch = std::env::args().any(|arg| arg == AUTOSTART_ARG);
-    if let Some(window) = app.get_webview_window("main") {
-        let main_win = window.clone();
-        window.on_window_event(move |event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = main_win.hide();
-            }
-        });
-
+    let main_url = {
+        #[cfg(debug_assertions)]
+        {
+            tauri::WebviewUrl::App("index.html".into())
+        }
         #[cfg(not(debug_assertions))]
         {
             let target: tauri::Url = format!("http://127.0.0.1:{bound_port}/")
                 .parse()
                 .expect("valid local server URL");
-            window.navigate(target)?;
+            tauri::WebviewUrl::External(target)
         }
+    };
 
-        if autostart_launch {
-            let _ = window.hide();
-        } else {
-            tray::show_main_window(app.handle());
+    let downloads_root = app
+        .path()
+        .download_dir()
+        .ok()
+        .or_else(|| app.path().home_dir().ok().map(|h| h.join("Downloads")));
+
+    let builder = tauri::WebviewWindowBuilder::new(app, "main", main_url)
+        .title("TruongPhoto")
+        .visible(false)
+        .inner_size(1280.0, 820.0)
+        .min_inner_size(980.0, 640.0)
+        .decorations(cfg!(target_os = "macos"))
+        .transparent(true)
+        .shadow(true)
+        .center()
+        .theme(Some(tauri::Theme::Dark))
+        .on_download(move |_webview, event| match event {
+            tauri::webview::DownloadEvent::Requested { url, destination } => {
+                if !tray::is_allowed_navigation_url(&url, bound_port) {
+                    return false;
+                }
+                if let Some(ref dl_dir) = downloads_root {
+                    let _ = std::fs::create_dir_all(dl_dir);
+                    let suggested = destination
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("download.bin")
+                        .to_string();
+                    *destination = unique_download_path(dl_dir, &suggested);
+                }
+                true
+            }
+            tauri::webview::DownloadEvent::Finished { .. } => true,
+            _ => true,
+        });
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(20.0, 18.0));
+
+    let window = builder.build()?;
+    let main_win = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = main_win.hide();
         }
+    });
+
+    if autostart_launch {
+        let _ = window.hide();
+    } else {
+        tray::show_main_window(app.handle());
     }
 
     tray::setup_system_tray(app.handle())?;
@@ -216,28 +264,35 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn unique_download_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let base_path = std::path::Path::new(filename);
+    let stem = base_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download");
+    let ext = base_path.extension().and_then(|s| s.to_str());
+    let first = dir.join(filename);
+    if !first.exists() {
+        return first;
+    }
+    for n in 1..10_000u32 {
+        let candidate_name = match ext {
+            Some(e) if !e.is_empty() => format!("{stem} ({n}).{e}"),
+            _ => format!("{stem} ({n})"),
+        };
+        let candidate = dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
 /// Boots the TruongPhoto Tauri v2 desktop application and embedded Axum server.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
-    #[cfg(target_os = "macos")]
-    let context = {
-        let mut context = context;
-        if let Some(main_win) = context
-            .config_mut()
-            .app
-            .windows
-            .iter_mut()
-            .find(|w| w.label == "main")
-        {
-            main_win.decorations = true;
-            main_win.title_bar_style = tauri::TitleBarStyle::Overlay;
-            main_win.hidden_title = true;
-            main_win.traffic_light_position =
-                Some(tauri::utils::config::LogicalPosition { x: 20.0, y: 18.0 });
-        }
-        context
-    };
 
     let app = tauri::Builder::default()
         // Register single-instance first so a second launch hands over before other plugins start.
@@ -262,6 +317,7 @@ pub fn run() {
             commands::show_main_window,
             commands::quit_app,
             commands::check_update_feed,
+            commands::install_native_update,
         ])
         .build(context);
 
@@ -288,9 +344,12 @@ pub fn run() {
 fn report_fatal_startup_error(message: &str) {
     tracing::error!("TruongPhoto fatal startup error: {message}");
     eprintln!("TruongPhoto failed to start: {message}");
-    let paths = truongphoto_core::StoragePaths::default();
-    let _ = std::fs::create_dir_all(&paths.data_dir);
-    let log_path = paths.data_dir.join("startup-error.log");
+    let data_dir = std::env::var_os("TP_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| truongphoto_core::StoragePaths::default().data_dir);
+    let _ = std::fs::create_dir_all(&data_dir);
+    let log_path = data_dir.join("startup-error.log");
     let unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -393,7 +452,7 @@ mod tests {
     #[test]
     fn app_acl_manifest_and_main_capability_match_registered_handlers() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 5);
+        assert_eq!(registered.len(), 6);
         assert_eq!(manifest_commands(), registered);
 
         let granted = granted_app_commands(include_str!("../capabilities/main.json"));
@@ -451,13 +510,10 @@ mod tests {
         assert!(csp.contains("http://127.0.0.1:*"));
         assert!(csp.contains("ws://127.0.0.1:*"));
 
-        let labels: Vec<&str> = conf["app"]["windows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|w| w["label"].as_str().unwrap())
-            .collect();
-        assert_eq!(labels, ["main"]);
+        // `"main"` is created programmatically in `setup_app` so `.on_download(...)` can be attached.
+        let windows = conf["app"]["windows"].as_array().unwrap();
+        assert!(windows.is_empty());
+        assert!(include_str!("lib.rs").contains(".on_download("));
 
         assert_eq!(
             capability(include_str!("../capabilities/main.json"))["windows"],

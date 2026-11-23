@@ -90,6 +90,11 @@ fn resolve_tool_binary(env_key: &str, name: &str) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             search_dirs.push(dir.join("resources"));
+            if cfg!(target_os = "macos") {
+                if let Some(contents_dir) = dir.parent() {
+                    search_dirs.push(contents_dir.join("Resources"));
+                }
+            }
         }
     }
 
@@ -137,9 +142,12 @@ fn smoke_test_encoder(ffmpeg: &Path, encoder: &str) -> bool {
         "-f",
         "null",
         "-",
-    ])
-    .status()
-    .is_ok_and(|s| s.success())
+    ]);
+    truongphoto_core::process::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(15),
+    )
+    .is_ok_and(|out| out.status.success())
 }
 
 fn probe_h264_encoder(ffmpeg: &Path) -> String {
@@ -159,7 +167,11 @@ fn probe_h264_encoder(ffmpeg: &Path) -> String {
 
     let mut cmd = Command::new(ffmpeg);
     hide_console_window(&mut cmd);
-    let Ok(out) = cmd.args(["-hide_banner", "-encoders"]).output() else {
+    cmd.args(["-hide_banner", "-encoders"]);
+    let Ok(out) = truongphoto_core::process::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(15),
+    ) else {
         return "libx264".to_string();
     };
 
@@ -178,7 +190,11 @@ fn probe_h264_encoder(ffmpeg: &Path) -> String {
 fn probe_zscale_tonemap(ffmpeg: &Path) -> bool {
     let mut cmd = Command::new(ffmpeg);
     hide_console_window(&mut cmd);
-    let Ok(out) = cmd.args(["-hide_banner", "-filters"]).output() else {
+    cmd.args(["-hide_banner", "-filters"]);
+    let Ok(out) = truongphoto_core::process::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(15),
+    ) else {
         return false;
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -255,11 +271,13 @@ pub fn extract_video_poster_frame(src: &Path) -> Result<RgbImage, MediaError> {
         if let Some(ts) = seek {
             cmd.args(["-ss", ts]);
         }
-        let output = cmd
-            .arg("-i")
+        cmd.arg("-i")
             .arg(src)
-            .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
-            .output()?;
+            .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]);
+        let output = truongphoto_core::process::run_command_with_timeout(
+            &mut cmd,
+            std::time::Duration::from_secs(30),
+        )?;
 
         if output.status.success() && !output.stdout.is_empty() {
             let dyn_img = image::load_from_memory(&output.stdout).map_err(|e| {

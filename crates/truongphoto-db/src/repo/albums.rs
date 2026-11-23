@@ -142,27 +142,32 @@ fn filter_allowed_asset_ids(
         }
     }
 
-    let mut params: Vec<Value> = Vec::with_capacity(ordered_unique.len());
-    let mut placeholders = Vec::with_capacity(ordered_unique.len());
-    for (idx, id) in ordered_unique.iter().enumerate() {
-        params.push(Value::Text(id.clone()));
-        placeholders.push(format!("?{}", idx + 1));
-    }
-    let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
-    let sql = format!(
-        "SELECT a.id
-         FROM assets a
-         WHERE a.id IN ({})
-           AND a.deleted_at_ms IS NULL
-           AND a.is_hidden = 0
-           AND {rbac_clause}",
-        placeholders.join(", ")
-    );
+    const CHUNK_SIZE: usize = 400;
+    let mut allowed_set: HashSet<String> = HashSet::with_capacity(ordered_unique.len());
+    for chunk in ordered_unique.chunks(CHUNK_SIZE) {
+        let mut params: Vec<Value> = Vec::with_capacity(chunk.len());
+        let mut placeholders = Vec::with_capacity(chunk.len());
+        for (idx, id) in chunk.iter().enumerate() {
+            params.push(Value::Text(id.clone()));
+            placeholders.push(format!("?{}", idx + 1));
+        }
+        let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
+        let sql = format!(
+            "SELECT a.id
+             FROM assets a
+             WHERE a.id IN ({})
+               AND a.deleted_at_ms IS NULL
+               AND a.is_hidden = 0
+               AND {rbac_clause}",
+            placeholders.join(", ")
+        );
 
-    let mut stmt = conn.prepare(&sql)?;
-    let allowed_set: HashSet<String> = stmt
-        .query_map(params_from_iter(params), |row| row.get::<_, String>(0))?
-        .collect::<Result<HashSet<_>, _>>()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, String>(0))?;
+        for r in rows {
+            allowed_set.insert(r?);
+        }
+    }
 
     Ok(ordered_unique
         .into_iter()
@@ -606,31 +611,37 @@ pub fn remove_album_assets(
         return Err(DbError::NotFound(format!("album not found: {album_id}")));
     };
 
-    let mut params: Vec<Value> = vec![Value::Text(album_id.to_string())];
     let mut seen = HashSet::with_capacity(asset_ids.len());
-    let mut placeholders = Vec::with_capacity(asset_ids.len());
-    for id in asset_ids {
-        if seen.insert(id.as_str()) {
-            let idx = params.len() + 1;
-            params.push(Value::Text(id.clone()));
-            placeholders.push(format!("?{idx}"));
-        }
-    }
-    if placeholders.is_empty() {
+    let unique_ids: Vec<&String> = asset_ids
+        .iter()
+        .filter(|id| seen.insert(id.as_str()))
+        .collect();
+    if unique_ids.is_empty() {
         return Ok(0);
     }
 
-    let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
+    const CHUNK_SIZE: usize = 400;
     let ts = now_ms();
     with_savepoint(conn, "remove_album_assets", || {
-        let del_sql = format!(
-            "DELETE FROM album_assets
-             WHERE album_id = ?1
-               AND asset_id IN ({})
-               AND EXISTS (SELECT 1 FROM assets a WHERE a.id = album_assets.asset_id AND {rbac_clause})",
-            placeholders.join(", ")
-        );
-        let removed = conn.execute(&del_sql, params_from_iter(params))?;
+        let mut removed = 0usize;
+        for chunk in unique_ids.chunks(CHUNK_SIZE) {
+            let mut params: Vec<Value> = vec![Value::Text(album_id.to_string())];
+            let mut placeholders = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                let idx = params.len() + 1;
+                params.push(Value::Text((*id).clone()));
+                placeholders.push(format!("?{idx}"));
+            }
+            let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
+            let del_sql = format!(
+                "DELETE FROM album_assets
+                 WHERE album_id = ?1
+                   AND asset_id IN ({})
+                   AND EXISTS (SELECT 1 FROM assets a WHERE a.id = album_assets.asset_id AND {rbac_clause})",
+                placeholders.join(", ")
+            );
+            removed += conn.execute(&del_sql, params_from_iter(params))?;
+        }
 
         if removed > 0 {
             let cover_removed = current_cover

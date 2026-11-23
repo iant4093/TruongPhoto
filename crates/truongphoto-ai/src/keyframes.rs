@@ -37,7 +37,13 @@ fn resolve_binary(env_key: &str, name: &str) -> Option<PathBuf> {
     };
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for cand in [dir.join(&bin_name), dir.join("resources").join(&bin_name)] {
+            let mut bundled = vec![dir.join(&bin_name), dir.join("resources").join(&bin_name)];
+            if cfg!(target_os = "macos") {
+                if let Some(contents_dir) = dir.parent() {
+                    bundled.push(contents_dir.join("Resources").join(&bin_name));
+                }
+            }
+            for cand in bundled {
                 if cand.is_file() {
                     return Some(cand);
                 }
@@ -115,18 +121,20 @@ fn parse_showinfo_pts_ms(stderr: &str) -> Vec<i64> {
 fn probe_duration_ms(ffprobe: &Path, video_path: &Path) -> Option<i64> {
     let mut cmd = Command::new(ffprobe);
     hide_console_window(&mut cmd);
-    let out = cmd
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(video_path)
-        .output()
-        .ok()?;
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ])
+    .arg(video_path);
+    let out = truongphoto_core::process::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(30),
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -178,8 +186,7 @@ pub fn sample_video_keyframes(
 
     let mut cmd = Command::new(&ffmpeg);
     hide_console_window(&mut cmd);
-    let output = cmd
-        .args(["-hide_banner", "-loglevel", "info", "-i"])
+    cmd.args(["-hide_banner", "-loglevel", "info", "-i"])
         .arg(video_path)
         .args([
             "-vf",
@@ -189,8 +196,11 @@ pub fn sample_video_keyframes(
             "-frames:v",
         ])
         .arg(max_frames.to_string())
-        .arg(&pattern)
-        .output()?;
+        .arg(&pattern);
+    let output = truongphoto_core::process::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(300),
+    )?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -213,13 +223,16 @@ pub fn sample_video_keyframes(
         let fallback_out = tmp_dir.path().join("kf_001.jpg");
         let mut fb_cmd = Command::new(&ffmpeg);
         hide_console_window(&mut fb_cmd);
-        let fb_status = fb_cmd
+        fb_cmd
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(video_path)
             .args(["-frames:v", "1"])
-            .arg(&fallback_out)
-            .status()?;
-        if fb_status.success() && fallback_out.is_file() {
+            .arg(&fallback_out);
+        let fb_out = truongphoto_core::process::run_command_with_timeout(
+            &mut fb_cmd,
+            std::time::Duration::from_secs(60),
+        )?;
+        if fb_out.status.success() && fallback_out.is_file() {
             frame_paths.push(fallback_out);
         }
     }

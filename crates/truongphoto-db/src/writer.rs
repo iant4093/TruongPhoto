@@ -63,7 +63,14 @@ impl DbWriter {
     {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = WriteCommand::Immediate(Box::new(move |conn| {
-            let _ = reply_tx.send(f(conn));
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn))) {
+                Ok(res) => res,
+                Err(_) => {
+                    error!("immediate db write closure panicked; isolating failure");
+                    Err(DbError::TaskJoin("db write closure panicked".to_string()))
+                }
+            };
+            let _ = reply_tx.send(outcome);
         }));
 
         self.tx
@@ -201,7 +208,16 @@ fn flush_batch(conn: &mut Connection, batch: Vec<BatchEntry>) {
             continue;
         }
 
-        let item_res = (entry.op)(&tx);
+        let item_res =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (entry.op)(&tx))) {
+                Ok(res) => res,
+                Err(_) => {
+                    error!("batched db write closure panicked; rolling back savepoint");
+                    Err(DbError::TaskJoin(
+                        "batched db write closure panicked".to_string(),
+                    ))
+                }
+            };
         match item_res {
             Ok(()) => {
                 if let Err(err) = tx.execute_batch("RELEASE SAVEPOINT batch_item;") {

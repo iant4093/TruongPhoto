@@ -176,7 +176,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       {hoverBucket && (
         <div
           className="scrubber-pill"
-          style={{ top: pillTop }}
+          style={{
+            top: 0,
+            transform: `translate3d(0, ${Math.round(pillTop)}px, 0)`,
+            fontVariantNumeric: 'tabular-nums',
+          }}
           role="status"
           aria-live="polite"
         >

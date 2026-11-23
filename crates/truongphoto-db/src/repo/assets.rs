@@ -509,7 +509,7 @@ pub fn list_assets(
     page_params.push(Value::Integer((limit + 1) as i64));
 
     let list_sql = format!(
-        "SELECT {ASSET_SUMMARY_JOIN_COLUMNS}
+        "SELECT {ASSET_SUMMARY_JOIN_COLUMNS}, a.capture_at_ms AS cursor_capture_at_ms
          FROM assets a
          LEFT JOIN deterministic_photo_meta p ON p.asset_id = a.id
          LEFT JOIN deterministic_video_meta v ON v.asset_id = a.id
@@ -520,18 +520,23 @@ pub fn list_assets(
     );
 
     let mut stmt = conn.prepare(&list_sql)?;
-    let mut items = stmt
-        .query_map(params_from_iter(page_params), row_to_asset_summary)?
+    let mut rows_with_cursor: Vec<(AssetSummary, i64)> = stmt
+        .query_map(params_from_iter(page_params), |row| {
+            let summary = row_to_asset_summary(row)?;
+            let raw_capture_at_ms: i64 = row.get(19)?;
+            Ok((summary, raw_capture_at_ms))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let next_cursor = if items.len() > limit {
-        items.truncate(limit);
-        items
+    let next_cursor = if rows_with_cursor.len() > limit {
+        rows_with_cursor.truncate(limit);
+        rows_with_cursor
             .last()
-            .map(|item| format!("{}:{}", item.capture_at_ms, item.id))
+            .map(|(item, raw_ts)| format!("{raw_ts}:{}", item.id))
     } else {
         None
     };
+    let items: Vec<AssetSummary> = rows_with_cursor.into_iter().map(|(s, _)| s).collect();
 
     Ok((items, next_cursor, total_count))
 }
@@ -1056,51 +1061,103 @@ pub fn get_assets_for_purge(
     conn: &Connection,
     asset_ids: Option<&[String]>,
 ) -> DbResult<Vec<PurgeCandidate>> {
-    let mut params: Vec<Value> = Vec::new();
-    let filter_clause = match asset_ids {
+    let mut sortable: Vec<(i64, PurgeCandidate)> = Vec::new();
+
+    match asset_ids {
         Some(ids) => {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let Some(id_list) = push_unique_id_placeholders(ids, &mut params) else {
-                return Ok(Vec::new());
-            };
-            format!("AND a.id IN ({id_list})")
+            let mut seen = HashSet::with_capacity(ids.len());
+            let unique_ids: Vec<&String> =
+                ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+            for chunk in unique_ids.chunks(BATCH_IN_CHUNK) {
+                let mut params: Vec<Value> = Vec::with_capacity(chunk.len());
+                let mut placeholders = Vec::with_capacity(chunk.len());
+                for (i, id) in chunk.iter().enumerate() {
+                    params.push(Value::Text((*id).clone()));
+                    placeholders.push(format!("?{}", i + 1));
+                }
+                let sql = format!(
+                    "SELECT
+                        a.id,
+                        a.folder_id,
+                        f.root_path,
+                        f.volume_uuid,
+                        f.allow_disk_delete,
+                        f.is_offline,
+                        a.thumb_rel_path,
+                        COALESCE(a.deleted_at_ms, 0)
+                     FROM assets a
+                     JOIN folders f ON f.id = a.folder_id
+                     WHERE a.deleted_at_ms IS NOT NULL
+                       AND a.id IN ({})
+                     ORDER BY a.deleted_at_ms ASC, a.id ASC",
+                    placeholders.join(", ")
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(params), |row| {
+                    let deleted_at_ms: i64 = row.get(7)?;
+                    Ok((
+                        deleted_at_ms,
+                        PurgeCandidate {
+                            asset_id: row.get(0)?,
+                            folder_id: row.get(1)?,
+                            folder_root_path: row.get(2)?,
+                            folder_volume_uuid: row.get(3)?,
+                            allow_disk_delete: row.get::<_, i64>(4)? != 0,
+                            is_offline: row.get::<_, i64>(5)? != 0,
+                            thumb_rel_path: row.get(6)?,
+                            files: Vec::new(),
+                        },
+                    ))
+                })?;
+                for r in rows {
+                    sortable.push(r?);
+                }
+            }
+            sortable.sort_unstable_by(|a, b| {
+                a.0.cmp(&b.0).then_with(|| a.1.asset_id.cmp(&b.1.asset_id))
+            });
         }
-        None => String::new(),
-    };
+        None => {
+            let sql = "SELECT
+                    a.id,
+                    a.folder_id,
+                    f.root_path,
+                    f.volume_uuid,
+                    f.allow_disk_delete,
+                    f.is_offline,
+                    a.thumb_rel_path,
+                    COALESCE(a.deleted_at_ms, 0)
+                 FROM assets a
+                 JOIN folders f ON f.id = a.folder_id
+                 WHERE a.deleted_at_ms IS NOT NULL
+                 ORDER BY a.deleted_at_ms ASC, a.id ASC";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map([], |row| {
+                let deleted_at_ms: i64 = row.get(7)?;
+                Ok((
+                    deleted_at_ms,
+                    PurgeCandidate {
+                        asset_id: row.get(0)?,
+                        folder_id: row.get(1)?,
+                        folder_root_path: row.get(2)?,
+                        folder_volume_uuid: row.get(3)?,
+                        allow_disk_delete: row.get::<_, i64>(4)? != 0,
+                        is_offline: row.get::<_, i64>(5)? != 0,
+                        thumb_rel_path: row.get(6)?,
+                        files: Vec::new(),
+                    },
+                ))
+            })?;
+            for r in rows {
+                sortable.push(r?);
+            }
+        }
+    }
 
-    let sql = format!(
-        "SELECT
-            a.id,
-            a.folder_id,
-            f.root_path,
-            f.volume_uuid,
-            f.allow_disk_delete,
-            f.is_offline,
-            a.thumb_rel_path
-         FROM assets a
-         JOIN folders f ON f.id = a.folder_id
-         WHERE a.deleted_at_ms IS NOT NULL
-           {filter_clause}
-         ORDER BY a.deleted_at_ms ASC, a.id ASC"
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut candidates = stmt
-        .query_map(params_from_iter(params), |row| {
-            Ok(PurgeCandidate {
-                asset_id: row.get(0)?,
-                folder_id: row.get(1)?,
-                folder_root_path: row.get(2)?,
-                folder_volume_uuid: row.get(3)?,
-                allow_disk_delete: row.get::<_, i64>(4)? != 0,
-                is_offline: row.get::<_, i64>(5)? != 0,
-                thumb_rel_path: row.get(6)?,
-                files: Vec::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut candidates: Vec<PurgeCandidate> = sortable.into_iter().map(|(_, c)| c).collect();
 
     if candidates.is_empty() {
         return Ok(candidates);

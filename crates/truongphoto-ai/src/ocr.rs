@@ -373,9 +373,10 @@ impl OrtOcrBackend {
             for x in 0..scaled_w as usize {
                 let px = resized.get_pixel(x as u32, y as u32).0;
                 let idx = y * side + x;
-                chw[idx] = (px[0] as f32 / 255.0 - mean[0]) / std[0];
+                // PaddleOCR DBNet expects BGR channel order (OpenCV convention).
+                chw[idx] = (px[2] as f32 / 255.0 - mean[0]) / std[0];
                 chw[hw + idx] = (px[1] as f32 / 255.0 - mean[1]) / std[1];
-                chw[2 * hw + idx] = (px[2] as f32 / 255.0 - mean[2]) / std[2];
+                chw[2 * hw + idx] = (px[0] as f32 / 255.0 - mean[2]) / std[2];
             }
         }
 
@@ -422,9 +423,10 @@ impl OrtOcrBackend {
             for x in 0..scaled_w as usize {
                 let px = resized.get_pixel(x as u32, y as u32).0;
                 let idx = y * w + x;
-                chw[idx] = (px[0] as f32 / 255.0 - 0.5) / 0.5;
+                // PaddleOCR SVTR recognizer expects BGR channel order (OpenCV convention).
+                chw[idx] = (px[2] as f32 / 255.0 - 0.5) / 0.5;
                 chw[hw + idx] = (px[1] as f32 / 255.0 - 0.5) / 0.5;
-                chw[2 * hw + idx] = (px[2] as f32 / 255.0 - 0.5) / 0.5;
+                chw[2 * hw + idx] = (px[0] as f32 / 255.0 - 0.5) / 0.5;
             }
         }
 
@@ -480,13 +482,27 @@ impl OcrBackend for OrtOcrBackend {
             }
             let raw_crop = image::imageops::crop_imm(img, ox0, oy0, cw, ch).to_image();
             // Rotate tall vertical text regions (street signs, book spines, vertical CJK)
-            // so resizing to height 48 preserves character aspect ratio.
-            let crop = if (ch as f32) > (cw as f32) * 1.5 {
-                image::imageops::rotate90(&raw_crop)
+            // so resizing to height 48 preserves character aspect ratio. Try both 90° and 270°
+            // when the first orientation is not high-confidence so upside-down vertical text still decodes.
+            let (text, mean_conf) = if (ch as f32) > (cw as f32) * 1.5 {
+                let rot90 = image::imageops::rotate90(&raw_crop);
+                let (t90, c90) = self.recognize_crop(&rot90, &dict)?;
+                let ok90 = is_meaningful_ocr_line(&t90, c90);
+                if ok90 && c90 >= 0.80 {
+                    (t90, c90)
+                } else {
+                    let rot270 = image::imageops::rotate270(&raw_crop);
+                    let (t270, c270) = self.recognize_crop(&rot270, &dict)?;
+                    let ok270 = is_meaningful_ocr_line(&t270, c270);
+                    match (ok90, ok270) {
+                        (false, true) => (t270, c270),
+                        (true, true) if c270 > c90 => (t270, c270),
+                        _ => (t90, c90),
+                    }
+                }
             } else {
-                raw_crop
+                self.recognize_crop(&raw_crop, &dict)?
             };
-            let (text, mean_conf) = self.recognize_crop(&crop, &dict)?;
             if is_meaningful_ocr_line(&text, mean_conf) {
                 lines.push(text);
             }

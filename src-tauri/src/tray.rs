@@ -281,39 +281,65 @@ fn toggle_tray_popover(app: &AppHandle, tray_rect: Rect) {
     };
 
     let fallback_scale = popover.scale_factor().unwrap_or(1.0);
-    let (icon_x, icon_y) = match tray_rect.position {
-        Position::Physical(p) => (p.x as f64, p.y as f64),
-        Position::Logical(l) => (l.x * fallback_scale, l.y * fallback_scale),
-    };
-    let (icon_w, icon_h) = match tray_rect.size {
-        tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
-        tauri::Size::Logical(l) => (l.width * fallback_scale, l.height * fallback_scale),
-    };
-    let center_x = icon_x + icon_w / 2.0;
-    let center_y = icon_y + icon_h / 2.0;
-    // Match against `available_monitors()` using physical coordinates directly so macOS Retina
-    // displays (where `monitor_from_point` uses logical points) still find the exact monitor.
-    let monitor = app
-        .available_monitors()
-        .ok()
-        .and_then(|monitors| {
-            monitors.into_iter().find(|m| {
-                let mp = m.position();
-                let ms = m.size();
-                let mx = mp.x as f64;
-                let my = mp.y as f64;
-                center_x >= mx
-                    && center_x < mx + ms.width as f64
-                    && center_y >= my
-                    && center_y < my + ms.height as f64
-            })
-        })
-        .or_else(|| {
-            app.monitor_from_point(center_x / fallback_scale, center_y / fallback_scale)
+    // When Tauri reports logical coordinates (e.g. macOS Retina / mixed-DPI monitors), resolve the
+    // target monitor FIRST using logical points so we convert with THAT monitor's scale factor.
+    let (monitor, icon_x, icon_y, icon_w, icon_h) = match tray_rect.position {
+        Position::Logical(l) => {
+            let (lw, lh) = match tray_rect.size {
+                tauri::Size::Logical(s) => (s.width, s.height),
+                tauri::Size::Physical(s) => (
+                    s.width as f64 / fallback_scale,
+                    s.height as f64 / fallback_scale,
+                ),
+            };
+            let mon = app
+                .monitor_from_point(l.x + lw / 2.0, l.y + lh / 2.0)
                 .ok()
                 .flatten()
-        })
-        .or_else(|| popover.current_monitor().ok().flatten());
+                .or_else(|| app.monitor_from_point(l.x, l.y).ok().flatten())
+                .or_else(|| popover.current_monitor().ok().flatten());
+            let scale = mon
+                .as_ref()
+                .map(|m| m.scale_factor())
+                .unwrap_or(fallback_scale);
+            let (pw, ph) = match tray_rect.size {
+                tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+                tauri::Size::Logical(s) => (s.width * scale, s.height * scale),
+            };
+            (mon, l.x * scale, l.y * scale, pw, ph)
+        }
+        Position::Physical(p) => {
+            let (pw, ph) = match tray_rect.size {
+                tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+                tauri::Size::Logical(s) => (s.width * fallback_scale, s.height * fallback_scale),
+            };
+            let cx = p.x as f64 + pw / 2.0;
+            let cy = p.y as f64 + ph / 2.0;
+            let mon = app
+                .available_monitors()
+                .ok()
+                .and_then(|monitors| {
+                    monitors.into_iter().find(|m| {
+                        let mp = m.position();
+                        let ms = m.size();
+                        let mx = mp.x as f64;
+                        let my = mp.y as f64;
+                        cx >= mx
+                            && cx < mx + ms.width as f64
+                            && cy >= my
+                            && cy < my + ms.height as f64
+                    })
+                })
+                .or_else(|| {
+                    app.monitor_from_point(cx / fallback_scale, cy / fallback_scale)
+                        .ok()
+                        .flatten()
+                })
+                .or_else(|| popover.current_monitor().ok().flatten());
+            (mon, p.x as f64, p.y as f64, pw, ph)
+        }
+    };
+    let center_x = icon_x + icon_w / 2.0;
     let scale = monitor
         .as_ref()
         .map(|m| m.scale_factor())

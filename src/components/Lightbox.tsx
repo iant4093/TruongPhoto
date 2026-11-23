@@ -18,6 +18,7 @@ import {
   mediaThumbUrl,
   setAssetFavorite,
   trashAssets,
+  triggerAssetDownload,
 } from '../lib/api';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
 import { formatDateTime } from '../lib/format';
@@ -32,10 +33,79 @@ import { WindowsCaptionButtons, isWindowsPlatform } from './WindowControls';
 
 const showWindowsCaption = isTauri() && isWindowsPlatform();
 
+const MAX_DETAIL_CACHE = 80;
+const MAX_PRELOAD_IMAGES = 24;
+const SLIDE_TRANSITION_MS = 240;
+
+const detailCache = new Map<string, AssetDetail>();
+const previewImageCache = new Map<string, HTMLImageElement>();
+const decodedUrlSet = new Set<string>();
+
+function getCachedDetail(id: string): AssetDetail | null {
+  const hit = detailCache.get(id) ?? null;
+  if (hit) {
+    detailCache.delete(id);
+    detailCache.set(id, hit);
+  }
+  return hit;
+}
+
+function setCachedDetail(id: string, detail: AssetDetail): void {
+  if (detailCache.has(id)) detailCache.delete(id);
+  detailCache.set(id, detail);
+  if (detailCache.size > MAX_DETAIL_CACHE) {
+    const oldest = detailCache.keys().next().value;
+    if (oldest !== undefined) detailCache.delete(oldest);
+  }
+}
+
+function preloadPreviewUrl(url: string): void {
+  if (typeof Image === 'undefined') return;
+  if (previewImageCache.has(url)) {
+    const existing = previewImageCache.get(url)!;
+    previewImageCache.delete(url);
+    previewImageCache.set(url, existing);
+    return;
+  }
+  const img = new Image();
+  img.decoding = 'async';
+  img.onload = () => {
+    decodedUrlSet.add(url);
+  };
+  img.src = url;
+  if (typeof img.decode === 'function') {
+    img
+      .decode()
+      .then(() => {
+        decodedUrlSet.add(url);
+      })
+      .catch(() => {});
+  }
+  previewImageCache.set(url, img);
+  if (previewImageCache.size > MAX_PRELOAD_IMAGES) {
+    const oldest = previewImageCache.keys().next().value;
+    if (oldest !== undefined) previewImageCache.delete(oldest);
+  }
+}
+
+export function clearLightboxCaches(): void {
+  detailCache.clear();
+  previewImageCache.clear();
+  decodedUrlSet.clear();
+}
+
 function touchDistance(a: React.Touch, b: React.Touch): number {
   const dx = a.clientX - b.clientX;
   const dy = a.clientY - b.clientY;
   return Math.hypot(dx, dy);
+}
+
+interface ExitingSlide {
+  key: string;
+  assetId: string;
+  previewUrl: string;
+  thumbUrl: string;
+  dir: 'next' | 'prev';
 }
 
 export const Lightbox: React.FC = () => {
@@ -47,28 +117,48 @@ export const Lightbox: React.FC = () => {
   const removeLightboxAsset = useAppStore((s) => s.removeLightboxAsset);
   const bumpLibraryRevision = useAppStore((s) => s.bumpLibraryRevision);
   const user = useAppStore((s) => s.user);
+  const authenticated = useAppStore((s) => s.authenticated);
 
   const canMutate = user?.role === 'admin' || user?.role === 'contributor';
 
-  const [detail, setDetail] = useState<AssetDetail | null>(null);
+  const [detail, setDetail] = useState<AssetDetail | null>(() =>
+    lightboxAssetId ? getCachedDetail(lightboxAssetId) : null,
+  );
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [infoOpen, setInfoOpen] = useState(false);
   const [rawDemosaic, setRawDemosaic] = useState(false);
   const [livePlaying, setLivePlaying] = useState(false);
+  const [liveVideoReady, setLiveVideoReady] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
-  const [isWheeling, setIsWheeling] = useState(false);
-  const [hiResLoadedUrl, setHiResLoadedUrl] = useState<string | null>(null);
+  const [animateZoom, setAnimateZoom] = useState(false);
+
+  // Stacked zero-flash media readiness state
+  const [previewLoadedUrl, setPreviewLoadedUrl] = useState<string | null>(null);
+  const [readyOverlayUrl, setReadyOverlayUrl] = useState<string | null>(null);
+  const [overlayVisible, setOverlayVisible] = useState(false);
   const [hiResLoading, setHiResLoading] = useState(false);
+
+  // Smooth dual-slot slide transition state
   const [navDir, setNavDir] = useState<'fade' | 'next' | 'prev'>('fade');
+  const [exitingSlide, setExitingSlide] = useState<ExitingSlide | null>(null);
 
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
-  const wheelTimerRef = useRef<number | null>(null);
+  const exitingTimerRef = useRef<number | null>(null);
+  const slideSeqRef = useRef(0);
+  const prevAssetRef = useRef<{ id: string; previewUrl: string } | null>(null);
+  const wasOpenRef = useRef(false);
+  const zoomRef = useRef(1);
+  const panRef = useRef({ x: 0, y: 0 });
+  const readyOverlayUrlRef = useRef<string | null>(null);
+  zoomRef.current = zoom;
+  panRef.current = pan;
+  readyOverlayUrlRef.current = readyOverlayUrl;
 
   // Touch & pointer gesture tracking
   const gestureRef = useRef<{
@@ -97,6 +187,13 @@ export const Lightbox: React.FC = () => {
     didDrag: false,
   });
 
+  // Clear caches when user signs out so another profile never sees stale details.
+  useEffect(() => {
+    if (!authenticated) {
+      clearLightboxCaches();
+    }
+  }, [authenticated]);
+
   const clearLongPress = useCallback(() => {
     if (gestureRef.current.longPressTimer !== null) {
       window.clearTimeout(gestureRef.current.longPressTimer);
@@ -104,7 +201,15 @@ export const Lightbox: React.FC = () => {
     }
   }, []);
 
-  useEffect(() => () => clearLongPress(), [clearLongPress]);
+  useEffect(() => {
+    return () => {
+      clearLongPress();
+      if (exitingTimerRef.current !== null) {
+        window.clearTimeout(exitingTimerRef.current);
+        exitingTimerRef.current = null;
+      }
+    };
+  }, [clearLongPress]);
 
   const currentIndex = useMemo(() => {
     if (!lightboxAssetId) return -1;
@@ -114,17 +219,44 @@ export const Lightbox: React.FC = () => {
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex >= 0 && currentIndex < lightboxAssetIds.length - 1;
 
+  const navigateWithSlide = useCallback(
+    (targetId: string, dir: 'next' | 'prev') => {
+      if (lightboxAssetId && lightboxAssetId !== targetId) {
+        const curPreview =
+          prevAssetRef.current?.id === lightboxAssetId
+            ? prevAssetRef.current.previewUrl
+            : mediaPreviewUrl(lightboxAssetId);
+        slideSeqRef.current += 1;
+        setExitingSlide({
+          key: `${lightboxAssetId}-${slideSeqRef.current}`,
+          assetId: lightboxAssetId,
+          previewUrl: curPreview,
+          thumbUrl: mediaThumbUrl(lightboxAssetId),
+          dir,
+        });
+        if (exitingTimerRef.current !== null) {
+          window.clearTimeout(exitingTimerRef.current);
+        }
+        exitingTimerRef.current = window.setTimeout(() => {
+          setExitingSlide(null);
+          exitingTimerRef.current = null;
+        }, SLIDE_TRANSITION_MS + 30);
+      }
+      setNavDir(dir);
+      setLightboxAsset(targetId);
+    },
+    [lightboxAssetId, setLightboxAsset],
+  );
+
   const goPrev = useCallback(() => {
     if (!hasPrev) return;
-    setNavDir('prev');
-    setLightboxAsset(lightboxAssetIds[currentIndex - 1]);
-  }, [currentIndex, hasPrev, lightboxAssetIds, setLightboxAsset]);
+    navigateWithSlide(lightboxAssetIds[currentIndex - 1], 'prev');
+  }, [currentIndex, hasPrev, lightboxAssetIds, navigateWithSlide]);
 
   const goNext = useCallback(() => {
     if (!hasNext) return;
-    setNavDir('next');
-    setLightboxAsset(lightboxAssetIds[currentIndex + 1]);
-  }, [currentIndex, hasNext, lightboxAssetIds, setLightboxAsset]);
+    navigateWithSlide(lightboxAssetIds[currentIndex + 1], 'next');
+  }, [currentIndex, hasNext, lightboxAssetIds, navigateWithSlide]);
 
   useEffect(() => {
     clearLongPress();
@@ -133,27 +265,54 @@ export const Lightbox: React.FC = () => {
       setDetailLoading(false);
       setInfoOpen(false);
       setNavDir('fade');
+      setExitingSlide(null);
+      prevAssetRef.current = null;
+      if (exitingTimerRef.current !== null) {
+        window.clearTimeout(exitingTimerRef.current);
+        exitingTimerRef.current = null;
+      }
       return;
     }
 
+    const cached = getCachedDetail(lightboxAssetId);
+    const nextPreview = cached?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId);
+    prevAssetRef.current = { id: lightboxAssetId, previewUrl: nextPreview };
+
     let active = true;
-    setDetailLoading(true);
     setError(null);
     setRawDemosaic(false);
     setLivePlaying(false);
+    setLiveVideoReady(false);
+    setAnimateZoom(false);
     setZoom(1);
     setPan({ x: 0, y: 0 });
-    setHiResLoadedUrl(null);
+    setReadyOverlayUrl(null);
+    setOverlayVisible(false);
     setHiResLoading(false);
+    setPreviewLoadedUrl(decodedUrlSet.has(nextPreview) ? nextPreview : null);
+
+    if (cached) {
+      setDetail(cached);
+      setDetailLoading(false);
+    } else {
+      setDetailLoading(true);
+    }
 
     void getAssetDetail(lightboxAssetId)
       .then((res) => {
         if (!active) return;
+        setCachedDetail(lightboxAssetId, res);
         setDetail(res);
+        prevAssetRef.current = {
+          id: lightboxAssetId,
+          previewUrl: res.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId),
+        };
       })
       .catch((err) => {
         if (!active) return;
-        setError(errorMessage(err));
+        if (!cached) {
+          setError(errorMessage(err));
+        }
       })
       .finally(() => {
         if (active) setDetailLoading(false);
@@ -165,21 +324,39 @@ export const Lightbox: React.FC = () => {
     };
   }, [clearLongPress, lightboxAssetId]);
 
-  // Preload adjacent prev/next photo previews in the background for instantaneous arrow navigation.
+  // Preload adjacent ±1 and ±2 preview images AND AssetDetail metadata so photo switching is instant & flash-free.
   useEffect(() => {
     if (!lightboxAssetId || currentIndex < 0) return;
-    const neighbors = [
-      lightboxAssetIds[currentIndex + 1],
-      lightboxAssetIds[currentIndex - 1],
-    ].filter((id): id is string => Boolean(id));
+    let cancelled = false;
+    const offsets = [1, -1, 2, -2];
+    const neighbors = offsets
+      .map((delta) => lightboxAssetIds[currentIndex + delta])
+      .filter((id): id is string => Boolean(id) && id !== lightboxAssetId);
+
     for (const id of neighbors) {
-      const img = new Image();
-      img.decoding = 'async';
-      img.src = mediaPreviewUrl(id);
+      const cached = getCachedDetail(id);
+      preloadPreviewUrl(cached?.playback.preview_url ?? mediaPreviewUrl(id));
+      if (!cached) {
+        void getAssetDetail(id)
+          .then((res) => {
+            if (cancelled) return;
+            setCachedDetail(id, res);
+            if (res.playback.preview_url) {
+              preloadPreviewUrl(res.playback.preview_url);
+            }
+          })
+          .catch(() => {});
+      }
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [currentIndex, lightboxAssetId, lightboxAssetIds]);
 
   const activeDetail = detail?.summary.id === lightboxAssetId ? detail : null;
+  // Keep prior detail ONLY to stabilize non-conflicting toolbar layout during cold cache misses.
+  const toolbarDetail = activeDetail ?? detail;
 
   const clampPan = useCallback((x: number, y: number, targetZoom: number) => {
     if (targetZoom <= 1.02) return { x: 0, y: 0 };
@@ -194,30 +371,30 @@ export const Lightbox: React.FC = () => {
     };
   }, []);
 
-  // Move focus into Lightbox overlay when opened so keyboard navigation stays scoped.
+  // Move focus into Lightbox overlay ONLY when transitioning from closed -> open (prevents focus-ring flicker on next/prev).
   useEffect(() => {
-    if (lightboxAssetId) {
+    const isOpen = Boolean(lightboxAssetId);
+    if (isOpen && !wasOpenRef.current) {
       overlayRef.current?.focus({ preventScroll: true });
     }
+    wasOpenRef.current = isOpen;
   }, [lightboxAssetId]);
 
   const handleToggleFavorite = useCallback(async () => {
     if (!canMutate || !lightboxAssetId || !activeDetail) return;
     const nextFav = !activeDetail.summary.is_favorite;
-    setDetail((prev) =>
-      prev && prev.summary.id === lightboxAssetId
-        ? { ...prev, summary: { ...prev.summary, is_favorite: nextFav } }
-        : prev,
-    );
+    const optimistic: AssetDetail = {
+      ...activeDetail,
+      summary: { ...activeDetail.summary, is_favorite: nextFav },
+    };
+    setCachedDetail(lightboxAssetId, optimistic);
+    setDetail(optimistic);
     try {
       await setAssetFavorite(lightboxAssetId, nextFav);
       bumpLibraryRevision();
     } catch (err) {
-      setDetail((prev) =>
-        prev && prev.summary.id === lightboxAssetId
-          ? { ...prev, summary: { ...prev.summary, is_favorite: !nextFav } }
-          : prev,
-      );
+      setCachedDetail(lightboxAssetId, activeDetail);
+      setDetail((prev) => (prev && prev.summary.id === lightboxAssetId ? activeDetail : prev));
       notifyError(err, 'Could not update favorite');
     }
   }, [activeDetail, bumpLibraryRevision, canMutate, lightboxAssetId]);
@@ -227,6 +404,7 @@ export const Lightbox: React.FC = () => {
     const trashedId = lightboxAssetId;
     try {
       await trashAssets([trashedId]);
+      detailCache.delete(trashedId);
       bumpLibraryRevision();
       notifySuccess('Moved item to Trash');
       removeLightboxAsset(trashedId);
@@ -236,6 +414,7 @@ export const Lightbox: React.FC = () => {
   }, [bumpLibraryRevision, canMutate, lightboxAssetId, removeLightboxAsset]);
 
   const togglePixelPeepZoom = useCallback(() => {
+    setAnimateZoom(true);
     setZoom((prev) => {
       if (prev > 1.05) {
         setPan({ x: 0, y: 0 });
@@ -262,6 +441,10 @@ export const Lightbox: React.FC = () => {
         return;
       }
 
+      if (event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+
       const target = event.target as HTMLElement | null;
       if (
         target &&
@@ -285,15 +468,13 @@ export const Lightbox: React.FC = () => {
         case 'Home':
           if (lightboxAssetIds.length > 0 && currentIndex !== 0) {
             event.preventDefault();
-            setNavDir('prev');
-            setLightboxAsset(lightboxAssetIds[0]);
+            navigateWithSlide(lightboxAssetIds[0], 'prev');
           }
           break;
         case 'End':
           if (lightboxAssetIds.length > 0 && currentIndex !== lightboxAssetIds.length - 1) {
             event.preventDefault();
-            setNavDir('next');
-            setLightboxAsset(lightboxAssetIds[lightboxAssetIds.length - 1]);
+            navigateWithSlide(lightboxAssetIds[lightboxAssetIds.length - 1], 'next');
           }
           break;
         case 'f':
@@ -309,10 +490,12 @@ export const Lightbox: React.FC = () => {
         case '+':
         case '=':
           event.preventDefault();
+          setAnimateZoom(true);
           setZoom((prev) => Math.min(5, Number((prev + 0.5).toFixed(2))));
           break;
         case '-':
           event.preventDefault();
+          setAnimateZoom(true);
           setZoom((prev) => {
             const next = Math.max(1, Number((prev - 0.5).toFixed(2)));
             if (next === 1) setPan({ x: 0, y: 0 });
@@ -321,6 +504,7 @@ export const Lightbox: React.FC = () => {
           break;
         case '0':
           event.preventDefault();
+          setAnimateZoom(true);
           setZoom(1);
           setPan({ x: 0, y: 0 });
           break;
@@ -336,7 +520,10 @@ export const Lightbox: React.FC = () => {
             activeDetail?.summary.kind === 'motion_photo'
           ) {
             event.preventDefault();
-            setLivePlaying((prev) => !prev);
+            setLivePlaying((prev) => {
+              if (prev) setLiveVideoReady(false);
+              return !prev;
+            });
           }
           break;
         }
@@ -351,11 +538,14 @@ export const Lightbox: React.FC = () => {
   }, [
     activeDetail,
     closeLightbox,
+    currentIndex,
     goNext,
     goPrev,
     handleToggleFavorite,
     infoOpen,
     lightboxAssetId,
+    lightboxAssetIds,
+    navigateWithSlide,
   ]);
 
   const isVideo =
@@ -397,51 +587,38 @@ export const Lightbox: React.FC = () => {
     return mediaOriginalUrl(lightboxAssetId);
   }, [browserNativeOriginal, hasRaw, isVideo, lightboxAssetId, primaryExt, rawDemosaic]);
 
-  // Progressive full-resolution pixel-peeping: automatically preload & decode full original when zoomed in.
+  // Zero-flash stacked hi-res / RAW overlay:
+  // Keeps the base preview <img> untouched underneath; mounts the overlay <img> at opacity 0
+  // and fades it in smoothly ONLY after load + decode(). Stays mounted on zoom-out so zooming
+  // in and out never swaps src or flashes!
+  const wantsOverlay = Boolean(
+    lightboxAssetId && !isVideo && fullResUrl && (rawDemosaic || zoom > 1.05),
+  );
+
   useEffect(() => {
-    if (!lightboxAssetId || !fullResUrl || isVideo || rawDemosaic) return;
-    if (zoom <= 1.05) return;
-    if (hiResLoadedUrl === fullResUrl) return;
-
-    let cancelled = false;
-    setHiResLoading(true);
-    const loader = new Image();
-    loader.decoding = 'async';
-
-    const finalize = () => {
-      if (cancelled) return;
-      setHiResLoadedUrl(fullResUrl);
+    if (!lightboxAssetId || isVideo || !fullResUrl) return;
+    if (!wantsOverlay) {
+      // When toggling RAW 100% back to Preview at 1x, smoothly fade out RAW overlay while preview stays painted.
+      if (!rawDemosaic && readyOverlayUrl?.includes('mode=raw_demosaic')) {
+        setOverlayVisible(false);
+      }
       setHiResLoading(false);
-    };
-    const fail = () => {
-      if (cancelled) return;
-      setHiResLoading(false);
-    };
-
-    loader.onload = finalize;
-    loader.onerror = fail;
-    loader.src = fullResUrl;
-
-    if (typeof loader.decode === 'function') {
-      loader
-        .decode()
-        .then(finalize)
-        .catch(() => {
-          if (loader.complete && loader.naturalWidth === 0) {
-            fail();
-          }
-        });
+      return;
     }
 
-    return () => {
-      cancelled = true;
-      loader.onload = null;
-      loader.onerror = null;
-    };
-  }, [fullResUrl, hiResLoadedUrl, isVideo, lightboxAssetId, rawDemosaic, zoom]);
+    if (readyOverlayUrl !== fullResUrl) {
+      setReadyOverlayUrl(fullResUrl);
+    }
+    if (decodedUrlSet.has(fullResUrl)) {
+      setOverlayVisible(true);
+      setHiResLoading(false);
+    } else {
+      setOverlayVisible(false);
+      setHiResLoading(true);
+    }
+  }, [fullResUrl, isVideo, lightboxAssetId, rawDemosaic, readyOverlayUrl, wantsOverlay]);
 
-  // Native non-passive wheel zoom listener so preventDefault works cleanly without console warnings
-  // and wheel ticks zoom smoothly without CSS transition stutter.
+  // Native non-passive wheel zoom listener with pointer focal-point anchoring & zero CSS transition jitter.
   useEffect(() => {
     const el = stageRef.current;
     if (!el || !lightboxAssetId) return;
@@ -449,59 +626,58 @@ export const Lightbox: React.FC = () => {
       if (isVideo) return;
       if (Math.abs(e.deltaY) < 1) return;
       e.preventDefault();
-      setIsWheeling(true);
-      if (wheelTimerRef.current !== null) {
-        window.clearTimeout(wheelTimerRef.current);
-      }
-      wheelTimerRef.current = window.setTimeout(() => {
-        setIsWheeling(false);
-        wheelTimerRef.current = null;
-      }, 140);
+      setAnimateZoom(false);
 
-      const factor = e.deltaY < 0 ? 1.14 : 1 / 1.14;
-      setZoom((prev) => {
-        const next = Math.min(5, Math.max(1, Number((prev * factor).toFixed(2))));
-        if (next <= 1.02) {
-          setPan({ x: 0, y: 0 });
-          return 1;
-        }
-        setPan((cur) => clampPan(cur.x, cur.y, next));
-        return next;
-      });
+      const curZoom = zoomRef.current;
+      const curPan = panRef.current;
+      // Smooth continuous delta scaling for both trackpad pinch/scroll and notched mice.
+      const clampedDelta = Math.max(-140, Math.min(140, e.deltaY));
+      const factor = Math.exp(-clampedDelta * 0.0025);
+      const nextZoom = Math.min(5, Math.max(1, Number((curZoom * factor).toFixed(3))));
+      if (nextZoom <= 1.02) {
+        setZoom(1);
+        setPan({ x: 0, y: 0 });
+        return;
+      }
+
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dx = e.clientX - cx;
+      const dy = e.clientY - cy;
+      const ratio = nextZoom / curZoom;
+      const nextPanX = curPan.x * ratio + dx * (1 - ratio);
+      const nextPanY = curPan.y * ratio + dy * (1 - ratio);
+      setZoom(nextZoom);
+      setPan(clampPan(nextPanX, nextPanY, nextZoom));
     };
     el.addEventListener('wheel', onNativeWheel, { passive: false });
     return () => {
       el.removeEventListener('wheel', onNativeWheel);
-      if (wheelTimerRef.current !== null) {
-        window.clearTimeout(wheelTimerRef.current);
-        wheelTimerRef.current = null;
-      }
     };
   }, [clampPan, isVideo, lightboxAssetId]);
 
   if (!lightboxAssetId) return null;
 
+  const titleDetail = activeDetail ?? toolbarDetail;
+  const titlePrimaryFile =
+    titleDetail?.files.find((f) => f.file_role === 'primary') ?? titleDetail?.files[0];
   const titleText =
-    activeDetail?.overrides?.title ||
-    activeDetail?.summary.title ||
-    primaryFile?.rel_path.split(/[\\/]/).pop() ||
-    'Media';
+    titleDetail?.overrides?.title ||
+    titleDetail?.summary.title ||
+    titlePrimaryFile?.rel_path.split(/[\\/]/).pop() ||
+    '\u00A0';
 
   const previewUrl = activeDetail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId);
-  const usingHiRes = Boolean(
-    rawDemosaic || (fullResUrl && hiResLoadedUrl === fullResUrl && zoom > 1.05),
-  );
-  const stillUrl = rawDemosaic
-    ? mediaOriginalUrl(lightboxAssetId, { mode: 'raw_demosaic' })
-    : usingHiRes
-      ? fullResUrl!
-      : previewUrl;
-
+  const thumbUrl = mediaThumbUrl(lightboxAssetId);
+  const previewIsReady = previewLoadedUrl === previewUrl || decodedUrlSet.has(previewUrl);
+  const usingHiRes = Boolean(readyOverlayUrl && overlayVisible && (rawDemosaic || zoom > 1.05));
   const liveVideoUrl = activeDetail?.playback.live_video_url ?? mediaLiveVideoUrl(lightboxAssetId);
 
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     clearLongPress();
     if (e.touches.length === 2) {
+      setAnimateZoom(false);
       gestureRef.current.pinchStartDist = touchDistance(e.touches[0], e.touches[1]);
       gestureRef.current.pinchStartZoom = zoom;
       gestureRef.current.wasPinching = true;
@@ -523,6 +699,7 @@ export const Lightbox: React.FC = () => {
       gestureRef.current.pinchStartDist = null;
       if (hasLiveClip && !isVideo) {
         gestureRef.current.longPressTimer = window.setTimeout(() => {
+          setLiveVideoReady(false);
           setLivePlaying(true);
         }, 420);
       }
@@ -532,6 +709,7 @@ export const Lightbox: React.FC = () => {
   const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
     clearLongPress();
     if (e.touches.length === 2 && gestureRef.current.pinchStartDist) {
+      setAnimateZoom(false);
       const dist = touchDistance(e.touches[0], e.touches[1]);
       const scaleFactor = dist / gestureRef.current.pinchStartDist;
       const nextZoom = Math.min(4, Math.max(1, gestureRef.current.pinchStartZoom * scaleFactor));
@@ -540,6 +718,7 @@ export const Lightbox: React.FC = () => {
       return;
     }
     if (e.touches.length === 1 && zoom > 1) {
+      setAnimateZoom(false);
       const t = e.touches[0];
       const dx = t.clientX - gestureRef.current.startX;
       const dy = t.clientY - gestureRef.current.startY;
@@ -581,6 +760,7 @@ export const Lightbox: React.FC = () => {
     gestureRef.current.startPanX = pan.x;
     gestureRef.current.startPanY = pan.y;
     if (zoom > 1.05) {
+      setAnimateZoom(false);
       gestureRef.current.dragging = true;
       setIsDragging(true);
     }
@@ -607,6 +787,7 @@ export const Lightbox: React.FC = () => {
       gestureRef.current.didDrag = false;
       return;
     }
+    setAnimateZoom(true);
     if (zoom > 1.05) {
       setZoom(1);
       setPan({ x: 0, y: 0 });
@@ -642,6 +823,7 @@ export const Lightbox: React.FC = () => {
               label: zoom > 1.05 ? 'Reset Zoom (100%)' : 'Zoom In (225%)',
               icon: <ZoomIn size={14} />,
               onSelect: () => {
+                setAnimateZoom(true);
                 if (zoom > 1.05) {
                   setZoom(1);
                   setPan({ x: 0, y: 0 });
@@ -676,7 +858,7 @@ export const Lightbox: React.FC = () => {
         label: 'Download Original',
         icon: <Download size={14} />,
         onSelect: () => {
-          window.open(mediaOriginalUrl(lightboxAssetId, { download: true }), '_blank', 'noopener');
+          triggerAssetDownload(lightboxAssetId);
         },
       },
       ...(canMutate
@@ -694,6 +876,37 @@ export const Lightbox: React.FC = () => {
     ]);
   };
 
+  const subtitleText = titleDetail
+    ? [
+        formatDateTime(titleDetail.summary.capture_at_ms),
+        titleDetail.photo_meta?.focal_length_mm != null && titleDetail.photo_meta.focal_length_mm > 0
+          ? `${Math.round(titleDetail.photo_meta.focal_length_mm)}mm`
+          : null,
+        titleDetail.photo_meta?.aperture_f != null && titleDetail.photo_meta.aperture_f > 0
+          ? `f/${Number(titleDetail.photo_meta.aperture_f.toFixed(1))}`
+          : null,
+        titleDetail.photo_meta?.shutter_speed_sec != null &&
+        titleDetail.photo_meta.shutter_speed_sec > 0
+          ? titleDetail.photo_meta.shutter_speed_sec >= 1
+            ? `${Number(titleDetail.photo_meta.shutter_speed_sec.toFixed(1))}s`
+            : `1/${Math.max(1, Math.round(1 / titleDetail.photo_meta.shutter_speed_sec))}s`
+          : null,
+        titleDetail.photo_meta?.iso != null && titleDetail.photo_meta.iso > 0
+          ? `ISO ${titleDetail.photo_meta.iso}`
+          : null,
+        lightboxAssetIds.length > 1 && currentIndex >= 0
+          ? `${currentIndex + 1} / ${lightboxAssetIds.length}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    : lightboxAssetIds.length > 1 && currentIndex >= 0
+      ? `${currentIndex + 1} / ${lightboxAssetIds.length}`
+      : '\u00A0';
+
+  const isFav = Boolean(activeDetail?.summary.is_favorite);
+  const hdLabel = hiResLoading ? 'HD…' : usingHiRes ? 'HD' : null;
+
   return (
     <div
       ref={overlayRef}
@@ -703,7 +916,7 @@ export const Lightbox: React.FC = () => {
       aria-modal="true"
       aria-label="Media lightbox"
     >
-      <header className="lightbox-toolbar" data-tauri-drag-region>
+      <header className="lightbox-toolbar" data-tauri-drag-region="deep">
         <div
           className="row lightbox-toolbar-left"
           style={{ gap: 10, minWidth: 0, flex: '1 1 180px' }}
@@ -717,11 +930,12 @@ export const Lightbox: React.FC = () => {
           >
             <X size={16} />
           </button>
-          <div style={{ minWidth: 0 }}>
+          <div style={{ minWidth: 0, minHeight: 31, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
             <div
               style={{
                 fontSize: 13,
                 fontWeight: 600,
+                lineHeight: 1.25,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
@@ -729,44 +943,24 @@ export const Lightbox: React.FC = () => {
             >
               {titleText}
             </div>
-            {activeDetail && (
-              <div
-                className="view-subtitle"
-                style={{
-                  marginTop: 0,
-                  fontSize: 11,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {[
-                  formatDateTime(activeDetail.summary.capture_at_ms),
-                  activeDetail.photo_meta?.focal_length_mm != null
-                    ? `${Math.round(activeDetail.photo_meta.focal_length_mm)}mm`
-                    : null,
-                  activeDetail.photo_meta?.aperture_f != null
-                    ? `f/${Number(activeDetail.photo_meta.aperture_f.toFixed(1))}`
-                    : null,
-                  activeDetail.photo_meta?.shutter_speed_sec != null &&
-                  activeDetail.photo_meta.shutter_speed_sec > 0
-                    ? activeDetail.photo_meta.shutter_speed_sec >= 1
-                      ? `${Number(activeDetail.photo_meta.shutter_speed_sec.toFixed(1))}s`
-                      : `1/${Math.max(1, Math.round(1 / activeDetail.photo_meta.shutter_speed_sec))}s`
-                    : null,
-                  activeDetail.photo_meta?.iso != null ? `ISO ${activeDetail.photo_meta.iso}` : null,
-                  lightboxAssetIds.length > 1 && currentIndex >= 0
-                    ? `${currentIndex + 1} / ${lightboxAssetIds.length}`
-                    : null,
-                ]
-                  .filter(Boolean)
-                  .join(' · ')}
-              </div>
-            )}
+            <div
+              className="view-subtitle"
+              style={{
+                marginTop: 0,
+                fontSize: 11,
+                lineHeight: 1.3,
+                fontVariantNumeric: 'tabular-nums',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {subtitleText}
+            </div>
           </div>
         </div>
 
-        <div className="row" style={{ gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+        <div className="row" style={{ gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', flexShrink: 0 }}>
           {hasRaw && !isVideo && (
             <div className="row" style={{ gap: 4 }} role="group" aria-label="RAW tier toggle">
               <button
@@ -793,7 +987,12 @@ export const Lightbox: React.FC = () => {
               type="button"
               className={`lightbox-live-badge${livePlaying ? ' is-playing' : ''}`}
               aria-pressed={livePlaying}
-              onClick={() => setLivePlaying((prev) => !prev)}
+              onClick={() => {
+                setLivePlaying((prev) => {
+                  if (prev) setLiveVideoReady(false);
+                  return !prev;
+                });
+              }}
             >
               <Play size={11} fill="currentColor" />
               <span>{activeDetail?.summary.kind === 'motion_photo' ? 'MOTION' : 'LIVE'}</span>
@@ -803,29 +1002,28 @@ export const Lightbox: React.FC = () => {
           {!isVideo && (
             <button
               type="button"
-              className={`lightbox-pill-btn${zoom > 1 ? ' is-active' : ''}`}
+              className={`lightbox-pill-btn lightbox-zoom-btn${zoom > 1 ? ' is-active' : ''}`}
               aria-pressed={zoom > 1}
               title={usingHiRes ? 'Viewing full original resolution' : 'Click photo or button to zoom'}
               onClick={togglePixelPeepZoom}
             >
               <ZoomIn size={13} />
               <span>{zoom > 1 ? `${zoom.toFixed(1)}×` : '100%'}</span>
-              {zoom > 1 && (
-                <span className="lightbox-hd-tag">{hiResLoading ? 'HD…' : usingHiRes ? 'HD' : ''}</span>
-              )}
+              {hdLabel && <span className="lightbox-hd-tag">{hdLabel}</span>}
             </button>
           )}
 
-          {canMutate && activeDetail && (
+          {canMutate && (
             <button
               type="button"
               className="icon-button"
-              aria-label={activeDetail.summary.is_favorite ? 'Remove favorite' : 'Favorite'}
-              aria-pressed={activeDetail.summary.is_favorite}
-              style={activeDetail.summary.is_favorite ? { color: '#f2cf6b' } : undefined}
+              disabled={!activeDetail}
+              aria-label={isFav ? 'Remove favorite' : 'Favorite'}
+              aria-pressed={isFav}
+              style={isFav ? { color: '#f2cf6b' } : undefined}
               onClick={() => void handleToggleFavorite()}
             >
-              <Star size={16} fill={activeDetail.summary.is_favorite ? 'currentColor' : 'none'} />
+              <Star size={16} fill={isFav ? 'currentColor' : 'none'} />
             </button>
           )}
 
@@ -890,60 +1088,134 @@ export const Lightbox: React.FC = () => {
             </button>
           )}
 
+          {/* Outgoing slide layer for simultaneous cross-slide photo-to-photo transitions */}
+          {exitingSlide && (
+            <div
+              key={exitingSlide.key}
+              className={`lightbox-media-frame is-exiting-${exitingSlide.dir}`}
+              aria-hidden="true"
+            >
+              <div className="lightbox-zoom-surface">
+                <img
+                  className="lightbox-media"
+                  src={exitingSlide.previewUrl}
+                  alt=""
+                  draggable={false}
+                />
+              </div>
+            </div>
+          )}
+
           {error ? (
             <div className="error-banner" role="alert">
               {error}
             </div>
           ) : isVideo && activeDetail ? (
-            <div
-              key={lightboxAssetId}
-              className={`lightbox-media-frame is-nav-${navDir}`}
-            >
+            <div key={lightboxAssetId} className={`lightbox-media-frame is-nav-${navDir}`}>
               <VideoPlayer
                 playback={activeDetail.playback}
-                posterUrl={mediaThumbUrl(lightboxAssetId)}
+                posterUrl={activeDetail.playback.preview_url ?? mediaThumbUrl(lightboxAssetId)}
                 initialTimestampSec={lightboxInitialTimestampSec}
                 className="lightbox-media"
               />
             </div>
           ) : (
-            <div
-              key={lightboxAssetId}
-              className={`lightbox-media-frame is-nav-${navDir}`}
-            >
-              <img
-                ref={imgRef}
-                className="lightbox-media"
-                src={stillUrl}
-                alt={titleText}
-                draggable={false}
-                onClick={handleImageClick}
+            <div key={lightboxAssetId} className={`lightbox-media-frame is-nav-${navDir}`}>
+              <div
+                className="lightbox-zoom-surface"
                 style={{
-                  transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-                  cursor: zoom > 1.05 ? (isDragging ? 'grabbing' : 'grab') : 'zoom-in',
-                  opacity: livePlaying ? 0 : 1,
-                  transition:
-                    isDragging || isWheeling
-                      ? 'opacity 180ms ease-out'
-                      : 'transform 200ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out',
+                  transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+                  transition: animateZoom
+                    ? 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1)'
+                    : 'none',
                 }}
-              />
+              >
+                {/* Instant cached grid thumbnail underlay so rapid navigation never cuts to black */}
+                {!previewIsReady && (
+                  <img
+                    className="lightbox-media lightbox-media-underlay"
+                    src={thumbUrl}
+                    alt=""
+                    aria-hidden="true"
+                    draggable={false}
+                  />
+                )}
 
-              {livePlaying && hasLiveClip && (
-                <video
+                {/* Stable base preview image: NEVER swaps src during zoom-in/out or RAW toggles */}
+                <img
+                  ref={imgRef}
                   className="lightbox-media"
-                  src={liveVideoUrl}
-                  playsInline
-                  muted
-                  autoPlay
-                  loop
+                  src={previewUrl}
+                  alt={titleText}
+                  draggable={false}
+                  decoding="async"
+                  onClick={handleImageClick}
+                  onLoad={(e) => {
+                    const el = e.currentTarget;
+                    if (el.naturalWidth > 0) {
+                      decodedUrlSet.add(previewUrl);
+                      setPreviewLoadedUrl(previewUrl);
+                    }
+                  }}
                   style={{
-                    position: 'absolute',
-                    inset: 0,
-                    margin: 'auto',
+                    cursor: zoom > 1.05 ? (isDragging ? 'grabbing' : 'grab') : 'zoom-in',
+                    opacity: previewIsReady ? 1 : 0,
+                    transition: 'opacity 140ms ease-out',
                   }}
                 />
-              )}
+
+                {/* Stacked decoded full-resolution / RAW 100% overlay: fades in seamlessly with zero flash */}
+                {readyOverlayUrl && (
+                  <img
+                    data-testid="lightbox-hires-layer"
+                    className="lightbox-media lightbox-media-overlay"
+                    src={readyOverlayUrl}
+                    alt=""
+                    aria-hidden="true"
+                    draggable={false}
+                    decoding="async"
+                    onLoad={(e) => {
+                      const el = e.currentTarget;
+                      const url = readyOverlayUrl;
+                      const reveal = () => {
+                        decodedUrlSet.add(url);
+                        if (readyOverlayUrlRef.current === url) {
+                          setOverlayVisible(true);
+                          setHiResLoading(false);
+                        }
+                      };
+                      if (typeof el.decode === 'function') {
+                        el.decode().then(reveal, reveal);
+                      } else {
+                        reveal();
+                      }
+                    }}
+                    onError={() => {
+                      setHiResLoading(false);
+                    }}
+                    style={{
+                      opacity: overlayVisible ? 1 : 0,
+                    }}
+                  />
+                )}
+
+                {/* Live Photo video fades in ONLY once playback frame is ready (zero black flash) */}
+                {livePlaying && hasLiveClip && (
+                  <video
+                    className="lightbox-media lightbox-media-overlay"
+                    src={liveVideoUrl}
+                    poster={previewUrl}
+                    playsInline
+                    muted
+                    autoPlay
+                    loop
+                    onPlaying={() => setLiveVideoReady(true)}
+                    style={{
+                      opacity: liveVideoReady ? 1 : 0,
+                    }}
+                  />
+                )}
+              </div>
             </div>
           )}
 
@@ -979,7 +1251,10 @@ export const Lightbox: React.FC = () => {
               assetId={lightboxAssetId}
               initialDetail={activeDetail}
               loadingInitialDetail={detailLoading}
-              onAssetUpdated={(updated) => setDetail(updated)}
+              onAssetUpdated={(updated) => {
+                setCachedDetail(updated.summary.id, updated);
+                setDetail(updated);
+              }}
             />
           </aside>
         )}

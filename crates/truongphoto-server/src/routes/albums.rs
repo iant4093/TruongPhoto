@@ -160,6 +160,14 @@ pub async fn update_album(
             "Contributor or Administrator privileges are required to edit albums.",
         ));
     }
+    if let Some(ref raw_title) = req.title {
+        let trimmed = raw_title.trim();
+        if trimmed.is_empty() || trimmed.len() > 200 {
+            return Err(AppError::validation(
+                "Album title must be 1..=200 characters.",
+            ));
+        }
+    }
     let user_id = rbac.auth.user.id;
     let role = rbac.auth.user.role;
     let scope = rbac.scope;

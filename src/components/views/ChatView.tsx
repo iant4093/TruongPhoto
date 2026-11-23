@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ArrowUp,
   Download,
@@ -12,7 +12,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { listPeople, mediaOriginalUrl, mediaThumbUrl, warmupChat } from '../../lib/api';
+import { listPeople, mediaThumbUrl, triggerAssetDownload, warmupChat } from '../../lib/api';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../../lib/escapeStack';
 import { isTauri } from '../../lib/tauri';
 import { notifyError, notifySuccess } from '../../store/feedback';
@@ -262,6 +262,61 @@ function renderFormattedReply(content: string): React.ReactNode {
   });
 }
 
+const ThinkingIndicator: React.FC<{
+  activeTier: ChatTier;
+  startedAt: number | null;
+}> = ({ activeTier, startedAt }) => {
+  const [thinkingSecs, setThinkingSecs] = useState(() =>
+    startedAt ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) : 0,
+  );
+
+  useEffect(() => {
+    const base = startedAt ?? Date.now();
+    setThinkingSecs(Math.max(0, Math.floor((Date.now() - base) / 1000)));
+    const id = window.setInterval(() => {
+      setThinkingSecs(Math.max(0, Math.floor((Date.now() - base) / 1000)));
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [startedAt]);
+
+  const thinkingLabel =
+    activeTier === 'tier0'
+      ? 'Searching library…'
+      : thinkingSecs >= 5
+        ? 'Thinking with Gemma 4 & searching library…'
+        : 'Thinking with Gemma 4…';
+
+  return (
+    <div className="chat-bubble-row is-assistant" role="status" aria-live="polite">
+      <div className="chat-assistant-avatar is-pulsing" aria-hidden="true">
+        <Sparkles size={13} />
+      </div>
+      <div className="chat-bubble is-assistant is-thinking">
+        <div className="chat-thinking-line">
+          <span className="chat-thinking-dots" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </span>
+          <span className="chat-thinking-label">{thinkingLabel}</span>
+          <span
+            className="chat-elapsed-pill"
+            style={{
+              fontVariantNumeric: 'tabular-nums',
+              minWidth: 28,
+              textAlign: 'center',
+              opacity: thinkingSecs > 0 ? 1 : 0,
+              transition: 'opacity 140ms ease',
+            }}
+          >
+            {thinkingSecs > 0 ? `${thinkingSecs}s` : '0s'}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export const ChatView: React.FC = () => {
   const chatSessions = useAppStore((s) => s.chatSessions);
   const activeChatSessionId = useAppStore((s) => s.activeChatSessionId);
@@ -288,7 +343,6 @@ export const ChatView: React.FC = () => {
   const [isNarrowViewport, setIsNarrowViewport] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth <= 960 : false,
   );
-  const [thinkingSecs, setThinkingSecs] = useState(0);
   const [warmingModel, setWarmingModel] = useState(false);
   const [warmupTier, setWarmupTier] = useState<ChatTier | null>(null);
 
@@ -357,20 +411,6 @@ export const ChatView: React.FC = () => {
       if (warmTimer !== null) window.clearTimeout(warmTimer);
     };
   }, [loadChatSessions, refreshAiDashboard, user?.role]);
-
-  // Live elapsed timer for the animated thinking bubble.
-  useEffect(() => {
-    if (!chatSending) {
-      setThinkingSecs(0);
-      return;
-    }
-    const base = chatPendingStartedAt ?? Date.now();
-    setThinkingSecs(Math.max(0, Math.floor((Date.now() - base) / 1000)));
-    const id = window.setInterval(() => {
-      setThinkingSecs(Math.max(0, Math.floor((Date.now() - base) / 1000)));
-    }, 500);
-    return () => window.clearInterval(id);
-  }, [chatPendingStartedAt, chatSending]);
 
   // Smooth auto-scroll: follow thinking bubble to bottom, and frame new photo-heavy replies at their header.
   useEffect(() => {
@@ -441,8 +481,8 @@ export const ChatView: React.FC = () => {
     void runSearch(req).catch((err) => notifyError(err, 'Could not open search results'));
   };
 
-  // Auto-resize composer textarea cleanly.
-  useEffect(() => {
+  // Auto-resize composer textarea before paint to avoid 1-row collapse flashes.
+  useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
@@ -502,13 +542,6 @@ export const ChatView: React.FC = () => {
       notifyError(err, 'Could not delete conversation');
     }
   };
-
-  const thinkingLabel =
-    activeTier === 'tier0'
-      ? 'Searching library…'
-      : thinkingSecs >= 5
-        ? 'Thinking with Gemma 4 & searching library…'
-        : 'Thinking with Gemma 4…';
 
   return (
     <div className="chat-workspace" aria-label="Ask AI Assistant">
@@ -709,9 +742,11 @@ export const ChatView: React.FC = () => {
             ) : (
               <div className="chat-thread-messages">
                 {chatMessages.map((msg, msgIndex) => {
+                  const stableKey =
+                    (msg as { _clientKey?: string })._clientKey ?? msg.id;
                   if (msg.role === 'user') {
                     return (
-                      <div key={msg.id} className="chat-bubble-row is-user">
+                      <div key={stableKey} className="chat-bubble-row is-user">
                         <div className="chat-bubble is-user">{msg.content}</div>
                       </div>
                     );
@@ -822,11 +857,7 @@ export const ChatView: React.FC = () => {
                                           label: 'Download Original',
                                           icon: <Download size={14} />,
                                           onSelect: () => {
-                                            window.open(
-                                              mediaOriginalUrl(hit.asset.id, { download: true }),
-                                              '_blank',
-                                              'noopener',
-                                            );
+                                            triggerAssetDownload(hit.asset.id);
                                           },
                                         },
                                       ])
@@ -836,6 +867,7 @@ export const ChatView: React.FC = () => {
                                       src={mediaThumbUrl(hit.asset.id)}
                                       alt={title}
                                       loading="lazy"
+                                      decoding="async"
                                     />
                                     {hasTs && (
                                       <span className="search-ts-badge">
@@ -871,24 +903,7 @@ export const ChatView: React.FC = () => {
                 })}
 
                 {chatSending && (
-                  <div className="chat-bubble-row is-assistant" role="status" aria-live="polite">
-                    <div className="chat-assistant-avatar is-pulsing" aria-hidden="true">
-                      <Sparkles size={13} />
-                    </div>
-                    <div className="chat-bubble is-assistant is-thinking">
-                      <div className="chat-thinking-line">
-                        <span className="chat-thinking-dots" aria-hidden="true">
-                          <span />
-                          <span />
-                          <span />
-                        </span>
-                        <span className="chat-thinking-label">{thinkingLabel}</span>
-                        {thinkingSecs > 0 && (
-                          <span className="chat-elapsed-pill">{thinkingSecs}s</span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
+                  <ThinkingIndicator activeTier={activeTier} startedAt={chatPendingStartedAt} />
                 )}
               </div>
             )}

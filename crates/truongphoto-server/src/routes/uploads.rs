@@ -259,15 +259,34 @@ async fn resolve_upload_target_folder(
             ));
         }
         let folder = folder_opt.ok_or_else(|| AppError::not_found("Target folder not found."))?;
-        if !Path::new(&folder.root_path).is_dir() {
+        if folder.is_offline {
+            return Err(AppError::validation("Target folder is currently offline."));
+        }
+        let folder_root = PathBuf::from(&folder.root_path);
+        if !folder_root.is_dir() {
             return Err(AppError::validation(
                 "Target folder directory is not accessible.",
             ));
         }
+        if let Some(ref expected_uuid) = folder.volume_uuid {
+            let root_probe = folder_root.clone();
+            let vol = tokio::task::spawn_blocking(move || resolve_volume_identity(&root_probe))
+                .await
+                .map_err(|e| AppError::internal(format!("Volume lookup panicked: {e}")))?;
+            if let Some(ref actual_uuid) = vol.volume_uuid {
+                if actual_uuid != expected_uuid {
+                    return Err(AppError::validation(
+                        "Target folder volume does not match the registered drive.",
+                    ));
+                }
+            }
+        }
         return Ok(folder);
     }
 
-    let root_path = PathBuf::from(managed_uploads_dir);
+    let normalized_managed_dir =
+        truongphoto_core::process::normalize_folder_path(managed_uploads_dir);
+    let root_path = PathBuf::from(&normalized_managed_dir);
     tokio::fs::create_dir_all(&root_path)
         .await
         .map_err(|e| AppError::internal(format!("Failed to create managed uploads dir: {e}")))?;
@@ -277,7 +296,7 @@ async fn resolve_upload_target_folder(
         .await
         .map_err(|e| AppError::internal(format!("Volume lookup panicked: {e}")))?;
 
-    let root_str = managed_uploads_dir.to_string();
+    let root_str = truongphoto_core::process::normalize_folder_path(&normalized_managed_dir);
     let uid = user_id.to_string();
     let now_ms = Utc::now().timestamp_millis();
 
@@ -345,9 +364,44 @@ fn sanitize_upload_filename(raw: &str) -> String {
     while cleaned.starts_with('.') {
         cleaned.remove(0);
     }
-    let trimmed = cleaned.trim();
+    let trimmed = cleaned.trim().trim_end_matches('.');
     if trimmed.is_empty() {
-        "upload.bin".to_string()
+        return "upload.bin".to_string();
+    }
+    // Prefix Windows reserved DOS device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) so uploads
+    // never fail or open a device handle on Windows.
+    let stem_upper = Path::new(trimmed)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(trimmed)
+        .to_ascii_uppercase();
+    let is_windows_reserved = matches!(
+        stem_upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if is_windows_reserved {
+        format!("file_{trimmed}")
     } else {
         trimmed.to_string()
     }

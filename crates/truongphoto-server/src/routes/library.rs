@@ -201,6 +201,11 @@ pub async fn update_overrides(
             return Err(AppError::validation("rating must be between 0 and 5."));
         }
     }
+    if req.gps_lat.is_some() != req.gps_lon.is_some() {
+        return Err(AppError::validation(
+            "gps_lat and gps_lon must both be provided together.",
+        ));
+    }
     if let Some(lat) = req.gps_lat {
         if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
             return Err(AppError::validation(

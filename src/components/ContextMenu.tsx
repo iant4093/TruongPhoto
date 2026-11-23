@@ -70,8 +70,27 @@ export const ContextMenuHost: React.FC = () => {
   const close = useContextMenuStore((s) => s.close);
 
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const [coords, setCoords] = useState<{ left: number; top: number }>({ left: x, top: y });
+  const [measuredCoords, setMeasuredCoords] = useState<{
+    key: string;
+    left: number;
+    top: number;
+  } | null>(null);
   const [activeIdx, setActiveIdx] = useState<number>(-1);
+  const openKey = `${x}:${y}:${items.length}`;
+
+  const clampEstimate = () => {
+    const vw = typeof window !== 'undefined' ? window.innerWidth : 1280;
+    const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+    const pad = 8;
+    const estW = 216;
+    const estH = Math.min(340, items.length * 34 + 12);
+    return {
+      left: Math.max(pad, Math.min(x, vw - estW - pad)),
+      top: Math.max(pad, Math.min(y, vh - estH - pad)),
+    };
+  };
+  const coords =
+    measuredCoords && measuredCoords.key === openKey ? measuredCoords : clampEstimate();
 
   // Global right-click interceptor: replace raw browser context menu on all non-input surfaces.
   useEffect(() => {
@@ -139,8 +158,8 @@ export const ContextMenuHost: React.FC = () => {
     const pad = 8;
     const left = Math.max(pad, Math.min(x, window.innerWidth - width - pad));
     const top = Math.max(pad, Math.min(y, window.innerHeight - height - pad));
-    setCoords({ left, top });
-  }, [open, x, y, items.length]);
+    setMeasuredCoords({ key: openKey, left, top });
+  }, [open, openKey, x, y, items.length]);
 
   const activeIdxRef = useRef(activeIdx);
   activeIdxRef.current = activeIdx;

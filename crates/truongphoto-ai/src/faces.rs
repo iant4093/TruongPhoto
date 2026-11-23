@@ -377,24 +377,46 @@ pub fn crop_face_thumbnail_webp(
 
     let cx = bx_px + 0.5 * bw_px;
     let cy = by_px + 0.5 * bh_px;
-    let side = bw_px.max(bh_px) * 1.70; // +35% padding on every side => 1.7x side
+    let side = (bw_px.max(bh_px) * 1.70).max(1.0); // +35% padding on every side => 1.7x side
+    let side_i64 = (side.ceil() as i64).max(1);
+    let side_u32 = side_i64 as u32;
 
     let half = 0.5 * side;
-    let x0 = (cx - half).floor().max(0.0) as u32;
-    let y0 = (cy - half).floor().max(0.0) as u32;
-    let x1 = (cx + half).ceil().min(iw as f64) as u32;
-    let y1 = (cy + half).ceil().min(ih as f64) as u32;
+    let ideal_x0 = (cx - half).floor() as i64;
+    let ideal_y0 = (cy - half).floor() as i64;
+    let ideal_x1 = ideal_x0 + side_i64;
+    let ideal_y1 = ideal_y0 + side_i64;
 
-    let crop_w = x1.saturating_sub(x0).max(1);
-    let crop_h = y1.saturating_sub(y0).max(1);
-    let safe_x0 = x0.min(iw - 1);
-    let safe_y0 = y0.min(ih - 1);
-    let safe_w = crop_w.min(iw - safe_x0);
-    let safe_h = crop_h.min(ih - safe_y0);
+    let src_x0 = ideal_x0.clamp(0, iw as i64) as u32;
+    let src_y0 = ideal_y0.clamp(0, ih as i64) as u32;
+    let src_x1 = ideal_x1.clamp(0, iw as i64) as u32;
+    let src_y1 = ideal_y1.clamp(0, ih as i64) as u32;
+
+    let safe_w = src_x1
+        .saturating_sub(src_x0)
+        .max(1)
+        .min(iw - src_x0.min(iw - 1));
+    let safe_h = src_y1
+        .saturating_sub(src_y0)
+        .max(1)
+        .min(ih - src_y0.min(ih - 1));
+    let safe_x0 = src_x0.min(iw - 1);
+    let safe_y0 = src_y0.min(ih - 1);
 
     let cropped = image::imageops::crop_imm(img, safe_x0, safe_y0, safe_w, safe_h).to_image();
+    // Preserve 1:1 square aspect ratio even when the padded bbox extends past an image border
+    // by compositing onto a square dark-neutral canvas instead of squashing the face.
+    let square = if safe_w == side_u32 && safe_h == side_u32 {
+        cropped
+    } else {
+        let mut canvas = RgbImage::from_pixel(side_u32, side_u32, image::Rgb([32, 32, 32]));
+        let dst_x = (safe_x0 as i64 - ideal_x0).max(0);
+        let dst_y = (safe_y0 as i64 - ideal_y0).max(0);
+        image::imageops::replace(&mut canvas, &cropped, dst_x, dst_y);
+        canvas
+    };
     let resized = image::imageops::resize(
-        &cropped,
+        &square,
         FACE_THUMB_SIZE,
         FACE_THUMB_SIZE,
         FilterType::Triangle,

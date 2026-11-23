@@ -2,6 +2,7 @@ use crate::error::{DbError, DbResult};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -18,6 +19,7 @@ const READ_PRAGMAS: &str = "
 pub struct ReadPool {
     sem: Arc<Semaphore>,
     conns: Arc<Mutex<Vec<Connection>>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl ReadPool {
@@ -36,12 +38,14 @@ impl ReadPool {
         Ok(Self {
             sem: Arc::new(Semaphore::new(pool_size)),
             conns: Arc::new(Mutex::new(conns)),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Closes the read pool and drops all pooled SQLite read connections so WAL checkpoints
     /// (`PRAGMA wal_checkpoint(TRUNCATE)`) are not blocked by lingering readers.
     pub async fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         self.sem.close();
         let conns = std::mem::take(&mut *self.conns.lock());
         let _ = tokio::task::spawn_blocking(move || drop(conns)).await;
@@ -53,6 +57,9 @@ impl ReadPool {
         T: Send + 'static,
         F: FnOnce(&Connection) -> DbResult<T> + Send + 'static,
     {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(DbError::SemaphoreClosed);
+        }
         let permit = self
             .sem
             .clone()
@@ -60,11 +67,15 @@ impl ReadPool {
             .await
             .map_err(|_| DbError::SemaphoreClosed)?;
         let conns = self.conns.clone();
+        let closed = self.closed.clone();
 
         tokio::task::spawn_blocking(move || {
             // Keep `_permit` before `guard` so `guard` always drops and returns the
             // connection to `conns` before `_permit` releases the semaphore slot.
             let _permit = permit;
+            if closed.load(Ordering::Acquire) {
+                return Err(DbError::SemaphoreClosed);
+            }
             let conn = conns
                 .lock()
                 .pop()
@@ -72,6 +83,7 @@ impl ReadPool {
             let guard = ConnGuard {
                 conn: Some(conn),
                 pool: conns,
+                closed,
             };
             let res = f(guard.conn_ref());
             drop(guard);
@@ -85,6 +97,7 @@ impl ReadPool {
 struct ConnGuard {
     conn: Option<Connection>,
     pool: Arc<Mutex<Vec<Connection>>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl ConnGuard {
@@ -98,7 +111,12 @@ impl ConnGuard {
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            self.pool.lock().push(conn);
+            if !self.closed.load(Ordering::Acquire) {
+                let mut guard = self.pool.lock();
+                if !self.closed.load(Ordering::Acquire) {
+                    guard.push(conn);
+                }
+            }
         }
     }
 }

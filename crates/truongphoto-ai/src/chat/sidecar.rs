@@ -1176,10 +1176,10 @@ fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64
             } else {
                 y - 1
             }
-        } else if m >= 3 {
-            y
+        } else if m == 12 {
+            y + 1
         } else {
-            y - 1
+            y
         };
         let feb_last = NaiveDate::from_ymd_opt(end_y, 3, 1)?.pred_opt()?;
         (NaiveDate::from_ymd_opt(end_y - 1, 12, 1)?, feb_last)
@@ -1420,7 +1420,9 @@ fn sanitize_sidecar_plan(
         || lower.contains("f-stop")
         || lower.contains("f stop")
         || lower.contains("depth of field");
-    let prior_had_aperture = prior.aperture_min_f.is_some() || prior.aperture_max_f.is_some();
+    let inherit_prior = !plan.clear_prior_filters;
+    let prior_had_aperture =
+        inherit_prior && (prior.aperture_min_f.is_some() || prior.aperture_max_f.is_some());
 
     if !has_aperture_cue && !prior_had_aperture {
         plan.aperture_min_f = None;
@@ -1449,7 +1451,7 @@ fn sanitize_sidecar_plan(
         || has_word(&lower, "grainy")
         || has_word(&lower, "noisy")
         || has_word(&lower, "noise");
-    let prior_had_iso = prior.iso_min.is_some() || prior.iso_max.is_some();
+    let prior_had_iso = inherit_prior && (prior.iso_min.is_some() || prior.iso_max.is_some());
 
     if !has_iso_cue && !prior_had_iso {
         plan.iso_min = None;
@@ -1477,8 +1479,8 @@ fn sanitize_sidecar_plan(
         || lower_no_wide_open.contains("telephoto")
         || lower_no_wide_open.contains("zoom")
         || lower_no_wide_open.contains("fisheye");
-    let prior_had_focal =
-        prior.focal_length_min_mm.is_some() || prior.focal_length_max_mm.is_some();
+    let prior_had_focal = inherit_prior
+        && (prior.focal_length_min_mm.is_some() || prior.focal_length_max_mm.is_some());
 
     if !has_focal_cue && !prior_had_focal {
         plan.focal_length_min_mm = None;
@@ -1540,8 +1542,8 @@ fn sanitize_sidecar_plan(
         || has_word(&lower, "sec")
         || has_word(&lower, "secs")
         || has_word(&lower, "seconds");
-    let prior_had_shutter =
-        prior.shutter_speed_min_sec.is_some() || prior.shutter_speed_max_sec.is_some();
+    let prior_had_shutter = inherit_prior
+        && (prior.shutter_speed_min_sec.is_some() || prior.shutter_speed_max_sec.is_some());
 
     if !has_shutter_cue && !prior_had_shutter {
         plan.shutter_speed_min_sec = None;
@@ -1588,7 +1590,7 @@ fn sanitize_sidecar_plan(
         || lower.contains("aspect ratio")
         || lower.contains("1:1");
 
-    if !has_orientation_cue && prior.orientation.is_none() {
+    if !has_orientation_cue && (!inherit_prior || prior.orientation.is_none()) {
         plan.orientation = None;
     }
 

@@ -170,7 +170,7 @@ fn append_deterministic_filters(
                 );
             } else {
                 where_clauses.push(
-                    "EXISTS (SELECT 1 FROM faces f_hp JOIN people p_hp ON p_hp.id = f_hp.person_id WHERE f_hp.asset_id = v.id AND p_hp.is_hidden = 0)"
+                    "EXISTS (SELECT 1 FROM faces f_hp LEFT JOIN people p_hp ON p_hp.id = f_hp.person_id WHERE f_hp.asset_id = v.id AND (f_hp.person_id IS NULL OR p_hp.is_hidden = 0))"
                         .to_string(),
                 );
             }
@@ -180,7 +180,7 @@ fn append_deterministic_filters(
             );
         } else {
             where_clauses.push(
-                "NOT EXISTS (SELECT 1 FROM faces f_np JOIN people p_np ON p_np.id = f_np.person_id WHERE f_np.asset_id = v.id AND p_np.is_hidden = 0)"
+                "NOT EXISTS (SELECT 1 FROM faces f_np LEFT JOIN people p_np ON p_np.id = f_np.person_id WHERE f_np.asset_id = v.id AND (f_np.person_id IS NULL OR p_np.is_hidden = 0))"
                     .to_string(),
             );
         }
@@ -254,19 +254,33 @@ fn append_deterministic_filters(
             (Some(lo), Some(hi)) if (hi - lo).abs() < 0.2 => (Some(lo - 0.6), Some(hi + 0.6)),
             pair => pair,
         };
-        if let Some(lo) = fl_min {
-            let idx = params.len() + 1;
-            params.push(Value::Real(lo));
-            exif_checks.push(format!(
-                "((dpm_e.focal_length_mm > 0 AND dpm_e.focal_length_mm >= ?{idx}) OR (dpm_e.focal_length_35mm > 0 AND dpm_e.focal_length_35mm >= ?{idx}))"
-            ));
-        }
-        if let Some(hi) = fl_max {
-            let idx = params.len() + 1;
-            params.push(Value::Real(hi));
-            exif_checks.push(format!(
-                "CASE WHEN dpm_e.focal_length_35mm > 0 THEN dpm_e.focal_length_35mm WHEN dpm_e.focal_length_mm > 0 THEN dpm_e.focal_length_mm END <= ?{idx}"
-            ));
+        // Evaluate focal-length range symmetrically on either actual focal length OR 35mm-equivalent
+        // focal length so APS-C / M43 shots (e.g. 56mm actual / 90mm 35mm-eq) match exact queries.
+        match (fl_min, fl_max) {
+            (Some(lo), Some(hi)) => {
+                let lo_idx = params.len() + 1;
+                params.push(Value::Real(lo));
+                let hi_idx = params.len() + 1;
+                params.push(Value::Real(hi));
+                exif_checks.push(format!(
+                    "((dpm_e.focal_length_mm > 0 AND dpm_e.focal_length_mm >= ?{lo_idx} AND dpm_e.focal_length_mm <= ?{hi_idx}) OR (dpm_e.focal_length_35mm > 0 AND dpm_e.focal_length_35mm >= ?{lo_idx} AND dpm_e.focal_length_35mm <= ?{hi_idx}))"
+                ));
+            }
+            (Some(lo), None) => {
+                let idx = params.len() + 1;
+                params.push(Value::Real(lo));
+                exif_checks.push(format!(
+                    "((dpm_e.focal_length_mm > 0 AND dpm_e.focal_length_mm >= ?{idx}) OR (dpm_e.focal_length_35mm > 0 AND dpm_e.focal_length_35mm >= ?{idx}))"
+                ));
+            }
+            (None, Some(hi)) => {
+                let idx = params.len() + 1;
+                params.push(Value::Real(hi));
+                exif_checks.push(format!(
+                    "((dpm_e.focal_length_mm > 0 AND dpm_e.focal_length_mm <= ?{idx}) OR (dpm_e.focal_length_35mm > 0 AND dpm_e.focal_length_35mm <= ?{idx}))"
+                ));
+            }
+            (None, None) => {}
         }
 
         let (ap_min, ap_max) = match (req.aperture_min_f, req.aperture_max_f) {
@@ -758,8 +772,12 @@ fn append_free_text_metadata_clauses(
                 "EXISTS (SELECT 1 FROM asset_files afqa WHERE afqa.asset_id = v.id AND LOWER(afqa.rel_path) LIKE ?{alt_idx} ESCAPE '\\')"
             ));
         }
+        let tag_word_idx = params.len() + 1;
+        params.push(Value::Text(format!("% {} %", escape_like_lower(&tok))));
+        // Match only non-AI (user/manual) tags on word boundaries so short tokens like "cat" or
+        // "rain" never substring-match "vacation"/"portrait" and AI auto-tags never outrank SigLIP2.
         ors.push(format!(
-            "EXISTS (SELECT 1 FROM media_tags mtq WHERE mtq.asset_id = v.id AND mtq.state = 'active' AND LOWER(mtq.tag) LIKE ?{idx} ESCAPE '\\')"
+            "EXISTS (SELECT 1 FROM media_tags mtq WHERE mtq.asset_id = v.id AND mtq.state = 'active' AND mtq.source != 'ai' AND (' ' || REPLACE(REPLACE(LOWER(mtq.tag), '-', ' '), '_', ' ') || ' ') LIKE ?{tag_word_idx} ESCAPE '\\')"
         ));
         ors.push(format!(
             "EXISTS (SELECT 1 FROM faces fq JOIN people pq ON pq.id = fq.person_id WHERE fq.asset_id = v.id AND pq.is_hidden = 0 AND LOWER(COALESCE(pq.name, '')) LIKE ?{idx} ESCAPE '\\')"
@@ -794,7 +812,7 @@ pub fn search_metadata_matches(
     }
 
     let limit_idx = params.len() + 1;
-    params.push(Value::Integer(limit.min(MAX_SEARCH_LIMIT as usize) as i64));
+    params.push(Value::Integer(limit.min(5_500) as i64));
 
     let sql = format!(
         "SELECT v.id
@@ -1041,22 +1059,22 @@ pub fn list_sql_filtered_assets(
     {
         Some("capture_asc") => "v.effective_capture_at_ms ASC, v.id ASC",
         Some("focal_asc") => {
-            "CASE WHEN COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) IS NULL OR COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) <= 0 THEN 1 ELSE 0 END ASC, COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) ASC, v.effective_capture_at_ms DESC"
+            "CASE WHEN COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) IS NULL OR COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) <= 0 THEN 1 ELSE 0 END ASC, COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) ASC, v.effective_capture_at_ms DESC, v.id DESC"
         }
         Some("focal_desc") => {
-            "CASE WHEN COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) IS NULL OR COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) <= 0 THEN 1 ELSE 0 END ASC, COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) DESC, v.effective_capture_at_ms DESC"
+            "CASE WHEN COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) IS NULL OR COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) <= 0 THEN 1 ELSE 0 END ASC, COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) DESC, v.effective_capture_at_ms DESC, v.id DESC"
         }
         Some("iso_desc") => {
-            "CASE WHEN dpm_s.iso IS NULL OR dpm_s.iso <= 0 THEN 1 ELSE 0 END ASC, dpm_s.iso DESC, v.effective_capture_at_ms DESC"
+            "CASE WHEN dpm_s.iso IS NULL OR dpm_s.iso <= 0 THEN 1 ELSE 0 END ASC, dpm_s.iso DESC, v.effective_capture_at_ms DESC, v.id DESC"
         }
         Some("aperture_asc") => {
-            "CASE WHEN dpm_s.aperture_f IS NULL OR dpm_s.aperture_f <= 0 THEN 1 ELSE 0 END ASC, dpm_s.aperture_f ASC, v.effective_capture_at_ms DESC"
+            "CASE WHEN dpm_s.aperture_f IS NULL OR dpm_s.aperture_f <= 0 THEN 1 ELSE 0 END ASC, dpm_s.aperture_f ASC, v.effective_capture_at_ms DESC, v.id DESC"
         }
         Some("shutter_asc") => {
-            "CASE WHEN dpm_s.shutter_speed_sec IS NULL OR dpm_s.shutter_speed_sec <= 0 THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec ASC, v.effective_capture_at_ms DESC"
+            "CASE WHEN dpm_s.shutter_speed_sec IS NULL OR dpm_s.shutter_speed_sec <= 0 THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec ASC, v.effective_capture_at_ms DESC, v.id DESC"
         }
         Some("shutter_desc") => {
-            "CASE WHEN dpm_s.shutter_speed_sec IS NULL OR dpm_s.shutter_speed_sec <= 0 THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec DESC, v.effective_capture_at_ms DESC"
+            "CASE WHEN dpm_s.shutter_speed_sec IS NULL OR dpm_s.shutter_speed_sec <= 0 THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec DESC, v.effective_capture_at_ms DESC, v.id DESC"
         }
         _ => "v.effective_capture_at_ms DESC, v.id DESC",
     };

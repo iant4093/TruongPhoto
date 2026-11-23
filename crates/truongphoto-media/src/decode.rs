@@ -106,11 +106,19 @@ fn decode_via_ffmpeg_png(path: &Path) -> Result<RgbImage, MediaError> {
         })?;
     let mut cmd = std::process::Command::new(ffmpeg);
     video::hide_console_window(&mut cmd);
-    let out = cmd
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
-        .output()?;
+    cmd.args(["-v", "error", "-i"]).arg(path).args([
+        "-frames:v",
+        "1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "-",
+    ]);
+    let out = truongphoto_core::process::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(30),
+    )?;
     if !out.status.success() || out.stdout.is_empty() {
         return Err(MediaError::ExternalTool {
             tool: "ffmpeg",
@@ -196,7 +204,9 @@ fn decode_raw_preview_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
     }
 
     if let Some(jpeg_bytes) = raw::try_libraw_demosaic_jpeg(path) {
-        if let Ok(rgb) = decode_jpeg_bytes_with_exif_and_icc(&jpeg_bytes, outer_orient) {
+        // LibRaw's `dcraw_process` already applies EXIF orientation to the output RGB pixels;
+        // do not pass `outer_orient` or portrait RAWs would be rotated twice.
+        if let Ok(rgb) = decode_jpeg_bytes_with_exif_and_icc(&jpeg_bytes, None) {
             return Ok(rgb);
         }
     }
@@ -215,7 +225,10 @@ fn decode_livp_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
             .suffix(&format!(".{ext}"))
             .tempfile()?;
         std::io::Write::write_all(&mut tmp, &bytes)?;
-        return decode_image_to_srgb(tmp.path());
+        std::io::Write::flush(&mut tmp)?;
+        // Close the open write handle before spawning external decoders (required on Windows).
+        let tmp_path = tmp.into_temp_path();
+        return decode_image_to_srgb(&tmp_path);
     }
 
     let reader = ImageReader::new(std::io::Cursor::new(&bytes))

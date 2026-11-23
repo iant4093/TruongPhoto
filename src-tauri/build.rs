@@ -9,6 +9,7 @@ const APP_COMMANDS: &[&str] = &[
     "show_main_window",
     "quit_app",
     "check_update_feed",
+    "install_native_update",
 ];
 
 fn attributes() -> tauri_build::Attributes {

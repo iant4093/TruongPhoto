@@ -135,8 +135,9 @@ fn check_etag_match(req_headers: &HeaderMap, etag: &str) -> bool {
         return false;
     };
     val.split(',').any(|tag| {
-        let t = tag.trim();
-        t == etag || t == "*"
+        let trimmed = tag.trim();
+        let unweak = trimmed.strip_prefix("W/").unwrap_or(trimmed);
+        unweak == etag || trimmed == "*"
     })
 }
 
@@ -366,6 +367,7 @@ pub async fn get_thumb(
             .join(format!("{asset_id}.webp"));
         let dest_clone = dest_path.clone();
 
+        let _decode_permit = state.cache_mgr.acquire_image_decode_permit().await;
         let generated = tokio::task::spawn_blocking(move || {
             generate_thumb_and_histogram(&src_path, &dest_clone)
         })
@@ -454,6 +456,7 @@ pub async fn get_preview(
             let src_path = resolve_asset_file_path(&folder, src_file)?;
             let dest_clone = dest_path.clone();
 
+            let _decode_permit = state.cache_mgr.acquire_image_decode_permit().await;
             let size_bytes = tokio::task::spawn_blocking(move || {
                 generate_preview_webp(&src_path, &dest_clone, 2048)
             })
@@ -540,11 +543,6 @@ pub async fn get_original(
                     .iter()
                     .find(|f| is_raw_extension(&f.extension) && !f.is_missing)
             })
-            .or_else(|| {
-                files
-                    .iter()
-                    .find(|f| f.file_role == FileRole::Primary && !f.is_missing)
-            })
             .ok_or_else(|| AppError::not_found("No RAW file available for asset."))?;
 
         let src_path = resolve_asset_file_path(&folder, raw_file)?;
@@ -569,12 +567,15 @@ pub async fn get_original(
                     .await
                     .unwrap_or_else(|_| "embedded_preview".to_string())
             } else {
+                let _raw_permit = state.cache_mgr.acquire_raw_demosaic_permit().await;
                 let jpeg_clone = jpeg_path.clone();
                 let dec_clone = decoder_path.clone();
                 let (bytes_len, decoder_str) = tokio::task::spawn_blocking(move || {
                     let (jpeg_bytes, backend) = demosaic_raw_to_jpeg(&src_path)?;
-                    atomic_write_bytes_sync(&jpeg_clone, &jpeg_bytes)?;
+                    // Write metadata sidecar BEFORE the primary artifact so any concurrent reader
+                    // observing `demosaic.jpg` always finds the matching `decoder.txt`.
                     atomic_write_bytes_sync(&dec_clone, backend.as_bytes())?;
+                    atomic_write_bytes_sync(&jpeg_clone, &jpeg_bytes)?;
                     Ok::<_, truongphoto_media::MediaError>((
                         (jpeg_bytes.len() + backend.len()) as u64,
                         backend.to_string(),
@@ -779,8 +780,9 @@ pub async fn get_live_video(
                     } else {
                         "video/quicktime"
                     };
-                    atomic_write_bytes_sync(&vid_out, &v_bytes)?;
+                    // Write MIME sidecar BEFORE `live.mov` so concurrent cache hits never miss it.
                     atomic_write_bytes_sync(&mime_out, mime.as_bytes())?;
+                    atomic_write_bytes_sync(&vid_out, &v_bytes)?;
                     Ok::<_, truongphoto_media::MediaError>((
                         (v_bytes.len() + mime.len()) as u64,
                         mime.to_string(),
@@ -889,15 +891,22 @@ pub async fn get_hls_playlist(
         })
         .await?;
 
-    let (_summary, files, folder, video_meta) =
+    let (summary, files, folder, video_meta) =
         asset_opt.ok_or_else(|| AppError::not_found("Asset not found."))?;
+    if !matches!(summary.kind, AssetKind::Video | AssetKind::LivePhoto) {
+        return Err(AppError::not_found("Asset is not a video."));
+    }
     let video_file = files
         .iter()
         .find(|f| f.file_role == FileRole::LiveVideo && !f.is_missing)
         .or_else(|| {
-            files
-                .iter()
-                .find(|f| f.file_role == FileRole::Primary && !f.is_missing)
+            if summary.kind == AssetKind::Video {
+                files
+                    .iter()
+                    .find(|f| f.file_role == FileRole::Primary && !f.is_missing)
+            } else {
+                None
+            }
         })
         .ok_or_else(|| AppError::not_found("No physical video file available."))?;
 
@@ -916,6 +925,7 @@ pub async fn get_hls_playlist(
         if playlist_path.is_file() {
             state.cache_mgr.touch_throttled(&cache_key).await;
         } else {
+            let _hls_permit = state.cache_mgr.acquire_hls_transcode_permit().await;
             let is_hdr = video_meta.as_ref().is_some_and(|vm| vm.is_hdr);
             let hls_out = hls_dir.clone();
             let total_bytes =

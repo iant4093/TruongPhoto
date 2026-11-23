@@ -79,44 +79,53 @@ const Glyph: React.FC<{ kind: 'minimize' | 'maximize' | 'restore' | 'close' }> =
   </svg>
 );
 
-/** Windows 11 caption buttons for the top-right corner of the desktop window. */
-export const WindowsCaptionButtons: React.FC = () => {
-  const [maximized, setMaximized] = useState(false);
-  useEffect(() => {
-    if (!isTauri()) return;
-    let alive = true;
-    let unlisten: (() => void) | undefined;
-    const sync = () => {
-      try {
-        void getCurrentWindow()
-          .isMaximized()
-          .then((m) => {
-            if (alive) {
-              setMaximized(m);
-              document.documentElement.classList.toggle('is-maximized', m);
-            }
-          })
-          .catch(() => {});
-      } catch {
-        // Ignore outside Tauri runtime
-      }
-    };
-    sync();
+let sharedMaximized = false;
+const maximizedListeners = new Set<(m: boolean) => void>();
+let maximizedWatcherInitialized = false;
+
+function broadcastMaximized(next: boolean): void {
+  sharedMaximized = next;
+  if (typeof document !== 'undefined') {
+    document.documentElement.classList.toggle('is-maximized', next);
+  }
+  for (const fn of maximizedListeners) {
+    fn(next);
+  }
+}
+
+function ensureMaximizedWatcher(): void {
+  if (maximizedWatcherInitialized || !isTauri()) return;
+  maximizedWatcherInitialized = true;
+  const sync = () => {
     try {
-      getCurrentWindow()
-        .onResized(sync)
-        .then((fn) => {
-          if (alive) unlisten = fn;
-          else fn();
-        })
+      void getCurrentWindow()
+        .isMaximized()
+        .then((m) => broadcastMaximized(m))
         .catch(() => {});
     } catch {
       // Ignore outside Tauri runtime
     }
+  };
+  sync();
+  try {
+    void getCurrentWindow()
+      .onResized(sync)
+      .catch(() => {});
+  } catch {
+    // Ignore outside Tauri runtime
+  }
+}
+
+/** Windows 11 caption buttons for the top-right corner of the desktop window. */
+export const WindowsCaptionButtons: React.FC = () => {
+  const [maximized, setMaximized] = useState(sharedMaximized);
+  useEffect(() => {
+    if (!isTauri()) return;
+    ensureMaximizedWatcher();
+    setMaximized(sharedMaximized);
+    maximizedListeners.add(setMaximized);
     return () => {
-      alive = false;
-      unlisten?.();
-      document.documentElement.classList.remove('is-maximized');
+      maximizedListeners.delete(setMaximized);
     };
   }, []);
   return (
@@ -137,9 +146,7 @@ export const WindowsCaptionButtons: React.FC = () => {
         title={maximized ? 'Restore Down' : 'Maximize'}
         onClick={run(async (w) => {
           await w.toggleMaximize();
-          const m = await w.isMaximized();
-          setMaximized(m);
-          document.documentElement.classList.toggle('is-maximized', m);
+          broadcastMaximized(await w.isMaximized());
         })}
       >
         <Glyph kind={maximized ? 'restore' : 'maximize'} />

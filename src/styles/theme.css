@@ -2614,7 +2614,7 @@ input[type='number'].text-input { width: 90px; }
   inset: 0;
   background: rgba(0, 0, 0, 0.36);
   z-index: 940;
-  animation: ctx-pop 120ms ease-out both;
+  animation: tp-fade-in 140ms ease-out both;
 }
 
 .status-drawer-slot {
@@ -2625,13 +2625,20 @@ input[type='number'].text-input { width: 90px; }
   width: min(360px, 94vw);
   z-index: 950;
   pointer-events: none;
-  transform: translateX(102%);
-  transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  visibility: hidden;
+  transform: translate3d(102%, 0, 0);
+  transition:
+    transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    visibility 0s linear 200ms;
 }
 
 .status-drawer-slot.is-open {
   pointer-events: auto;
-  transform: translateX(0);
+  visibility: visible;
+  transform: translate3d(0, 0, 0);
+  transition:
+    transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    visibility 0s linear 0s;
 }
 
 .status-drawer {
@@ -2827,13 +2834,45 @@ input[type='number'].text-input { width: 90px; }
   color: var(--text-primary);
 }
 
-/* Collapsed accordion should not be keyboard-focusable */
+/* Collapsed accordion hides smoothly after collapse rather than flashing blank before closing */
 .advanced-accordion-body {
   visibility: hidden;
+  transition:
+    max-height 180ms ease-out,
+    opacity 140ms ease-out,
+    padding 140ms ease-out,
+    visibility 0s linear 180ms;
 }
 
 .advanced-accordion-body.is-open {
   visibility: visible;
+  transition:
+    max-height 180ms ease-out,
+    opacity 140ms ease-out,
+    padding 140ms ease-out,
+    visibility 0s linear 0s;
+}
+
+/* Prevent horizontal header/counter jitter and harsh opacity snap during search refreshes */
+.status-pill-btn {
+  min-width: 94px;
+  justify-content: center;
+}
+
+.badge,
+.property-value,
+.bulk-action-bar,
+.scrubber-pill,
+.lightbox-pill-btn {
+  font-variant-numeric: tabular-nums;
+}
+
+.search-hit-grid {
+  transition: opacity 160ms ease;
+}
+
+.search-hit-grid.is-refreshing {
+  opacity: 0.65;
 }
 
 /* Inset focus ring on overflow:hidden interactive cards/tiles so focus is never clipped */
@@ -2987,47 +3026,107 @@ input[type='number'].text-input { width: 90px; }
   transform: scale(1.045);
 }
 
-/* Lightbox smooth entrance & directional prev/next photo transitions */
+/* Lightbox smooth entrance & simultaneous dual-layer photo transitions */
 .lightbox-overlay {
   animation: tp-fade-in 160ms ease-out both;
 }
 
+.lightbox-overlay:focus,
+.lightbox-overlay:focus-visible {
+  outline: none;
+}
+
+.lightbox-zoom-btn {
+  min-width: 78px;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .lightbox-media-frame {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  will-change: transform, opacity;
+}
+
+.lightbox-zoom-surface {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   width: 100%;
   height: 100%;
-  will-change: transform, opacity;
+  transform-origin: center center;
+  will-change: transform;
+}
+
+.lightbox-media-underlay,
+.lightbox-media-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.lightbox-media-overlay {
+  transition: opacity 150ms ease-out;
 }
 
 @keyframes tp-lightbox-next {
   from {
     opacity: 0;
-    transform: translateX(30px) scale(0.985);
+    transform: translate3d(40px, 0, 0);
   }
   to {
     opacity: 1;
-    transform: translateX(0) scale(1);
+    transform: translate3d(0, 0, 0);
   }
 }
 
 @keyframes tp-lightbox-prev {
   from {
     opacity: 0;
-    transform: translateX(-30px) scale(0.985);
+    transform: translate3d(-40px, 0, 0);
   }
   to {
     opacity: 1;
-    transform: translateX(0) scale(1);
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes tp-lightbox-exit-next {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(-40px, 0, 0);
+  }
+}
+
+@keyframes tp-lightbox-exit-prev {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(40px, 0, 0);
   }
 }
 
 @keyframes tp-lightbox-fade {
   from {
     opacity: 0;
-    transform: scale(0.985);
+    transform: scale(0.988);
   }
   to {
     opacity: 1;
@@ -3035,12 +3134,33 @@ input[type='number'].text-input { width: 90px; }
   }
 }
 
+@keyframes tp-drawer-slide-in {
+  from {
+    opacity: 0;
+    transform: translate3d(18px, 0, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
 .lightbox-media-frame.is-nav-next {
-  animation: tp-lightbox-next 210ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: tp-lightbox-next 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 .lightbox-media-frame.is-nav-prev {
-  animation: tp-lightbox-prev 210ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: tp-lightbox-prev 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.lightbox-media-frame.is-exiting-next {
+  pointer-events: none;
+  animation: tp-lightbox-exit-next 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.lightbox-media-frame.is-exiting-prev {
+  pointer-events: none;
+  animation: tp-lightbox-exit-prev 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 .lightbox-media-frame.is-nav-fade {
@@ -3172,7 +3292,7 @@ input[type='number'].text-input { width: 90px; }
 }
 
 .lightbox-info-drawer {
-  animation: tp-lightbox-next 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: tp-drawer-slide-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* Prevent duplicate native WebKit search clear button beside our custom clear button */

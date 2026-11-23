@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Image as ImageIcon, Play, Search } from 'lucide-react';
 import { mediaThumbUrl } from '../lib/api';
 import { formatDateTime } from '../lib/format';
@@ -34,10 +34,8 @@ const SearchHitCard: React.FC<{
   hit: SearchHit;
   onOpen: (hit: SearchHit) => void;
 }> = ({ hit, onOpen }) => {
-  const [imgFailed, setImgFailed] = useState(false);
-  useEffect(() => {
-    setImgFailed(false);
-  }, [hit.asset.id]);
+  const [failedAssetId, setFailedAssetId] = useState<string | null>(null);
+  const imgFailed = failedAssetId === hit.asset.id;
   const title = hit.asset.title || hit.asset.camera_model || 'Media item';
   const showTimestamp = hit.timestamp_sec != null && hit.timestamp_sec > 0;
 
@@ -54,7 +52,8 @@ const SearchHitCard: React.FC<{
             src={mediaThumbUrl(hit.asset.id)}
             alt={title}
             loading="lazy"
-            onError={() => setImgFailed(true)}
+            decoding="async"
+            onError={() => setFailedAssetId(hit.asset.id)}
           />
         ) : (
           <div className="thumbnail-placeholder" role="img" aria-label={title}>
@@ -108,6 +107,7 @@ export const SearchResultsView: React.FC = () => {
   const searchQuery = useAppStore((s) => s.searchQuery);
   const searchResponse = useAppStore((s) => s.searchResponse);
   const searchLoading = useAppStore((s) => s.searchLoading);
+  const searchLoadingMore = useAppStore((s) => s.searchLoadingMore);
   const searchError = useAppStore((s) => s.searchError);
   const runSearch = useAppStore((s) => s.runSearch);
   const loadMoreSearch = useAppStore((s) => s.loadMoreSearch);
@@ -172,10 +172,7 @@ export const SearchResultsView: React.FC = () => {
         </div>
       ) : hits.length > 0 ? (
         <>
-          <div
-            className="search-hit-grid"
-            style={searchLoading ? { opacity: 0.6, transition: 'opacity 140ms ease' } : undefined}
-          >
+          <div className={`search-hit-grid${searchLoading ? ' is-refreshing' : ''}`}>
             {hits.map((hit) => (
               <SearchHitCard
                 key={`${hit.asset.id}-${hit.timestamp_sec ?? 'photo'}`}
@@ -189,14 +186,14 @@ export const SearchResultsView: React.FC = () => {
               <button
                 type="button"
                 className="button"
-                disabled={searchLoading}
+                disabled={searchLoading || searchLoadingMore}
                 onClick={() =>
                   void loadMoreSearch().catch((err) =>
                     notifyError(err, 'Could not load more search results'),
                   )
                 }
               >
-                {searchLoading
+                {searchLoadingMore
                   ? 'Loading more…'
                   : `Load More (${hits.length} of ${totalCount.toLocaleString()})`}
               </button>

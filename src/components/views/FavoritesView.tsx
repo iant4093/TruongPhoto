@@ -93,7 +93,11 @@ export const FavoritesView: React.FC = () => {
     <div>
       <ViewHeader
         title="Favorites"
-        subtitle={`${plural(totalCount, 'favorite asset')} in your allowed folders`}
+        subtitle={
+          loading && !hasLoadedOnceRef.current
+            ? '\u00A0'
+            : `${plural(totalCount, 'favorite asset')} in your allowed folders`
+        }
       />
 
       {error && (

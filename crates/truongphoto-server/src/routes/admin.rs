@@ -408,9 +408,23 @@ pub async fn get_settings(
 pub async fn update_settings(
     RequireAdmin(auth): RequireAdmin,
     State(state): State<Arc<AppState>>,
-    ApiJson(patch): ApiJson<PartialAppSettings>,
+    ApiJson(mut patch): ApiJson<PartialAppSettings>,
 ) -> Result<Json<AppSettings>, AppError> {
     validate_settings_patch(&patch)?;
+    for path_opt in [
+        &mut patch.managed_uploads_dir,
+        &mut patch.thumbnails_dir,
+        &mut patch.cache_dir,
+        &mut patch.backup_dir,
+        &mut patch.map_pmtiles_dir,
+    ] {
+        if let Some(p) = path_opt.as_mut() {
+            let norm = truongphoto_core::process::normalize_folder_path(p);
+            if !norm.is_empty() {
+                *p = norm;
+            }
+        }
+    }
 
     let default_paths = state.default_paths.clone();
     let actor_id = auth.user.id.clone();

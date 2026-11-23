@@ -273,7 +273,7 @@ async fn migration_0002_histograms_and_lru_cache_eviction() {
             400
         );
 
-        let victims = repo::cache::pop_oldest_entries_to_free(conn, 2_500)?;
+        let victims = repo::cache::pop_oldest_entries_to_free(conn, 2_500, None)?;
         let victim_keys: Vec<&str> = victims.iter().map(|v| v.cache_key.as_str()).collect();
         assert_eq!(victim_keys, vec!["k-mid", "k-new"]);
         assert_eq!(repo::cache::total_cache_bytes(conn)?, 1_000);

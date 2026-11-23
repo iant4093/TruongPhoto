@@ -369,6 +369,21 @@ export const mediaOriginalUrl = (
   return qs ? `${base}?${qs}` : base;
 };
 
+/**
+ * Triggers a file download without opening a popup window (works in both browsers and Tauri WebViews).
+ */
+export function triggerAssetDownload(id: string): void {
+  if (typeof document === 'undefined') return;
+  const link = document.createElement('a');
+  link.href = mediaOriginalUrl(id, { download: true });
+  link.download = '';
+  link.rel = 'noopener';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
 export const mediaLiveVideoUrl = (id: string): string =>
   `/api/media/${encodeURIComponent(id)}/live-video`;
 

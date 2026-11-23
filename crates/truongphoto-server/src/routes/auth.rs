@@ -188,6 +188,9 @@ pub async fn login(
     ApiJson(req): ApiJson<LoginRequest>,
 ) -> Result<(CookieJar, Json<AuthLoginResponse>), AppError> {
     let target_user_id = req.user_id.trim().to_string();
+    if target_user_id.is_empty() || target_user_id.len() > 128 {
+        return Err(AppError::validation("Invalid user_id."));
+    }
     let user_scope = format!("login_user:{target_user_id}");
     if let Err(retry_after_secs) = state.rate_limiter.check_scoped("login", &peer.rate_key) {
         return Err(AppError::rate_limited(retry_after_secs));
@@ -242,6 +245,9 @@ pub async fn login(
             }
             return Err(AppError::unauthorized("Invalid server PIN."));
         }
+        state
+            .rate_limiter
+            .record_success_scoped("server_pin", &peer.rate_key);
     }
 
     let Some(user) = user_opt.filter(|u| u.disabled_at_ms.is_none()) else {

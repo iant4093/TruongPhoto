@@ -49,28 +49,44 @@ impl TailscaleRunner for SystemTailscaleRunner {
             }
         }
 
-        let macos_standalone = Path::new("/Applications/Tailscale.app/Contents/MacOS/Tailscale");
-        if macos_standalone.is_file() {
-            return Some(macos_standalone.to_path_buf());
-        }
-
-        for windows_cand in [
-            r"C:\Program Files\Tailscale\tailscale.exe",
-            r"C:\Program Files\Tailscale IPN\tailscale.exe",
-        ] {
-            let p = Path::new(windows_cand);
-            if p.is_file() {
-                return Some(p.to_path_buf());
+        #[cfg(target_os = "macos")]
+        {
+            for macos_cand in [
+                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                "/opt/homebrew/bin/tailscale",
+                "/usr/local/bin/tailscale",
+            ] {
+                let p = Path::new(macos_cand);
+                if p.is_file() {
+                    return Some(p.to_path_buf());
+                }
             }
         }
 
-        for bin in ["tailscale", "tailscale.exe"] {
-            if let Some(found) = find_in_path(bin) {
+        #[cfg(target_os = "windows")]
+        {
+            for windows_cand in [
+                r"C:\Program Files\Tailscale\tailscale.exe",
+                r"C:\Program Files\Tailscale IPN\tailscale.exe",
+            ] {
+                let p = Path::new(windows_cand);
+                if p.is_file() {
+                    return Some(p.to_path_buf());
+                }
+            }
+            if let Some(found) = find_in_path("tailscale.exe") {
                 return Some(found);
             }
+            return None;
         }
 
-        None
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Some(found) = find_in_path("tailscale") {
+                return Some(found);
+            }
+            None
+        }
     }
 
     fn run<'a>(

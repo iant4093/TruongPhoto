@@ -956,18 +956,35 @@ pub async fn send_message(
         "reset",
         "clear filter",
         "clear all",
+        "clear the",
+        "clear ",
         "new search",
         "remove the",
         "remove filter",
         "drop the",
     ]
     .iter()
-    .any(|kw| lower_prompt.contains(kw));
-    let persisted_filters = if is_answer_only || (!has_any_search_criteria && !explicit_reset) {
+    .any(|kw| lower_prompt.contains(kw))
+        || lower_prompt.trim() == "clear";
+    let mut persisted_filters = if is_answer_only
+        || (!has_any_search_criteria && !explicit_reset && !plan.clear_prior_filters)
+    {
         session.active_filters.clone()
     } else {
         plan.clone()
     };
+    // Never persist unmatched or ambiguous person names into session active_filters so a typo
+    // or ambiguous name cannot silently poison subsequent conversational turns.
+    if !unmatched_people.is_empty() || !ambiguous_people.is_empty() {
+        let bad_names: std::collections::HashSet<String> = unmatched_people
+            .iter()
+            .chain(ambiguous_people.iter().map(|(raw, _)| raw))
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect();
+        persisted_filters
+            .person_names
+            .retain(|name| !bad_names.contains(&name.trim().to_ascii_lowercase()));
+    }
 
     let user_id_write = rbac.auth.user.id.clone();
     let sid_write = session_id.clone();

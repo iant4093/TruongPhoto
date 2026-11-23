@@ -154,6 +154,31 @@ pub fn normalize_folder_path(raw: &str) -> String {
     }
 }
 
+/// Atomically renames `from` to `to`, retrying briefly on Windows where antivirus scanners
+/// or recently closed mmap/file handles can transiently hold `ERROR_SHARING_VIOLATION` / `AccessDenied`.
+pub fn rename_with_windows_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let attempts = if cfg!(windows) { 5 } else { 1 };
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(Duration::from_millis(50 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::other(format!(
+            "rename {} -> {} failed",
+            from.display(),
+            to.display()
+        ))
+    }))
+}
+
 fn strip_windows_verbatim(path: &str) -> String {
     if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{unc}")

@@ -25,10 +25,11 @@ pub async fn ws_handler(
 
 async fn should_deliver_ws_event(
     state: &AppState,
-    auth: &AuthSession,
+    user_id: &str,
+    role: Role,
     event: &WsServerEvent,
 ) -> bool {
-    if auth.user.role == Role::Admin {
+    if role == Role::Admin {
         return true;
     }
     match event {
@@ -37,7 +38,7 @@ async fn should_deliver_ws_event(
         | WsServerEvent::AiStateChanged { .. }
         | WsServerEvent::JobProgress { .. } => false,
         WsServerEvent::FolderChanged { folder_id, .. } => {
-            let uid = auth.user.id.clone();
+            let uid = user_id.to_string();
             let fid = folder_id.clone();
             state
                 .db
@@ -52,13 +53,55 @@ async fn should_deliver_ws_event(
     }
 }
 
+fn sanitize_ws_event_for_role(role: Role, event: WsServerEvent) -> WsServerEvent {
+    if role == Role::Admin {
+        return event;
+    }
+    match event {
+        WsServerEvent::Heartbeat { uptime_secs, .. } => WsServerEvent::Heartbeat {
+            uptime_secs,
+            process_ram_bytes: 0,
+            db_size_bytes: 0,
+            active_jobs: 0,
+        },
+        other => other,
+    }
+}
+
+async fn verify_ws_session_role(state: &AppState, token_hash: &str) -> Option<Role> {
+    let hash = token_hash.to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    state
+        .db
+        .read(move |conn| {
+            let Some(session) =
+                repo::sessions::find_active_session_by_token_hash(conn, &hash, now_ms)?
+            else {
+                return Ok(None);
+            };
+            let Some(user) = repo::users::get_user_by_id(conn, &session.user_id)? else {
+                return Ok(None);
+            };
+            if user.disabled_at_ms.is_some() {
+                return Ok(None);
+            }
+            Ok(Some(user.role))
+        })
+        .await
+        .ok()
+        .flatten()
+}
+
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, auth: AuthSession) {
     let (mut sender, mut receiver) = socket.split();
+    let mut current_role = auth.user.role;
+    let user_id = auth.user.id.clone();
+    let token_hash = auth.session.token_hash.clone();
 
     let connected = WsServerEvent::Connected {
         server_version: APP_VERSION.to_string(),
-        user_id: auth.user.id.clone(),
-        role: auth.user.role,
+        user_id: user_id.clone(),
+        role: current_role,
     };
     if let Ok(json) = serde_json::to_string(&connected) {
         if sender.send(Message::text(json)).await.is_err() {
@@ -68,12 +111,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, auth: AuthSessio
 
     let mut rx = state.ws_tx.subscribe();
     let shutdown = state.shutdown_token.clone();
+    let mut auth_recheck = tokio::time::interval(Duration::from_secs(15));
+    auth_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    auth_recheck.tick().await;
 
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
                 let _ = sender.send(Message::Close(None)).await;
                 break;
+            }
+            _ = auth_recheck.tick() => {
+                match verify_ws_session_role(&state, &token_hash).await {
+                    Some(fresh_role) => {
+                        current_role = fresh_role;
+                    }
+                    None => {
+                        let _ = sender.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
             }
             inbound = receiver.next() => {
                 match inbound {
@@ -93,10 +150,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, auth: AuthSessio
             evt = rx.recv() => {
                 match evt {
                     Ok(event) => {
-                        if !should_deliver_ws_event(&state, &auth, &event).await {
+                        if !should_deliver_ws_event(&state, &user_id, current_role, &event).await {
                             continue;
                         }
-                        if let Ok(json) = serde_json::to_string(&event) {
+                        let outbound = sanitize_ws_event_for_role(current_role, event);
+                        if let Ok(json) = serde_json::to_string(&outbound) {
                             if sender.send(Message::text(json)).await.is_err() {
                                 break;
                             }

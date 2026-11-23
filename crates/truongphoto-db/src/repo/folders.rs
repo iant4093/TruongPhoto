@@ -314,6 +314,14 @@ pub fn find_or_create_managed_uploads_folder(
         return Ok((existing, false));
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let by_path_sql = format!(
+        "SELECT {FOLDER_COLUMNS}
+         FROM folders
+         WHERE LOWER(root_path) = LOWER(?1)
+         LIMIT 1"
+    );
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let by_path_sql = format!(
         "SELECT {FOLDER_COLUMNS}
          FROM folders

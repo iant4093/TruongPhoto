@@ -1,7 +1,6 @@
 use crate::ai::worker::run_face_clustering;
 use crate::error::{ApiJson, AppError};
 use crate::extractors::{RbacContext, RequireAdmin};
-use crate::ingest::cache_mgr::safe_join_relative;
 use crate::routes::library::AssetListResponse;
 use crate::state::AppState;
 use axum::{
@@ -192,9 +191,11 @@ pub async fn get_face_thumb(
                 .await
                 .map_err(|e| AppError::internal(format!("Failed to read cached face thumb: {e}")))?
         } else {
-            let img_path =
-                safe_join_relative(Path::new(&src.folder_root_path), &src.primary_rel_path)
-                    .ok_or_else(|| AppError::not_found("Invalid media file path."))?;
+            let img_path = crate::ingest::cache_mgr::safe_join_no_symlinks(
+                Path::new(&src.folder_root_path),
+                &src.primary_rel_path,
+            )
+            .ok_or_else(|| AppError::not_found("Invalid media file path."))?;
             if !img_path.is_file() {
                 return Err(AppError::not_found("Media file does not exist on disk."));
             }

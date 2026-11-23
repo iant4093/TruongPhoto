@@ -288,6 +288,9 @@ pub(crate) async fn execute_hybrid_search(
     }
 
     let query_str = trimmed_query.expect("checked Some above");
+    let fetch_window = offset
+        .saturating_add(limit)
+        .clamp(MAX_LIMIT, MAX_OFFSET + MAX_LIMIT);
 
     if req.mode == SearchMode::Ocr {
         let scope = rbac.scope.clone();
@@ -308,7 +311,7 @@ pub(crate) async fn execute_hybrid_search(
                     &scope,
                     &q_clone,
                     Some(&candidates.asset_ids),
-                    MAX_LIMIT,
+                    fetch_window,
                 )
             })
             .await?;
@@ -349,14 +352,18 @@ pub(crate) async fn execute_hybrid_search(
                     &scope,
                     &ocr_q_clone,
                     Some(&cands.asset_ids),
-                    MAX_LIMIT,
+                    fetch_window,
                 )?
             } else {
                 Vec::new()
             };
             let meta = if want_ocr {
                 repo::search::search_metadata_matches(
-                    conn, &scope, &req_clone, &q_clone, MAX_LIMIT,
+                    conn,
+                    &scope,
+                    &req_clone,
+                    &q_clone,
+                    fetch_window,
                 )?
             } else {
                 Vec::new()

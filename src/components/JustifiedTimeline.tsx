@@ -1,13 +1,13 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Check, Download, Eye, FolderPlus, Heart, Info, Star, Trash2, X } from 'lucide-react';
 import {
   addAlbumAssets,
   listAlbums,
-  mediaOriginalUrl,
   mediaThumbUrl,
   setAssetFavorite,
   trashAssets,
+  triggerAssetDownload,
 } from '../lib/api';
 import { computeJustifiedRows, type JustifiedRow } from '../lib/justifiedLayout';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
@@ -83,8 +83,8 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
   const [loadingAlbums, setLoadingAlbums] = useState(false);
   const [bulkBusy, setBulkBusy] = useState(false);
 
-  // Measure container width with ResizeObserver, keeping safe 960px fallback in jsdom/SSR.
-  useEffect(() => {
+  // Measure container width before first paint to prevent a 960px Frame-1 layout flash.
+  useLayoutEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
@@ -158,9 +158,8 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
     getItemKey: (index) => rows[index]?.key ?? index,
   });
 
-  // Re-measure virtual rows whenever row layout, container width, or row height changes
-  // so @tanstack/react-virtual never uses stale cached offsets that cause vertical row overlap.
-  useEffect(() => {
+  // Re-measure virtual rows before paint whenever row layout or container width changes.
+  useLayoutEffect(() => {
     rowVirtualizer.measure();
   }, [rowVirtualizer, rows, containerWidth, targetRowHeight]);
 
@@ -417,7 +416,7 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                     label: 'Download Original',
                     icon: <Download size={14} />,
                     onSelect: () => {
-                      window.open(mediaOriginalUrl(asset.id, { download: true }), '_blank', 'noopener');
+                      triggerAssetDownload(asset.id);
                     },
                   },
                   ...(canMutate
@@ -457,6 +456,9 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                 loading="lazy"
                 decoding="async"
                 draggable={false}
+                onError={(e) => {
+                  e.currentTarget.style.opacity = '0';
+                }}
               />
 
               {(canMutate || Boolean(extraBulkActions)) && (

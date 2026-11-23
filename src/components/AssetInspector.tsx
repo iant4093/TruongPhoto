@@ -241,7 +241,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     }
   };
 
-  if (loading) {
+  if (loading && !detail) {
     return (
       <div className="asset-inspector">
         <div className="view-loading" role="status">
@@ -251,7 +251,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     );
   }
 
-  if (error || !detail) {
+  if (!detail) {
     return (
       <div className="asset-inspector">
         <div className="error-banner" role="alert">
