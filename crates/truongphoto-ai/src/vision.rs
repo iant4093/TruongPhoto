@@ -262,38 +262,9 @@ impl VisionBackend for OrtSiglip2Backend {
             return Ok(cached.clone());
         }
 
-        // SigLIP2 was pretrained with descriptive captions ("a photo of ..."). For concise queries
-        // not already framed, ensemble the framed prompt and raw query in a single batch=2 forward
-        // pass to boost cosine separation without sacrificing literal multi-word fidelity.
-        let already_framed = normalized_query.starts_with("a photo of ")
-            || normalized_query.starts_with("photo of ")
-            || normalized_query.starts_with("a picture of ")
-            || normalized_query.starts_with("picture of ")
-            || normalized_query.starts_with("an image of ")
-            || normalized_query.starts_with("image of ");
-        let word_count = normalized_query.split_whitespace().count();
-
-        let vec_out = if !already_framed && word_count > 0 && word_count <= 5 {
-            let framed = format!("a photo of {normalized_query}.");
-            let pair = self.embed_texts_batch(tier, &[framed, normalized_query.clone()])?;
-            if pair.len() == 2 {
-                let mut combined = vec![0.0f32; pair[0].len()];
-                for ((dst, &a), &b) in combined.iter_mut().zip(&pair[0]).zip(&pair[1]) {
-                    *dst = 0.65 * a + 0.35 * b;
-                }
-                l2_normalize(&combined)
-            } else {
-                pair.into_iter().next().unwrap_or_default()
-            }
-        } else {
-            let prompt = if already_framed || word_count == 0 {
-                normalized_query.clone()
-            } else {
-                format!("a photo of {normalized_query}.")
-            };
-            let single = self.embed_texts_batch(tier, &[prompt])?;
-            single.into_iter().next().unwrap_or_default()
-        };
+        // SigLIP2 text encoders expect raw lowercase query strings (matching training & ONNX export).
+        let single = self.embed_texts_batch(tier, &[normalized_query])?;
+        let vec_out = single.into_iter().next().unwrap_or_default();
 
         let mut cache = self.text_embed_cache.write();
         if cache.len() >= MAX_TEXT_EMBED_CACHE_ENTRIES {

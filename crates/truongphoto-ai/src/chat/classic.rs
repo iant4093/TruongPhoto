@@ -256,6 +256,10 @@ impl ClassicChatRouter {
                 )
             {
                 None
+            } else if matches!(low.as_str(), "outdoor" | "outdoors") {
+                Some("outdoor nature landscape".to_string())
+            } else if matches!(low.as_str(), "indoor" | "indoors") {
+                Some("indoor room interior".to_string())
             } else {
                 Some(cleaned)
             }
@@ -2017,6 +2021,12 @@ fn extract_semantic_query(text: &str) -> Option<String> {
         "taken",
         "shot",
         "shots",
+        "shoot",
+        "did",
+        "take",
+        "took",
+        "capture",
+        "captured",
         "containing",
         "during",
         "how",

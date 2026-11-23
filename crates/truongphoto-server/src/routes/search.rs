@@ -18,8 +18,7 @@ const MAX_LIMIT: usize = 500;
 fn tier_min_semantic_score(tier: AiTier) -> f32 {
     match tier {
         AiTier::Tier1 => 0.075,
-        AiTier::Tier2 => 0.085,
-        AiTier::Tier3 => 0.090,
+        AiTier::Tier2 | AiTier::Tier3 => 0.080,
     }
 }
 

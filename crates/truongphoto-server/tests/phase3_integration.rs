@@ -1404,7 +1404,7 @@ async fn live_vague_ai_eval() {
         .await;
         assert_eq!(st_m, StatusCode::OK, "chat failed for {prompt}: {resp}");
 
-        let plan = &resp["active_filters"];
+        let plan = &resp["assistant_message"]["plan"];
         let hits = resp["total_count"].as_i64().unwrap_or(-1);
         let reply = resp["assistant_message"]["content"].as_str().unwrap_or("");
         let intent = plan["intent"].as_str().unwrap_or("search");
@@ -1492,7 +1492,7 @@ async fn live_vague_ai_eval() {
         ))
         .await;
         assert_eq!(st_m, StatusCode::OK);
-        let plan = &resp["active_filters"];
+        let plan = &resp["assistant_message"]["plan"];
         let hits = resp["total_count"].as_i64().unwrap_or(-1);
         let intent = plan["intent"].as_str().unwrap_or("search");
         let ms = resp["elapsed_ms"].as_u64().unwrap_or(0);
