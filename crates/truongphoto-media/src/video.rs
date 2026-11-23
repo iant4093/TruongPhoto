@@ -329,23 +329,25 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
     }
     std::fs::create_dir_all(&tmp_dir)?;
 
-    let vf = if is_hdr && caps.has_zscale_tonemap {
-        "scale=w=min(1920\\,iw):h=-2,zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
-    } else {
-        "scale=w=min(1920\\,iw):h=-2,format=yuv420p"
-    };
+    const VF_SDR: &str = "scale=w='trunc(min(1920\\,iw)/2)*2':h=-2,format=yuv420p";
+    const VF_HDR_TONEMAP: &str = "scale=w='trunc(min(1920\\,iw)/2)*2':h=-2,zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+
+    let use_hdr_vf = is_hdr && caps.has_zscale_tonemap;
+    let initial_vf = if use_hdr_vf { VF_HDR_TONEMAP } else { VF_SDR };
 
     let seg_pattern = tmp_dir.join("seg_%04d.ts");
     let playlist_path = tmp_dir.join("index.m3u8");
 
-    let run_hls = |encoder: &str| {
+    let run_hls = |encoder: &str, filter: &str| {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::create_dir_all(&tmp_dir);
         let mut cmd = Command::new(ffmpeg);
         hide_console_window(&mut cmd);
         cmd.args(["-y", "-v", "error", "-i"])
             .arg(src)
             .args([
                 "-vf",
-                vf,
+                filter,
                 "-c:v",
                 encoder,
                 "-b:v",
@@ -376,7 +378,7 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
         )
     };
 
-    let mut output = match run_hls(&caps.h264_encoder) {
+    let mut output = match run_hls(&caps.h264_encoder, initial_vf) {
         Ok(out) => out,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -388,8 +390,15 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
     if (!output.status.success() || !playlist_path.is_file())
         && is_hardware_encoder(&caps.h264_encoder)
     {
-        if let Ok(fallback) = run_hls("libx264") {
+        if let Ok(fallback) = run_hls("libx264", initial_vf) {
             output = fallback;
+        }
+    }
+
+    // If HDR zscale tonemapping failed (e.g. missing/unusual colorspace tags), fall back to SDR filter chain.
+    if (!output.status.success() || !playlist_path.is_file()) && use_hdr_vf {
+        if let Ok(sdr_fallback) = run_hls("libx264", VF_SDR) {
+            output = sdr_fallback;
         }
     }
 

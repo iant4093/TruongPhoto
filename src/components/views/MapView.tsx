@@ -257,6 +257,25 @@ export const MapView: React.FC = () => {
     void loadInitialMap();
   }, [loadInitialMap, libraryRevision]);
 
+  // Refresh open cluster photo strip when libraryRevision changes (e.g. item trashed or favorited in Lightbox).
+  useEffect(() => {
+    if (!selectedCluster || libraryRevision === 0) return;
+    const seq = ++pointsSeqRef.current;
+    void getMapPoints({
+      min_lat: selectedCluster.min_lat,
+      max_lat: selectedCluster.max_lat,
+      min_lng: selectedCluster.min_lon,
+      max_lng: selectedCluster.max_lon,
+      limit: 100,
+    })
+      .then((res) => {
+        if (seq === pointsSeqRef.current) {
+          setStripAssets(res.items);
+        }
+      })
+      .catch(() => {});
+  }, [libraryRevision, selectedCluster]);
+
   const handleSelectCluster = useCallback(async (cluster: MapCluster) => {
     setSelectedCluster(cluster);
     setLoadingStrip(true);

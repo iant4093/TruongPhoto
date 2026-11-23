@@ -56,29 +56,29 @@ const SIMPLE_CHAT_PRESETS: ReadonlyArray<{
   label: string;
   desc: string;
 }> = [
-  { tier: 'tier0', modelId: null, label: 'Instant Rules', desc: 'Built-in · No download' },
-  { tier: 'tier1', modelId: 'gemma4-e2b', label: 'Compact AI', desc: '~1.6 GB local LLM' },
-  { tier: 'tier2', modelId: 'gemma4-e4b', label: 'Standard AI', desc: '~2.8 GB local LLM' },
-  { tier: 'tier3', modelId: 'gemma4-26b-a4b', label: 'Studio AI + VLM', desc: '~15 GB · Visual rerank' },
+  { tier: 'tier0', modelId: null, label: 'Classic', desc: 'Instant rules · No download' },
+  { tier: 'tier1', modelId: 'gemma4-e2b', label: 'Fast', desc: '~1.6 GB · Gemma 4 E2B' },
+  { tier: 'tier2', modelId: 'gemma4-e4b', label: 'Balanced', desc: '~2.8 GB · Gemma 4 E4B' },
+  { tier: 'tier3', modelId: 'gemma4-26b-a4b', label: 'Pro + VLM', desc: '~15 GB · Visual rerank' },
 ];
 
 const CHAT_TIER_OPTIONS: ReadonlyArray<readonly [ChatTier, string]> = [
-  ['tier0', 'Tier 0 Classic'],
-  ['tier1', 'Tier 1 Gemma-4-E2B'],
-  ['tier2', 'Tier 2 Gemma-4-E4B'],
-  ['tier3', 'Tier 3 Gemma-4-26B + VLM'],
+  ['tier0', 'Classic'],
+  ['tier1', 'Fast · E2B'],
+  ['tier2', 'Balanced · E4B'],
+  ['tier3', 'Pro + VLM · 26B'],
 ];
 
 function formatChatTierLabel(tier: ChatTier): string {
   switch (tier) {
     case 'tier0':
-      return 'Tier 0 Classic';
+      return 'Classic';
     case 'tier1':
-      return 'Tier 1 Gemma-4-E2B';
+      return 'Fast (Gemma 4 E2B)';
     case 'tier2':
-      return 'Tier 2 Gemma-4-E4B';
+      return 'Balanced (Gemma 4 E4B)';
     case 'tier3':
-      return 'Tier 3 Gemma-4-26B + VLM';
+      return 'Pro + VLM (Gemma 4 26B)';
   }
 }
 
@@ -216,15 +216,21 @@ export const AiModelsPanel: React.FC = () => {
     };
   }, [refreshAiDashboard]);
 
-  // Automatically poll dashboard every 2 seconds while any model is downloading
+  // Automatically poll dashboard while downloading models, indexing pending photos, or staging a tier upgrade.
+  const anyDownloading = aiDashboard?.models.some((m) => m.status === 'downloading') ?? false;
+  const activeIndexing = Boolean(
+    aiDashboard &&
+      !aiDashboard.state.paused &&
+      (aiDashboard.queue.pending_assets > 0 || aiDashboard.state.staging_vision_tier !== null),
+  );
   useEffect(() => {
-    const anyDownloading = aiDashboard?.models.some((m) => m.status === 'downloading') ?? false;
-    if (!anyDownloading) return;
+    if (!anyDownloading && !activeIndexing) return;
+    const intervalMs = anyDownloading ? 2000 : 4000;
     const timer = window.setInterval(() => {
       void refreshAiDashboard().catch(() => {});
-    }, 2000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [aiDashboard?.models, refreshAiDashboard]);
+  }, [activeIndexing, anyDownloading, refreshAiDashboard]);
 
   const setModelBusy = (id: string, busy: boolean) => {
     setBusyModelIds((prev) => ({ ...prev, [id]: busy }));
@@ -311,12 +317,9 @@ export const AiModelsPanel: React.FC = () => {
 
   const handleSetChatTier = async (tier: ChatTier, vlmRerankEnabled?: boolean) => {
     if (!aiDashboard) return;
+    // Selecting Tier 3 ("Pro + VLM") enables VLM visual reranking by default unless explicitly toggled off.
     const nextVlm =
-      vlmRerankEnabled !== undefined
-        ? vlmRerankEnabled
-        : tier === 'tier3'
-          ? Boolean(aiDashboard.state.vlm_rerank_enabled)
-          : false;
+      vlmRerankEnabled !== undefined ? vlmRerankEnabled : tier === 'tier3';
     setBusyControl('chat-tier');
     try {
       await setAiChatTier({ tier, vlm_rerank_enabled: nextVlm });
@@ -547,6 +550,7 @@ export const AiModelsPanel: React.FC = () => {
                   key={preset.tier}
                   type="button"
                   className={`preset-choice-card ${active ? 'is-selected' : ''}`}
+                  disabled={busyControl !== null}
                   onClick={() => void handleSetTier(preset.tier)}
                 >
                   <div className="row" style={{ justifyContent: 'space-between', width: '100%' }}>
@@ -717,13 +721,19 @@ export const AiModelsPanel: React.FC = () => {
                   key={preset.tier}
                   type="button"
                   className={`preset-choice-card ${active ? 'is-selected' : ''}`}
+                  disabled={busyControl !== null}
                   onClick={() => {
                     if (preset.tier !== activeChatTier) {
                       void handleSetChatTier(preset.tier);
                     }
                   }}
                 >
-                  <strong>{preset.label}</strong>
+                  <div className="row" style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <strong>{preset.label}</strong>
+                    {hardware.recommended_chat_tier === preset.tier && (
+                      <Badge tone="info">Suggested</Badge>
+                    )}
+                  </div>
                   <span className="view-subtitle" style={{ marginTop: 2 }}>
                     {preset.desc}
                   </span>
@@ -754,21 +764,28 @@ export const AiModelsPanel: React.FC = () => {
 
           {activeChatModel &&
             (activeChatModel.status === 'not_installed' || activeChatModel.status === 'error') && (
-              <div className="row" style={{ justifyContent: 'space-between', paddingTop: 4 }}>
-                <span className="view-subtitle" style={{ marginTop: 0 }}>
-                  Model download required ({formatBytes(activeChatModel.approx_bytes)})
-                </span>
-                <button
-                  type="button"
-                  className="button button-primary"
-                  disabled={Boolean(busyModelIds[activeChatModel.id])}
-                  onClick={() =>
-                    void handleDownloadModel(activeChatModel.id, activeChatModel.name)
-                  }
-                >
-                  <Download size={13} />
-                  <span>Install Chat Model</span>
-                </button>
+              <div className="stack" style={{ gap: 6, paddingTop: 4 }}>
+                {activeChatModel.status === 'error' && activeChatModel.error_message && (
+                  <div className="error-banner" role="alert" style={{ padding: '6px 10px', fontSize: 11 }}>
+                    {activeChatModel.error_message}
+                  </div>
+                )}
+                <div className="row" style={{ justifyContent: 'space-between' }}>
+                  <span className="view-subtitle" style={{ marginTop: 0 }}>
+                    Model download required ({formatBytes(activeChatModel.approx_bytes)})
+                  </span>
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    disabled={Boolean(busyModelIds[activeChatModel.id])}
+                    onClick={() =>
+                      void handleDownloadModel(activeChatModel.id, activeChatModel.name)
+                    }
+                  >
+                    <Download size={13} />
+                    <span>Install Chat Model</span>
+                  </button>
+                </div>
               </div>
             )}
         </div>
@@ -824,6 +841,7 @@ export const AiModelsPanel: React.FC = () => {
                 <SegmentedControl
                   value={state.staging_vision_tier ?? state.active_vision_tier}
                   options={TIER_OPTIONS}
+                  disabled={busyControl !== null}
                   onChange={(tier) => void handleSetTier(tier)}
                 />
               </div>

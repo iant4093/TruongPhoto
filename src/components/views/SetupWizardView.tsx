@@ -89,7 +89,7 @@ export const SetupWizardView: React.FC = () => {
     setSelectedVisionTier(setupStatus.hardware.recommended_vision_tier);
   }, [setupStatus]);
 
-  const authViewportClass = `auth-viewport${isTauri() && nativeMacTitlebar ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`;
+  const authViewportClass = `app-window-frame auth-viewport${isTauri() && nativeMacTitlebar ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`;
 
   if (!setupStatus) {
     return (

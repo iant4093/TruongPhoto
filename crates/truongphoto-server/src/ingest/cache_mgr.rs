@@ -189,12 +189,19 @@ pub(crate) fn safe_join_relative(root: &Path, rel: &str) -> Option<PathBuf> {
         return None;
     }
     let mut out = root.to_path_buf();
+    let mut saw_normal = false;
     for comp in rel_path.components() {
         match comp {
-            Component::Normal(seg) => out.push(seg),
+            Component::Normal(seg) => {
+                out.push(seg);
+                saw_normal = true;
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
         }
+    }
+    if !saw_normal {
+        return None;
     }
     Some(out)
 }

@@ -32,7 +32,12 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
       "type": "array",
       "items": { "type": "string" }
     },
+    "exclude_person_names": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
     "location_query": { "type": ["string", "null"] },
+    "exclude_location_query": { "type": ["string", "null"] },
     "camera_model": { "type": ["string", "null"] },
     "lens_model": { "type": ["string", "null"] },
     "focal_length_min_mm": { "type": ["number", "null"] },
@@ -45,20 +50,25 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
     "shutter_speed_max_sec": { "type": ["number", "null"] },
     "orientation": {
       "type": ["string", "null"],
-      "enum": ["portrait", "landscape", "square", null]
+      "enum": ["portrait", "landscape", "square", "panorama", null]
     },
     "has_people": { "type": ["boolean", "null"] },
+    "min_faces": { "type": ["integer", "null"] },
+    "max_faces": { "type": ["integer", "null"] },
     "sort_by": {
       "type": ["string", "null"],
       "enum": [
+        "best",
         "capture_desc",
         "capture_asc",
         "focal_asc",
         "focal_desc",
         "iso_desc",
+        "iso_asc",
         "aperture_asc",
         "shutter_asc",
         "shutter_desc",
+        "duration_desc",
         null
       ]
     },
@@ -67,6 +77,10 @@ pub const ROUTER_PLAN_JSON_SCHEMA: &str = r#"{
       "items": { "type": "string" }
     },
     "kind": {
+      "type": ["string", "null"],
+      "enum": ["photo", "video", "live_photo", "motion_photo", "raw_jpg_stack", null]
+    },
+    "exclude_kind": {
       "type": ["string", "null"],
       "enum": ["photo", "video", "live_photo", "motion_photo", "raw_jpg_stack", null]
     },
@@ -87,7 +101,9 @@ const ALLOWED_ROUTER_PLAN_KEYS: &[&str] = &[
     "semantic_query",
     "ocr_terms",
     "person_names",
+    "exclude_person_names",
     "location_query",
+    "exclude_location_query",
     "camera_model",
     "lens_model",
     "focal_length_min_mm",
@@ -100,9 +116,12 @@ const ALLOWED_ROUTER_PLAN_KEYS: &[&str] = &[
     "shutter_speed_max_sec",
     "orientation",
     "has_people",
+    "min_faces",
+    "max_faces",
     "sort_by",
     "tags",
     "kind",
+    "exclude_kind",
     "favorite",
     "date_from",
     "date_to",
@@ -171,13 +190,55 @@ fn parse_iso_date_to_ms(raw: &str, is_end: bool) -> Option<i64> {
     Some(Utc.from_utc_datetime(&dt).timestamp_millis())
 }
 
+fn strip_json_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let after_lang = rest.split_once('\n').map(|(_, body)| body).unwrap_or(rest);
+        after_lang
+            .trim()
+            .strip_suffix("```")
+            .map(str::trim)
+            .unwrap_or_else(|| after_lang.trim())
+    } else {
+        trimmed
+    }
+}
+
+fn strip_trailing_count_suffix(raw: &str) -> &str {
+    if let Some((head, tail)) = raw.rsplit_once(" (") {
+        if let Some(inner) = tail.strip_suffix(')') {
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+                return head.trim();
+            }
+        }
+    }
+    raw.trim()
+}
+
 fn normalize_opt_string(value: Option<String>) -> Option<String> {
     value.and_then(|s| {
         let trimmed = s.trim();
         if trimmed.is_empty() {
+            return None;
+        }
+        // Small models (Tier 1) occasionally emit literal placeholder strings instead of JSON null.
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "null" | "none" | "n/a" | "nil" | "undefined" | "any"
+        ) {
+            return None;
+        }
+        Some(trimmed.to_string())
+    })
+}
+
+fn normalize_entity_opt_string(value: Option<String>) -> Option<String> {
+    normalize_opt_string(value).and_then(|s| {
+        let stripped = strip_trailing_count_suffix(&s);
+        if stripped.is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            Some(stripped.to_string())
         }
     })
 }
@@ -191,6 +252,9 @@ fn normalize_string_vec(items: Vec<String>) -> Vec<String> {
             continue;
         }
         let key = trimmed.to_ascii_lowercase();
+        if matches!(key.as_str(), "null" | "none" | "n/a") {
+            continue;
+        }
         if seen.insert(key) {
             out.push(trimmed.to_string());
         }
@@ -198,12 +262,20 @@ fn normalize_string_vec(items: Vec<String>) -> Vec<String> {
     out
 }
 
+fn normalize_entity_vec(items: Vec<String>) -> Vec<String> {
+    let cleaned = items
+        .into_iter()
+        .map(|s| strip_trailing_count_suffix(&s).to_string())
+        .collect();
+    normalize_string_vec(cleaned)
+}
+
 /// Parses and strictly validates a raw JSON string into [`RouterPlan`].
 ///
 /// Rejects malformed JSON, non-object JSON values, unknown/hallucinated keys (e.g. `file_paths`),
-/// invalid enum/type values, and inverted date ranges (`date_from_ms > date_to_ms`).
+/// invalid enum/type values, and inverted numeric date ranges (`date_from_ms > date_to_ms`).
 pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiError> {
-    let trimmed = raw_json.trim();
+    let trimmed = strip_json_code_fence(raw_json);
     if trimmed.is_empty() {
         return Err(AiError::InvalidInput("empty RouterPlan JSON".to_string()));
     }
@@ -224,6 +296,7 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
     }
 
     // Deterministically convert ISO date strings (`date_from` / `date_to`) into UTC epoch ms.
+    // Auto-swap inverted ISO date string pairs (common on smaller models).
     let iso_from = obj
         .remove("date_from")
         .and_then(|v| v.as_str().map(str::to_string));
@@ -231,20 +304,36 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
         .remove("date_to")
         .and_then(|v| v.as_str().map(str::to_string));
 
-    if let Some(raw) = iso_from {
-        if let Some(ms) = parse_iso_date_to_ms(&raw, false) {
-            let needs_insert = obj.get("date_from_ms").is_none_or(|v| v.is_null());
-            if needs_insert {
-                obj.insert("date_from_ms".to_string(), Value::from(ms));
-            }
+    let mut parsed_from = iso_from
+        .as_deref()
+        .and_then(|raw| parse_iso_date_to_ms(raw, false));
+    let mut parsed_to = iso_to
+        .as_deref()
+        .and_then(|raw| parse_iso_date_to_ms(raw, true));
+    if let (Some(a), Some(b)) = (parsed_from, parsed_to) {
+        if a > b {
+            // Re-parse swapped raw dates so start-of-day / end-of-day alignment stays exact.
+            parsed_from = iso_to
+                .as_deref()
+                .and_then(|raw| parse_iso_date_to_ms(raw, false))
+                .or(Some(b));
+            parsed_to = iso_from
+                .as_deref()
+                .and_then(|raw| parse_iso_date_to_ms(raw, true))
+                .or(Some(a));
         }
     }
-    if let Some(raw) = iso_to {
-        if let Some(ms) = parse_iso_date_to_ms(&raw, true) {
-            let needs_insert = obj.get("date_to_ms").is_none_or(|v| v.is_null());
-            if needs_insert {
-                obj.insert("date_to_ms".to_string(), Value::from(ms));
-            }
+
+    if let Some(ms) = parsed_from {
+        let needs_insert = obj.get("date_from_ms").is_none_or(|v| v.is_null());
+        if needs_insert {
+            obj.insert("date_from_ms".to_string(), Value::from(ms));
+        }
+    }
+    if let Some(ms) = parsed_to {
+        let needs_insert = obj.get("date_to_ms").is_none_or(|v| v.is_null());
+        if needs_insert {
+            obj.insert("date_to_ms".to_string(), Value::from(ms));
         }
     }
 
@@ -294,6 +383,19 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
         }
     }
 
+    if plan.min_faces == Some(0) {
+        plan.min_faces = None;
+    }
+    if plan.max_faces == Some(0) {
+        plan.max_faces = None;
+    }
+    if let (Some(a), Some(b)) = (plan.min_faces, plan.max_faces) {
+        if a > b {
+            plan.min_faces = Some(b);
+            plan.max_faces = Some(a);
+        }
+    }
+
     plan.intent =
         normalize_opt_string(plan.intent).and_then(|i| match i.to_ascii_lowercase().as_str() {
             "search" => Some("search".to_string()),
@@ -302,24 +404,29 @@ pub fn parse_and_validate_router_plan(raw_json: &str) -> Result<RouterPlan, AiEr
         });
     plan.semantic_query = normalize_opt_string(plan.semantic_query);
     plan.ocr_terms = normalize_opt_string(plan.ocr_terms);
-    plan.location_query = normalize_opt_string(plan.location_query);
-    plan.camera_model = normalize_opt_string(plan.camera_model);
-    plan.lens_model = normalize_opt_string(plan.lens_model);
+    plan.location_query = normalize_entity_opt_string(plan.location_query);
+    plan.exclude_location_query = normalize_entity_opt_string(plan.exclude_location_query);
+    plan.camera_model = normalize_entity_opt_string(plan.camera_model);
+    plan.lens_model = normalize_entity_opt_string(plan.lens_model);
     plan.orientation = normalize_opt_string(plan.orientation).and_then(|o| {
         match o.to_ascii_lowercase().as_str() {
             "portrait" | "vertical" => Some("portrait".to_string()),
             "landscape" | "horizontal" => Some("landscape".to_string()),
             "square" => Some("square".to_string()),
+            "panorama" | "panoramic" | "pano" => Some("panorama".to_string()),
             _ => None,
         }
     });
     plan.sort_by =
         normalize_opt_string(plan.sort_by).and_then(|s| match s.to_ascii_lowercase().as_str() {
-            "capture_desc" | "capture_asc" | "focal_asc" | "focal_desc" | "iso_desc"
-            | "aperture_asc" | "shutter_asc" | "shutter_desc" => Some(s.to_ascii_lowercase()),
+            "best" | "capture_desc" | "capture_asc" | "focal_asc" | "focal_desc" | "iso_desc"
+            | "iso_asc" | "aperture_asc" | "shutter_asc" | "shutter_desc" | "duration_desc" => {
+                Some(s.to_ascii_lowercase())
+            }
             _ => None,
         });
-    plan.person_names = normalize_string_vec(plan.person_names);
+    plan.person_names = normalize_entity_vec(plan.person_names);
+    plan.exclude_person_names = normalize_entity_vec(plan.exclude_person_names);
     plan.tags = normalize_string_vec(plan.tags);
     plan.assistant_reply = plan.assistant_reply.trim().to_string();
     plan.follow_up_suggestions = normalize_string_vec(plan.follow_up_suggestions);
@@ -368,10 +475,14 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
             intent: next_intent,
             semantic_query: normalize_opt_string(next.semantic_query.clone()),
             ocr_terms: normalize_opt_string(next.ocr_terms.clone()),
-            person_names: normalize_string_vec(next.person_names.clone()),
-            location_query: normalize_opt_string(next.location_query.clone()),
-            camera_model: normalize_opt_string(next.camera_model.clone()),
-            lens_model: normalize_opt_string(next.lens_model.clone()),
+            person_names: normalize_entity_vec(next.person_names.clone()),
+            exclude_person_names: normalize_entity_vec(next.exclude_person_names.clone()),
+            location_query: normalize_entity_opt_string(next.location_query.clone()),
+            exclude_location_query: normalize_entity_opt_string(
+                next.exclude_location_query.clone(),
+            ),
+            camera_model: normalize_entity_opt_string(next.camera_model.clone()),
+            lens_model: normalize_entity_opt_string(next.lens_model.clone()),
             focal_length_min_mm: next.focal_length_min_mm,
             focal_length_max_mm: next.focal_length_max_mm,
             aperture_min_f: next.aperture_min_f,
@@ -382,9 +493,12 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
             shutter_speed_max_sec: next.shutter_speed_max_sec,
             orientation: normalize_opt_string(next.orientation.clone()),
             has_people: next.has_people,
+            min_faces: next.min_faces,
+            max_faces: next.max_faces,
             sort_by: normalize_opt_string(next.sort_by.clone()),
             tags: normalize_string_vec(next.tags.clone()),
             kind: next.kind,
+            exclude_kind: next.exclude_kind,
             favorite: next.favorite,
             date_from_ms: next.date_from_ms,
             date_to_ms: next.date_to_ms,
@@ -447,13 +561,42 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         next.shutter_speed_max_sec,
     );
 
+    let (min_faces, max_faces) = merge_ord_range(
+        prior.min_faces,
+        prior.max_faces,
+        next.min_faces,
+        next.max_faces,
+    );
+
     let mut merged_people = merge_string_lists(&prior.person_names, &next.person_names);
+    let mut merged_exclude_people =
+        merge_string_lists(&prior.exclude_person_names, &next.exclude_person_names);
+    // If a person was explicitly included in this turn, remove them from exclusions and vice versa.
+    if !next.person_names.is_empty() {
+        let inc_low: HashSet<String> = next
+            .person_names
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect();
+        merged_exclude_people.retain(|s| !inc_low.contains(&s.to_ascii_lowercase()));
+    }
+    if !next.exclude_person_names.is_empty() {
+        let exc_low: HashSet<String> = next
+            .exclude_person_names
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect();
+        merged_people.retain(|s| !exc_low.contains(&s.to_ascii_lowercase()));
+    }
+
     let mut merged_has_people = next.has_people.or(prior.has_people);
     // Avoid contradictory SQL when switching between "photos of X" and "without people".
     if next.has_people == Some(false) {
         merged_people.clear();
         merged_has_people = Some(false);
-    } else if (!next.person_names.is_empty() || next.has_people == Some(true))
+    } else if (!next.person_names.is_empty()
+        || next.has_people == Some(true)
+        || next.min_faces.is_some())
         && merged_has_people == Some(false)
     {
         merged_has_people = if next.has_people == Some(true) {
@@ -463,6 +606,13 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         };
     }
 
+    let merged_kind = next.kind.or(prior.kind);
+    let merged_exclude_kind = if next.kind.is_some() && next.exclude_kind.is_none() {
+        None
+    } else {
+        next.exclude_kind.or(prior.exclude_kind)
+    };
+
     RouterPlan {
         intent: next_intent,
         semantic_query: normalize_opt_string(next.semantic_query.clone())
@@ -470,12 +620,15 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         ocr_terms: normalize_opt_string(next.ocr_terms.clone())
             .or_else(|| normalize_opt_string(prior.ocr_terms.clone())),
         person_names: merged_people,
-        location_query: normalize_opt_string(next.location_query.clone())
-            .or_else(|| normalize_opt_string(prior.location_query.clone())),
-        camera_model: normalize_opt_string(next.camera_model.clone())
-            .or_else(|| normalize_opt_string(prior.camera_model.clone())),
-        lens_model: normalize_opt_string(next.lens_model.clone())
-            .or_else(|| normalize_opt_string(prior.lens_model.clone())),
+        exclude_person_names: merged_exclude_people,
+        location_query: normalize_entity_opt_string(next.location_query.clone())
+            .or_else(|| normalize_entity_opt_string(prior.location_query.clone())),
+        exclude_location_query: normalize_entity_opt_string(next.exclude_location_query.clone())
+            .or_else(|| normalize_entity_opt_string(prior.exclude_location_query.clone())),
+        camera_model: normalize_entity_opt_string(next.camera_model.clone())
+            .or_else(|| normalize_entity_opt_string(prior.camera_model.clone())),
+        lens_model: normalize_entity_opt_string(next.lens_model.clone())
+            .or_else(|| normalize_entity_opt_string(prior.lens_model.clone())),
         focal_length_min_mm,
         focal_length_max_mm,
         aperture_min_f,
@@ -487,10 +640,13 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         orientation: normalize_opt_string(next.orientation.clone())
             .or_else(|| normalize_opt_string(prior.orientation.clone())),
         has_people: merged_has_people,
+        min_faces,
+        max_faces,
         sort_by: normalize_opt_string(next.sort_by.clone())
             .or_else(|| normalize_opt_string(prior.sort_by.clone())),
         tags: merge_string_lists(&prior.tags, &next.tags),
-        kind: next.kind.or(prior.kind),
+        kind: merged_kind,
+        exclude_kind: merged_exclude_kind,
         favorite: next.favorite.or(prior.favorite),
         date_from_ms,
         date_to_ms,

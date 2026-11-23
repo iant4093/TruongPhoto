@@ -7,8 +7,10 @@ import {
   PanelLeft,
   Play,
   Plus,
+  RotateCcw,
   Search,
   Sparkles,
+  Square,
   Trash2,
   X,
 } from 'lucide-react';
@@ -26,21 +28,31 @@ const nativeMacTitlebar =
 const windowsCaption = !nativeMacTitlebar && isWindowsPlatform();
 
 const SORT_LABELS: Record<string, string> = {
+  best: 'Top picks',
   capture_desc: 'Newest first',
   capture_asc: 'Oldest first',
   focal_asc: 'Widest angle first',
   focal_desc: 'Most zoomed first',
   iso_desc: 'Highest ISO first',
+  iso_asc: 'Lowest ISO first',
   aperture_asc: 'Widest aperture first',
   shutter_asc: 'Fastest shutter first',
   shutter_desc: 'Longest exposure first',
+  duration_desc: 'Longest video first',
 };
 
 const CHAT_TIER_LABELS: Record<ChatTier, string> = {
-  tier0: 'Classic Search',
+  tier0: 'Classic',
   tier1: 'Gemma 4 · Fast',
   tier2: 'Gemma 4 · Balanced',
-  tier3: 'Gemma 4 · Max + VLM',
+  tier3: 'Gemma 4 · Pro + VLM',
+};
+
+const CHAT_TIER_TOOLTIPS: Record<ChatTier, string> = {
+  tier0: 'Instant deterministic rules — parses dates, people, EXIF, locations & negations offline with zero download',
+  tier1: 'Gemma 4 E2B — fast local LLM for natural-language photo search',
+  tier2: 'Gemma 4 E4B — balanced local LLM for nuanced multi-turn library queries',
+  tier3: 'Gemma 4 26B + VLM — deep reasoning plus visual thumbnail reranking',
 };
 
 const KIND_LABELS: Record<AssetKind, string> = {
@@ -99,19 +111,33 @@ function formatShortTime(ms: number): string {
   return new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-function buildFilterChips(plan: RouterPlan | null): string[] {
+function buildFilterChips(plan: RouterPlan | null, includeSemantic = false): string[] {
   if (!plan || plan.intent === 'answer') return [];
   const chips: string[] = [];
 
+  if (includeSemantic && plan.semantic_query?.trim()) {
+    chips.push(`Search: ${plan.semantic_query.trim()}`);
+  }
   if (plan.kind) {
     chips.push(`Kind: ${KIND_LABELS[plan.kind] ?? plan.kind}`);
+  }
+  if (plan.exclude_kind) {
+    chips.push(`Exclude: ${KIND_LABELS[plan.exclude_kind] ?? plan.exclude_kind}`);
   }
   if (plan.location_query) {
     chips.push(`Location: ${plan.location_query}`);
   }
+  if (plan.exclude_location_query) {
+    chips.push(`Not in: ${plan.exclude_location_query}`);
+  }
   for (const person of plan.person_names ?? []) {
     if (person.trim()) {
       chips.push(`Person: ${person.trim()}`);
+    }
+  }
+  for (const person of plan.exclude_person_names ?? []) {
+    if (person.trim()) {
+      chips.push(`Without: ${person.trim()}`);
     }
   }
   if (plan.camera_model) {
@@ -171,7 +197,7 @@ function buildFilterChips(plan: RouterPlan | null): string[] {
     if (sMin != null && sMax != null && Math.abs(sMin - sMax) / Math.max(sMin, 1e-6) < 0.05) {
       chips.push(`Shutter: ${fmtShutter(sMin)}`);
     } else if (sMin != null && sMax != null) {
-      chips.push(`Shutter: ${fmtShutter(sMax)}–${fmtShutter(sMin)}`);
+      chips.push(`Shutter: ${fmtShutter(sMin)}–${fmtShutter(sMax)}`);
     } else if (sMax != null) {
       chips.push(`Shutter: ≤ ${fmtShutter(sMax)}`);
     } else if (sMin != null) {
@@ -188,6 +214,19 @@ function buildFilterChips(plan: RouterPlan | null): string[] {
     chips.push('People: None');
   } else if (plan.has_people === true) {
     chips.push('People: Present');
+  }
+  if (plan.min_faces != null || plan.max_faces != null) {
+    if (plan.max_faces === 1 && (plan.min_faces == null || plan.min_faces === 1)) {
+      chips.push('Faces: Solo');
+    } else if (plan.min_faces != null && plan.max_faces != null && plan.min_faces === plan.max_faces) {
+      chips.push(`Faces: ${plan.min_faces}`);
+    } else if (plan.min_faces != null && plan.max_faces != null) {
+      chips.push(`Faces: ${plan.min_faces}–${plan.max_faces}`);
+    } else if (plan.min_faces != null) {
+      chips.push(`Faces: ${plan.min_faces}+`);
+    } else if (plan.max_faces != null) {
+      chips.push(`Faces: ≤ ${plan.max_faces}`);
+    }
   }
   if (plan.sort_by && SORT_LABELS[plan.sort_by]) {
     chips.push(`Sort: ${SORT_LABELS[plan.sort_by]}`);
@@ -321,6 +360,9 @@ export const ChatView: React.FC = () => {
   const chatSessions = useAppStore((s) => s.chatSessions);
   const activeChatSessionId = useAppStore((s) => s.activeChatSessionId);
   const chatMessages = useAppStore((s) => s.chatMessages);
+  const chatActiveFilters = useAppStore((s) => s.chatActiveFilters);
+  const chatError = useAppStore((s) => s.chatError);
+  const chatFailedPrompt = useAppStore((s) => s.chatFailedPrompt);
   const user = useAppStore((s) => s.user);
   const chatSending = useAppStore((s) => s.chatSending);
   const chatPendingStartedAt = useAppStore((s) => s.chatPendingStartedAt);
@@ -331,6 +373,8 @@ export const ChatView: React.FC = () => {
   const selectChatSession = useAppStore((s) => s.selectChatSession);
   const removeChatSession = useAppStore((s) => s.removeChatSession);
   const sendChatPrompt = useAppStore((s) => s.sendChatPrompt);
+  const abortChatPrompt = useAppStore((s) => s.abortChatPrompt);
+  const clearChatError = useAppStore((s) => s.clearChatError);
   const refreshAiDashboard = useAppStore((s) => s.refreshAiDashboard);
   const openLightbox = useAppStore((s) => s.openLightbox);
   const setActiveNav = useAppStore((s) => s.setActiveNav);
@@ -380,9 +424,12 @@ export const ChatView: React.FC = () => {
     };
   }, [isNarrowViewport, threadsOpen]);
 
-  const activeTier: ChatTier = aiDashboard?.state.active_chat_tier ?? warmupTier ?? 'tier0';
-  const tierLabel = CHAT_TIER_LABELS[activeTier];
+  const resolvedTier: ChatTier | null = aiDashboard?.state.active_chat_tier ?? warmupTier ?? null;
+  const activeTier: ChatTier = resolvedTier ?? 'tier0';
+  const tierLabel = resolvedTier ? CHAT_TIER_LABELS[resolvedTier] : null;
+  const tierTooltip = resolvedTier ? CHAT_TIER_TOOLTIPS[resolvedTier] : undefined;
   const activeSession = chatSessions.find((s) => s.id === activeChatSessionId) ?? null;
+  const activeFilterBarChips = buildFilterChips(chatActiveFilters, true);
 
   // Load sessions, AI model state, and pre-warm Gemma 4 on GPU once when entering Ask AI.
   useEffect(() => {
@@ -432,20 +479,27 @@ export const ChatView: React.FC = () => {
     const sem = plan.semantic_query?.trim() || undefined;
     const ocr = plan.ocr_terms?.trim() || undefined;
     let personIds: string[] | undefined;
-    if (plan.person_names && plan.person_names.length > 0) {
+    let excludePersonIds: string[] | undefined;
+    if (
+      (plan.person_names && plan.person_names.length > 0) ||
+      (plan.exclude_person_names && plan.exclude_person_names.length > 0)
+    ) {
       try {
         const res = await listPeople({ include_hidden: false });
-        const wanted = plan.person_names.map((n) => n.trim().toLowerCase()).filter(Boolean);
-        const matched = res.items
-          .filter((p) => {
-            const name = (p.name ?? '').trim().toLowerCase();
-            if (!name) return false;
-            return wanted.some((w) => name === w || name.split(/\s+/)[0] === w);
-          })
-          .map((p) => p.id);
-        if (matched.length > 0) {
-          personIds = matched;
-        }
+        const resolveNames = (names: string[] | undefined): string[] | undefined => {
+          if (!names || names.length === 0) return undefined;
+          const wanted = names.map((n) => n.trim().toLowerCase()).filter(Boolean);
+          const matched = res.items
+            .filter((p) => {
+              const name = (p.name ?? '').trim().toLowerCase();
+              if (!name) return false;
+              return wanted.some((w) => name === w || name.split(/\s+/)[0] === w);
+            })
+            .map((p) => p.id);
+          return matched.length > 0 ? matched : undefined;
+        };
+        personIds = resolveNames(plan.person_names);
+        excludePersonIds = resolveNames(plan.exclude_person_names);
       } catch {
         // Proceed without person_ids if people lookup fails.
       }
@@ -456,7 +510,10 @@ export const ChatView: React.FC = () => {
       mode: sem ? 'hybrid' : ocr ? 'ocr' : 'filters',
       folder_id: undefined,
       person_ids: personIds,
+      exclude_person_ids: excludePersonIds,
       has_people: plan.has_people ?? undefined,
+      min_faces: plan.min_faces ?? undefined,
+      max_faces: plan.max_faces ?? undefined,
       tags: plan.tags && plan.tags.length > 0 ? plan.tags : undefined,
       camera_model: plan.camera_model ?? undefined,
       lens_model: plan.lens_model ?? undefined,
@@ -471,7 +528,9 @@ export const ChatView: React.FC = () => {
       orientation: plan.orientation ?? undefined,
       sort_by: plan.sort_by ?? undefined,
       geo_query: plan.location_query ?? undefined,
+      exclude_geo_query: plan.exclude_location_query ?? undefined,
       kind: plan.kind ?? undefined,
+      exclude_kind: plan.exclude_kind ?? undefined,
       favorite: plan.favorite ?? undefined,
       date_from_ms: plan.date_from_ms ?? undefined,
       date_to_ms: plan.date_to_ms ?? undefined,
@@ -491,6 +550,11 @@ export const ChatView: React.FC = () => {
 
   useEffect(() => {
     sessionEpochRef.current += 1;
+    stickToBottomRef.current = true;
+    const scroller = scrollContainerRef.current;
+    if (scroller) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
     textareaRef.current?.focus();
   }, [activeChatSessionId]);
 
@@ -502,10 +566,15 @@ export const ChatView: React.FC = () => {
     try {
       await sendChatPrompt(trimmed);
     } catch (err) {
+      const aborted =
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError');
       if (epoch === sessionEpochRef.current) {
         setPromptInput((cur) => (cur.trim().length === 0 ? trimmed : cur));
       }
-      notifyError(err, 'Chat search failed');
+      if (!aborted) {
+        notifyError(err, 'Chat search failed');
+      }
     } finally {
       if (epoch === sessionEpochRef.current) {
         textareaRef.current?.focus();
@@ -641,18 +710,24 @@ export const ChatView: React.FC = () => {
 
           <div className="chat-threads-footer">
             <div className="row" style={{ justifyContent: 'space-between', gap: 6 }}>
-              <span className="row" style={{ gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
-                <Sparkles size={13} />
-                <span>{tierLabel}</span>
-              </span>
-              <button
-                type="button"
-                className="button button-quiet"
-                style={{ minHeight: 24, padding: '2px 7px', fontSize: 11 }}
-                onClick={() => setActiveNav('settings')}
+              <span
+                className="row"
+                title={tierTooltip}
+                style={{ gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}
               >
-                Models
-              </button>
+                <Sparkles size={13} />
+                <span>{tierLabel ?? 'Loading AI…'}</span>
+              </span>
+              {user?.role === 'admin' && (
+                <button
+                  type="button"
+                  className="button button-quiet"
+                  style={{ minHeight: 24, padding: '2px 7px', fontSize: 11 }}
+                  onClick={() => setActiveNav('settings')}
+                >
+                  Models
+                </button>
+              )}
             </div>
             {warmingModel && (
               <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
@@ -686,7 +761,11 @@ export const ChatView: React.FC = () => {
             <div className="chat-main-title" data-tauri-drag-region>
               {activeSession?.title || 'New Conversation'}
             </div>
-            <span className="badge badge-info">{tierLabel}</span>
+            {tierLabel && (
+              <span className="badge badge-info" title={tierTooltip}>
+                {tierLabel}
+              </span>
+            )}
           </div>
 
           <div className="row chat-topbar-actions" style={{ gap: 6, marginLeft: 'auto' }}>
@@ -905,6 +984,38 @@ export const ChatView: React.FC = () => {
                 {chatSending && (
                   <ThinkingIndicator activeTier={activeTier} startedAt={chatPendingStartedAt} />
                 )}
+
+                {chatError && !chatSending && (
+                  <div className="chat-inline-error" role="alert">
+                    <span>{chatError}</span>
+                    <div className="row" style={{ gap: 6, flexShrink: 0 }}>
+                      {chatFailedPrompt && (
+                        <button
+                          type="button"
+                          className="button"
+                          style={{ minHeight: 26, padding: '2px 9px', fontSize: 11 }}
+                          onClick={() => {
+                            const retryText = chatFailedPrompt;
+                            clearChatError();
+                            void submitPrompt(retryText);
+                          }}
+                        >
+                          <RotateCcw size={11} />
+                          <span>Retry</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="icon-button"
+                        style={{ width: 24, height: 24 }}
+                        aria-label="Dismiss error"
+                        onClick={clearChatError}
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
             <div ref={messagesEndRef} />
@@ -912,6 +1023,34 @@ export const ChatView: React.FC = () => {
         </div>
 
         <div className="chat-composer-dock">
+          {activeFilterBarChips.length > 0 && (
+            <div className="chat-active-filters-bar" aria-label="Active conversation filters">
+              <span className="chat-active-filters-label">Active:</span>
+              <div className="chat-filter-chips" style={{ marginTop: 0 }}>
+                {activeFilterBarChips.map((chip) => (
+                  <button
+                    key={chip}
+                    type="button"
+                    className="chat-filter-chip is-removable"
+                    title={`Click to remove ${chip}`}
+                    disabled={chatSending}
+                    onClick={() => void submitPrompt(`Remove the ${chip} filter`)}
+                  >
+                    <span>{chip}</span>
+                    <X size={10} aria-hidden="true" />
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="chat-clear-filters-btn"
+                disabled={chatSending}
+                onClick={() => void submitPrompt('Clear filters')}
+              >
+                Clear filters
+              </button>
+            </div>
+          )}
           <form className="chat-composer-shell" onSubmit={handleFormSubmit}>
             <textarea
               ref={textareaRef}
@@ -924,15 +1063,27 @@ export const ChatView: React.FC = () => {
               onChange={(e) => setPromptInput(e.target.value)}
               onKeyDown={handleComposerKeyDown}
             />
-            <button
-              type="submit"
-              className="chat-send-btn"
-              aria-label="Send"
-              disabled={chatSending || !promptInput.trim()}
-              title="Send (Enter)"
-            >
-              <ArrowUp size={16} strokeWidth={2.2} />
-            </button>
+            {chatSending ? (
+              <button
+                type="button"
+                className="chat-send-btn chat-stop-btn"
+                aria-label="Stop"
+                title="Stop generating"
+                onClick={abortChatPrompt}
+              >
+                <Square size={13} fill="currentColor" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                className="chat-send-btn"
+                aria-label="Send"
+                disabled={!promptInput.trim()}
+                title="Send (Enter)"
+              >
+                <ArrowUp size={16} strokeWidth={2.2} />
+              </button>
+            )}
           </form>
           <div className="chat-composer-hint">
             Enter to send · Shift+Enter for new line · 100% local on-device AI

@@ -3,8 +3,9 @@ use ort::environment::Environment;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use truongphoto_core::AiTier;
@@ -25,6 +26,7 @@ pub enum SessionKey {
 struct CachedSession {
     session: Session,
     last_used: Instant,
+    is_cpu: bool,
 }
 
 struct GlobalOrtState {
@@ -129,6 +131,10 @@ fn init_global_ort() -> Result<GlobalOrtState, String> {
 pub struct OrtRuntimeManager {
     coreml_cache_dir: PathBuf,
     sessions: Mutex<HashMap<SessionKey, Arc<Mutex<Option<CachedSession>>>>>,
+    /// Session keys that failed hardware EP build or runtime execution and are latched to CPU EP.
+    cpu_fallback_keys: Mutex<HashSet<SessionKey>>,
+    hw_ep_succeeded: AtomicBool,
+    hw_ep_failed: AtomicBool,
 }
 
 impl std::fmt::Debug for OrtRuntimeManager {
@@ -149,6 +155,9 @@ impl OrtRuntimeManager {
         Self {
             coreml_cache_dir: coreml_cache_dir.into(),
             sessions: Mutex::new(HashMap::new()),
+            cpu_fallback_keys: Mutex::new(HashSet::new()),
+            hw_ep_succeeded: AtomicBool::new(false),
+            hw_ep_failed: AtomicBool::new(false),
         }
     }
 
@@ -160,7 +169,15 @@ impl OrtRuntimeManager {
     /// Returns `"CoreML"`, `"DirectML"`, `"CPU"`, or `"Unavailable"`.
     pub fn ep_name(&self) -> &'static str {
         match GLOBAL_ORT.get() {
-            Some(Ok(state)) => state.ep_name,
+            Some(Ok(state)) => {
+                if self.hw_ep_failed.load(Ordering::Acquire)
+                    && !self.hw_ep_succeeded.load(Ordering::Acquire)
+                {
+                    "CPU"
+                } else {
+                    state.ep_name
+                }
+            }
             _ => "Unavailable",
         }
     }
@@ -215,9 +232,16 @@ impl OrtRuntimeManager {
     }
 
     /// Lazily loads (or reuses) the ONNX Runtime session for `key` and runs `f(&mut session)`.
-    pub fn with_session<T, F>(&self, key: SessionKey, model_path: &Path, f: F) -> Result<T, AiError>
+    /// If a hardware-EP session (DirectML/CoreML) fails at runtime with an ORT error, it is
+    /// automatically evicted, latched to CPU EP for `key`, and retried once transparently.
+    pub fn with_session<T, F>(
+        &self,
+        key: SessionKey,
+        model_path: &Path,
+        mut f: F,
+    ) -> Result<T, AiError>
     where
-        F: FnOnce(&mut Session) -> Result<T, AiError>,
+        F: FnMut(&mut Session) -> Result<T, AiError>,
     {
         let state = match GLOBAL_ORT.get_or_init(init_global_ort) {
             Ok(s) => s,
@@ -231,19 +255,30 @@ impl OrtRuntimeManager {
             )));
         }
 
+        // CoreML needs per-width-bucket static sessions for OCR recognition, whereas DirectML/CPU
+        // handle dynamic widths cleanly in a single session (saving 3× VRAM on Windows).
+        let effective_key = if !cfg!(target_os = "macos") && matches!(key, SessionKey::OcrRec(_)) {
+            SessionKey::OcrRec(0)
+        } else {
+            key
+        };
+
         let slot = {
             let mut map = self.sessions.lock();
-            map.entry(key)
+            map.entry(effective_key)
                 .or_insert_with(|| Arc::new(Mutex::new(None)))
                 .clone()
         };
 
         let mut guard = slot.lock();
         if guard.is_none() {
-            let session = self.build_session(&state.env, key, model_path)?;
+            let force_cpu = self.cpu_fallback_keys.lock().contains(&effective_key);
+            let (session, is_cpu) =
+                self.build_session(&state.env, effective_key, model_path, force_cpu)?;
             *guard = Some(CachedSession {
                 session,
                 last_used: Instant::now(),
+                is_cpu,
             });
         }
 
@@ -251,9 +286,35 @@ impl OrtRuntimeManager {
             .as_mut()
             .expect("session slot populated immediately above");
         cached.last_used = Instant::now();
-        let out = f(&mut cached.session)?;
-        cached.last_used = Instant::now();
-        Ok(out)
+        let was_cpu = cached.is_cpu;
+        match f(&mut cached.session) {
+            Ok(out) => {
+                cached.last_used = Instant::now();
+                Ok(out)
+            }
+            Err(AiError::Ort(hw_run_err)) if !was_cpu => {
+                tracing::warn!(
+                    key = ?effective_key,
+                    error = %hw_run_err,
+                    "hardware EP inference failed at runtime; latching session to CPU EP and retrying"
+                );
+                self.hw_ep_failed.store(true, Ordering::Release);
+                self.cpu_fallback_keys.lock().insert(effective_key);
+                *guard = None;
+                let (cpu_session, _) =
+                    self.build_session(&state.env, effective_key, model_path, true)?;
+                *guard = Some(CachedSession {
+                    session: cpu_session,
+                    last_used: Instant::now(),
+                    is_cpu: true,
+                });
+                let retry_cached = guard.as_mut().expect("cpu session populated above");
+                let out = f(&mut retry_cached.session)?;
+                retry_cached.last_used = Instant::now();
+                Ok(out)
+            }
+            Err(other) => Err(other),
+        }
     }
 
     fn build_session(
@@ -261,7 +322,8 @@ impl OrtRuntimeManager {
         env: &Environment,
         key: SessionKey,
         model_path: &Path,
-    ) -> Result<Session, AiError> {
+        force_cpu: bool,
+    ) -> Result<(Session, bool), AiError> {
         let _ = key;
         let _ = std::fs::create_dir_all(&self.coreml_cache_dir);
         let intra_threads = std::thread::available_parallelism()
@@ -271,7 +333,7 @@ impl OrtRuntimeManager {
 
         // 1. Try hardware-accelerated execution provider first (CoreML on macOS, DirectML on Windows).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
+        if !force_cpu {
             let mut hw_builder = Session::builder(env)
                 .map_err(|e| AiError::Ort(e.to_string()))?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -280,6 +342,8 @@ impl OrtRuntimeManager {
                 .map_err(|e| AiError::Ort(e.to_string()))?
                 .with_inter_threads(1)
                 .map_err(|e| AiError::Ort(e.to_string()))?;
+
+            let mut ep_registered = true;
 
             #[cfg(target_os = "macos")]
             {
@@ -292,9 +356,13 @@ impl OrtRuntimeManager {
                     .with_static_input_shapes(use_static_shapes)
                     .with_model_cache_dir(&cache_dir)
                     .build();
-                hw_builder = hw_builder
-                    .with_execution_providers([ep])
-                    .unwrap_or_else(|e| e.recover());
+                hw_builder = match hw_builder.with_execution_providers([ep]) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        ep_registered = false;
+                        e.recover()
+                    }
+                };
             }
 
             #[cfg(target_os = "windows")]
@@ -304,29 +372,43 @@ impl OrtRuntimeManager {
                     .with_memory_pattern(false)
                     .map_err(|e| AiError::Ort(e.to_string()))?
                     .with_parallel_execution(false)
-                    .map_err(|e| AiError::Ort(e.to_string()))?
-                    .with_execution_providers([ep])
-                    .unwrap_or_else(|e| {
+                    .map_err(|e| AiError::Ort(e.to_string()))?;
+                hw_builder = match hw_builder.with_execution_providers([ep]) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        ep_registered = false;
                         tracing::warn!(
                             error = %e,
                             "DirectML execution provider registration failed; falling back to CPU EP"
                         );
                         e.recover()
-                    });
+                    }
+                };
             }
 
-            match hw_builder.commit_from_file(model_path) {
-                Ok(sess) => return Ok(sess),
-                Err(hw_err) => {
-                    tracing::warn!(
-                        model = %model_path.display(),
-                        error = %hw_err,
-                        "hardware EP session build failed; falling back to CPU EP"
-                    );
+            if ep_registered {
+                match hw_builder.commit_from_file(model_path) {
+                    Ok(sess) => {
+                        self.hw_ep_succeeded.store(true, Ordering::Release);
+                        return Ok((sess, false));
+                    }
+                    Err(hw_err) => {
+                        self.hw_ep_failed.store(true, Ordering::Release);
+                        self.cpu_fallback_keys.lock().insert(key);
+                        tracing::warn!(
+                            model = %model_path.display(),
+                            error = %hw_err,
+                            "hardware EP session build failed; falling back to CPU EP"
+                        );
+                    }
                 }
+            } else {
+                self.hw_ep_failed.store(true, Ordering::Release);
+                self.cpu_fallback_keys.lock().insert(key);
             }
         }
 
+        let _ = force_cpu;
         // 2. Universal CPU execution provider fallback (100% operator coverage).
         let mut cpu_builder = Session::builder(env)
             .map_err(|e| AiError::Ort(e.to_string()))?
@@ -337,8 +419,9 @@ impl OrtRuntimeManager {
             .with_inter_threads(1)
             .map_err(|e| AiError::Ort(e.to_string()))?;
 
-        cpu_builder
+        let sess = cpu_builder
             .commit_from_file(model_path)
-            .map_err(|e| AiError::Ort(format!("load {}: {e}", model_path.display())))
+            .map_err(|e| AiError::Ort(format!("load {}: {e}", model_path.display())))?;
+        Ok((sess, true))
     }
 }

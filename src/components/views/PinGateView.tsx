@@ -106,7 +106,7 @@ export const PinGateView: React.FC = () => {
 
   return (
     <div
-      className={`auth-viewport${isTauri() && nativeMacTitlebar ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
+      className={`app-window-frame auth-viewport${isTauri() && nativeMacTitlebar ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
       data-tauri-drag-region
     >
       {winDesktop && (

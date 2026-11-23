@@ -708,11 +708,11 @@ describe('AiModelsPanel Phase 3 Chat Tier & SettingsView Map Basemap RBAC', () =
 
     await screen.findByText('Conversational Chat Tier');
 
-    // All 4 chat tier options are rendered
-    expect(screen.getByRole('button', { name: 'Tier 0 Classic' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Tier 1 Gemma-4-E2B' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Tier 2 Gemma-4-E4B' })).toBeTruthy();
-    const tier3Btn = screen.getByRole('button', { name: 'Tier 3 Gemma-4-26B + VLM' });
+    // All 4 chat tier options are rendered in the Advanced control
+    expect(screen.getByRole('button', { name: 'Classic' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Fast · E2B' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Balanced · E4B' })).toBeTruthy();
+    const tier3Btn = screen.getByRole('button', { name: 'Pro + VLM · 26B' });
     expect(tier3Btn).toBeTruthy();
 
     // GGUF & PMTiles model cards render
@@ -730,7 +730,7 @@ describe('AiModelsPanel Phase 3 Chat Tier & SettingsView Map Basemap RBAC', () =
     const vlmToggle = screen.getByLabelText(/VLM Thumbnail Reranking/i) as HTMLInputElement;
     expect(vlmToggle.disabled).toBe(true);
 
-    // Switch to Tier 3 -> enables VLM toggle
+    // Switch to Tier 3 -> automatically enables VLM reranking and unlocks the toggle
     await act(async () => {
       fireEvent.click(tier3Btn);
     });
@@ -739,17 +739,18 @@ describe('AiModelsPanel Phase 3 Chat Tier & SettingsView Map Basemap RBAC', () =
         (c) =>
           c.url === '/api/admin/ai/chat-tier' &&
           c.method === 'POST' &&
-          (c.body as { tier?: string })?.tier === 'tier3',
+          (c.body as { tier?: string; vlm_rerank_enabled?: boolean })?.tier === 'tier3' &&
+          (c.body as { vlm_rerank_enabled?: boolean })?.vlm_rerank_enabled === true,
       ),
     ).toBe(true);
 
     await waitFor(() => {
-      expect((screen.getByLabelText(/VLM Thumbnail Reranking/i) as HTMLInputElement).disabled).toBe(
-        false,
-      );
+      const toggle = screen.getByLabelText(/VLM Thumbnail Reranking/i) as HTMLInputElement;
+      expect(toggle.disabled).toBe(false);
+      expect(toggle.checked).toBe(true);
     });
 
-    // Enable VLM reranking
+    // Toggling VLM reranking off sends vlm_rerank_enabled: false
     await act(async () => {
       fireEvent.click(screen.getByLabelText(/VLM Thumbnail Reranking/i));
     });
@@ -759,7 +760,7 @@ describe('AiModelsPanel Phase 3 Chat Tier & SettingsView Map Basemap RBAC', () =
           c.url === '/api/admin/ai/chat-tier' &&
           c.method === 'POST' &&
           (c.body as { tier?: string; vlm_rerank_enabled?: boolean })?.tier === 'tier3' &&
-          (c.body as { vlm_rerank_enabled?: boolean })?.vlm_rerank_enabled === true,
+          (c.body as { vlm_rerank_enabled?: boolean })?.vlm_rerank_enabled === false,
       ),
     ).toBe(true);
   });

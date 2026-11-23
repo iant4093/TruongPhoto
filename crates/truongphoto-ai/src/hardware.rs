@@ -6,12 +6,15 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// Maps total system RAM bytes to recommended `(vision_tier, chat_tier)`:
 /// - `< 16 GiB` -> `(Tier1, Tier1)`
 /// - `16 GiB .. < 32 GiB` -> `(Tier2, Tier2)`
-/// - `>= 32 GiB` -> `(Tier3, Tier3)`
+/// - `32 GiB .. < 48 GiB` -> `(Tier3, Tier2)` (32 GiB PCs often have 8–12 GB discrete VRAM where 15 GB Tier 3 chat GGUF would swap/OOM)
+/// - `>= 48 GiB` -> `(Tier3, Tier3)`
 pub const fn recommend_tiers_for_ram(total_ram_bytes: u64) -> (AiTier, AiTier) {
     if total_ram_bytes < 16 * GIB {
         (AiTier::Tier1, AiTier::Tier1)
     } else if total_ram_bytes < 32 * GIB {
         (AiTier::Tier2, AiTier::Tier2)
+    } else if total_ram_bytes < 48 * GIB {
+        (AiTier::Tier3, AiTier::Tier2)
     } else {
         (AiTier::Tier3, AiTier::Tier3)
     }
@@ -71,6 +74,10 @@ mod tests {
         );
         assert_eq!(
             recommend_tiers_for_ram(32 * GIB),
+            (AiTier::Tier3, AiTier::Tier2)
+        );
+        assert_eq!(
+            recommend_tiers_for_ram(48 * GIB),
             (AiTier::Tier3, AiTier::Tier3)
         );
         assert_eq!(

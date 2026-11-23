@@ -117,6 +117,7 @@ pub async fn install_native_update(app: tauri::AppHandle) -> Result<(), String> 
             if let Some(coord) = exit_handle.try_state::<crate::ShutdownCoordinator>() {
                 coord.shutdown_blocking();
             }
+            exit_handle.cleanup_before_exit();
         })
         .build()
         .map_err(|e| format!("Updater unavailable: {e}"))?;
@@ -135,7 +136,7 @@ pub async fn install_native_update(app: tauri::AppHandle) -> Result<(), String> 
         .map_err(|e| format!("Failed to install update: {e}"))?;
 
     if let Some(coord) = app.try_state::<crate::ShutdownCoordinator>() {
-        coord.shutdown_blocking();
+        coord.shutdown().await;
     }
     app.restart();
 }

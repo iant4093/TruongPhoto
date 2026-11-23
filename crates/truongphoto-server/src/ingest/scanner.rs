@@ -169,7 +169,10 @@ async fn mark_job_cancelled(state: &AppState, job_id: i64) -> anyhow::Result<()>
 }
 
 /// Checks if a watched folder directory and volume UUID are online; updates DB and broadcasts events on transitions.
-async fn verify_volume_online(state: &AppState, folder: &FolderRecord) -> anyhow::Result<bool> {
+async fn verify_volume_online(
+    state: &Arc<AppState>,
+    folder: &FolderRecord,
+) -> anyhow::Result<bool> {
     let root_path = PathBuf::from(&folder.root_path);
     let expected_uuid = folder.volume_uuid.clone();
 
@@ -210,6 +213,9 @@ async fn verify_volume_online(state: &AppState, folder: &FolderRecord) -> anyhow
             .db
             .write(move |conn| repo::folders::set_folder_offline(conn, &fid, false, now_ms))
             .await?;
+        state
+            .watcher
+            .ensure_watched(state, folder.id.clone(), PathBuf::from(&folder.root_path));
         let _ = state.ws_tx.send(WsServerEvent::FolderChanged {
             folder_id: folder.id.clone(),
             action: "online".to_string(),

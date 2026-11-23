@@ -443,6 +443,7 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                 ]);
               }}
               onKeyDown={(e) => {
+                if (e.target !== e.currentTarget) return;
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   selectAsset(asset.id);
@@ -456,6 +457,9 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                 loading="lazy"
                 decoding="async"
                 draggable={false}
+                onLoad={(e) => {
+                  e.currentTarget.style.opacity = '1';
+                }}
                 onError={(e) => {
                   e.currentTarget.style.opacity = '0';
                 }}

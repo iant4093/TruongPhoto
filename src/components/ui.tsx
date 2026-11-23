@@ -94,10 +94,12 @@ export const ToggleRow: React.FC<{
 export function SegmentedControl<T extends string>({
   value,
   options,
+  disabled = false,
   onChange,
 }: {
   value: T;
   options: ReadonlyArray<readonly [T, string]>;
+  disabled?: boolean;
   onChange: (next: T) => void;
 }) {
   return (
@@ -107,6 +109,7 @@ export function SegmentedControl<T extends string>({
           key={key}
           type="button"
           className="button"
+          disabled={disabled}
           aria-pressed={value === key}
           onClick={() => onChange(key)}
         >

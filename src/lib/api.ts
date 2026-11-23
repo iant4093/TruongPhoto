@@ -753,13 +753,19 @@ export const sendChatMessage = (
   sessionId: string,
   content: string,
   limit?: number,
+  signal?: AbortSignal,
 ): Promise<SendChatMessageResponse> => {
-  const body: SendChatMessageRequest = limit !== undefined ? { content, limit } : { content };
+  const tzOffsetMinutes = -new Date().getTimezoneOffset();
+  const body: SendChatMessageRequest =
+    limit !== undefined
+      ? { content, limit, tz_offset_minutes: tzOffsetMinutes }
+      : { content, tz_offset_minutes: tzOffsetMinutes };
   return request<SendChatMessageResponse>(
     `/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`,
     {
       method: 'POST',
       body: JSON.stringify(body),
+      signal,
     },
   );
 };

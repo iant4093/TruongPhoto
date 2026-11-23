@@ -636,7 +636,10 @@ export interface SearchRequest {
   mode?: SearchMode;
   folder_id?: string | null;
   person_ids?: string[] | null;
+  exclude_person_ids?: string[] | null;
   has_people?: boolean | null;
+  min_faces?: number | null;
+  max_faces?: number | null;
   tags?: string[] | null;
   camera_model?: string | null;
   lens_model?: string | null;
@@ -648,10 +651,12 @@ export interface SearchRequest {
   iso_max?: number | null;
   shutter_speed_min_sec?: number | null;
   shutter_speed_max_sec?: number | null;
-  orientation?: 'portrait' | 'landscape' | 'square' | string | null;
+  orientation?: 'portrait' | 'landscape' | 'square' | 'panorama' | string | null;
   sort_by?: string | null;
   geo_query?: string | null;
+  exclude_geo_query?: string | null;
   kind?: AssetKind | null;
+  exclude_kind?: AssetKind | null;
   favorite?: boolean | null;
   date_from_ms?: number | null;
   date_to_ms?: number | null;
@@ -788,7 +793,9 @@ export interface RouterPlan {
   semantic_query: string | null;
   ocr_terms: string | null;
   person_names: string[];
+  exclude_person_names?: string[];
   location_query: string | null;
+  exclude_location_query?: string | null;
   camera_model: string | null;
   lens_model?: string | null;
   focal_length_min_mm?: number | null;
@@ -799,11 +806,14 @@ export interface RouterPlan {
   iso_max?: number | null;
   shutter_speed_min_sec?: number | null;
   shutter_speed_max_sec?: number | null;
-  orientation?: 'portrait' | 'landscape' | 'square' | string | null;
+  orientation?: 'portrait' | 'landscape' | 'square' | 'panorama' | string | null;
   has_people?: boolean | null;
+  min_faces?: number | null;
+  max_faces?: number | null;
   sort_by?: string | null;
   tags: string[];
   kind: AssetKind | null;
+  exclude_kind?: AssetKind | null;
   favorite: boolean | null;
   date_from_ms: number | null;
   date_to_ms: number | null;
@@ -860,6 +870,7 @@ export interface CreateChatSessionRequest {
 export interface SendChatMessageRequest {
   content: string;
   limit?: number | null;
+  tz_offset_minutes?: number | null;
 }
 
 export interface SendChatMessageResponse {

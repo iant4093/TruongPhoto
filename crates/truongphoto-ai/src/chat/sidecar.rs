@@ -10,18 +10,19 @@ use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use truongphoto_core::{ChatRole, ChatTier, RouterPlan};
+use truongphoto_core::{AssetKind, ChatRole, ChatTier, RouterPlan};
 
 struct SidecarProcess {
     tier: ChatTier,
     port: u16,
+    cpu_only: bool,
     child: Child,
     last_used: Instant,
 }
@@ -42,12 +43,18 @@ impl Drop for InFlightGuard<'_> {
 }
 
 /// Zero-`cmake` Tier 1–3 conversational router & VLM reranker backed by a managed local
-/// `llama-server` HTTP sidecar process, falling back cleanly to [`ClassicChatRouter`]
-/// on Tier 0 or when the sidecar binary / GGUF model files are not yet installed.
+/// `llama-server` HTTP sidecar process, falling back cleanly to CPU offload when GPU VRAM
+/// or drivers fail, and to [`ClassicChatRouter`] when no binary/model is installed.
 pub struct SidecarLlamaRouter {
     models_dir: PathBuf,
     classic: ClassicChatRouter,
     process: Mutex<Option<SidecarProcess>>,
+    /// Lock-free readiness flag so `is_loaded()` never blocks while the server is starting up.
+    loaded: AtomicBool,
+    /// Tiers latched to CPU-only (`-ngl 0 -fa off`) after a GPU spawn or VRAM OOM failure.
+    cpu_fallback_tiers: Mutex<HashSet<ChatTier>>,
+    /// Set if an older `llama-server` binary rejects `--reasoning-budget`.
+    no_reasoning_budget: AtomicBool,
     in_flight: AtomicUsize,
     shutting_down: AtomicBool,
 }
@@ -67,6 +74,9 @@ impl SidecarLlamaRouter {
             models_dir: models_dir.into(),
             classic: ClassicChatRouter::new(),
             process: Mutex::new(None),
+            loaded: AtomicBool::new(false),
+            cpu_fallback_tiers: Mutex::new(HashSet::new()),
+            no_reasoning_budget: AtomicBool::new(false),
             in_flight: AtomicUsize::new(0),
             shutting_down: AtomicBool::new(false),
         }
@@ -77,61 +87,54 @@ impl SidecarLlamaRouter {
     }
 
     fn resolve_model_paths(&self, tier: ChatTier) -> Option<(PathBuf, Option<PathBuf>)> {
-        let model_id = tier.chat_model_id()?;
-        let spec = find_model_spec(model_id)?;
-        let dir = model_dir(&self.models_dir, model_id);
-        let gguf = dir.join(spec.files.first()?.filename);
-        if !gguf.is_file() {
-            return None;
+        let primary_id = tier.chat_model_id()?;
+        // For Tier 2, gracefully fall back to `qwen3.5-4b` if the user downloaded that alternative
+        // instead of `gemma4-e4b`.
+        let candidate_ids: &[&str] = if tier == ChatTier::Tier2 {
+            &[primary_id, "qwen3.5-4b"]
+        } else {
+            &[primary_id]
+        };
+        for &model_id in candidate_ids {
+            let Some(spec) = find_model_spec(model_id) else {
+                continue;
+            };
+            let dir = model_dir(&self.models_dir, model_id);
+            let Some(first_file) = spec.files.first() else {
+                continue;
+            };
+            let gguf = dir.join(first_file.filename);
+            if !gguf.is_file() {
+                continue;
+            }
+            let mmproj = spec
+                .files
+                .get(1)
+                .map(|f| dir.join(f.filename))
+                .filter(|p| p.is_file());
+            return Some((gguf, mmproj));
         }
-        let mmproj = spec
-            .files
-            .get(1)
-            .map(|f| dir.join(f.filename))
-            .filter(|p| p.is_file());
-        Some((gguf, mmproj))
+        None
     }
 
-    fn ensure_server_port(&self, tier: ChatTier) -> Result<Option<u16>, AiError> {
-        if tier == ChatTier::Tier0 || self.shutting_down.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        let Some(bin_path) = discover_llama_server_bin_with_models_dir(&self.models_dir) else {
-            return Ok(None);
-        };
-        let Some((gguf_path, mmproj_path)) = self.resolve_model_paths(tier) else {
-            return Ok(None);
-        };
-        if tier == ChatTier::Tier3 && mmproj_path.is_none() {
-            tracing::debug!(
-                tier = %tier,
-                "Tier 3 mmproj missing; sidecar running text-only unless mmproj is present"
-            );
-        }
-
-        let mut guard = self.process.lock();
-        if self.shutting_down.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        if let Some(existing) = guard.as_mut() {
-            let alive = matches!(existing.child.try_wait(), Ok(None));
-            if alive && existing.tier == tier {
-                existing.last_used = Instant::now();
-                return Ok(Some(existing.port));
-            }
-            // Tier changed or child exited; drop and respawn cleanly.
-            *guard = None;
-        }
-
-        let port = pick_ephemeral_port()?;
+    fn spawn_and_wait_server(
+        &self,
+        bin_path: &Path,
+        gguf_path: &Path,
+        mmproj_path: Option<&Path>,
+        tier: ChatTier,
+        cpu_only: bool,
+        use_reasoning_budget: bool,
+    ) -> Result<SidecarProcess, (AiError, String)> {
+        let port = pick_ephemeral_port().map_err(|e| (e, String::new()))?;
+        // 8192 context for text tiers prevents HTTP 400 overflow on large libraries with rich
+        // overviews + multi-turn history, while staying lightweight (~150-250 MB KV cache).
         let ctx_size = if tier == ChatTier::Tier3 && mmproj_path.is_some() {
             "16384"
-        } else if mmproj_path.is_some() {
-            "8192"
         } else {
-            "4096"
+            "8192"
         };
-        let mut cmd = Command::new(&bin_path);
+        let mut cmd = Command::new(bin_path);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -139,13 +142,11 @@ impl SidecarLlamaRouter {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
         cmd.arg("-m")
-            .arg(&gguf_path)
+            .arg(gguf_path)
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
-            .arg("--reasoning-budget")
-            .arg("0")
             .arg("-c")
             .arg(ctx_size)
             .arg("-np")
@@ -153,23 +154,29 @@ impl SidecarLlamaRouter {
             .arg("--cache-reuse")
             .arg("256")
             .arg("-fa")
-            .arg("on")
+            .arg(if cpu_only { "off" } else { "on" })
             .arg("-ngl")
-            .arg("99")
+            .arg(if cpu_only { "0" } else { "99" })
             .arg("--no-webui")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        if use_reasoning_budget {
+            cmd.arg("--reasoning-budget").arg("0");
+        }
         if let Some(bin_dir) = bin_path.parent() {
             cmd.current_dir(bin_dir);
         }
-        if let Some(mmproj) = &mmproj_path {
+        if let Some(mmproj) = mmproj_path {
             cmd.arg("--mmproj").arg(mmproj);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AiError::ExternalTool(format!("spawn {}: {e}", bin_path.display())))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            (
+                AiError::ExternalTool(format!("spawn {}: {e}", bin_path.display())),
+                String::new(),
+            )
+        })?;
         truongphoto_core::process::assign_to_kill_on_close_job(&child);
 
         // Drain stderr continuously into a small bounded ring buffer so the pipe never stalls
@@ -207,27 +214,132 @@ impl SidecarLlamaRouter {
         {
             let _ = child.kill();
             let _ = child.wait();
-            let tail_msg = {
+            let raw_stderr = {
                 let q = stderr_tail.lock();
-                if q.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " | stderr: {}",
-                        q.iter().cloned().collect::<Vec<_>>().join(" ; ")
-                    )
-                }
+                q.iter().cloned().collect::<Vec<_>>().join(" ; ")
             };
-            return Err(AiError::ExternalTool(format!("{e}{tail_msg}")));
+            let tail_msg = if raw_stderr.is_empty() {
+                String::new()
+            } else {
+                format!(" | stderr: {raw_stderr}")
+            };
+            return Err((AiError::ExternalTool(format!("{e}{tail_msg}")), raw_stderr));
         }
 
-        *guard = Some(SidecarProcess {
+        Ok(SidecarProcess {
             tier,
             port,
+            cpu_only,
             child,
             last_used: Instant::now(),
-        });
-        Ok(Some(port))
+        })
+    }
+
+    fn ensure_server_port(&self, tier: ChatTier) -> Result<Option<u16>, AiError> {
+        if tier == ChatTier::Tier0 || self.shutting_down.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(bin_path) = discover_llama_server_bin_with_models_dir(&self.models_dir) else {
+            return Ok(None);
+        };
+        let Some((gguf_path, mmproj_path)) = self.resolve_model_paths(tier) else {
+            return Ok(None);
+        };
+        if tier == ChatTier::Tier3 && mmproj_path.is_none() {
+            tracing::debug!(
+                tier = %tier,
+                "Tier 3 mmproj missing; sidecar running text-only unless mmproj is present"
+            );
+        }
+
+        let mut guard = self.process.lock();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let want_cpu = self.cpu_fallback_tiers.lock().contains(&tier);
+        if let Some(existing) = guard.as_mut() {
+            let alive = matches!(existing.child.try_wait(), Ok(None));
+            if alive && existing.tier == tier && existing.cpu_only == want_cpu {
+                existing.last_used = Instant::now();
+                return Ok(Some(existing.port));
+            }
+            // Tier or offload mode changed, or child exited; drop and respawn cleanly.
+            *guard = None;
+            self.loaded.store(false, Ordering::Release);
+        }
+
+        let use_rb = !self.no_reasoning_budget.load(Ordering::Acquire);
+        match self.spawn_and_wait_server(
+            &bin_path,
+            &gguf_path,
+            mmproj_path.as_deref(),
+            tier,
+            want_cpu,
+            use_rb,
+        ) {
+            Ok(proc) => {
+                let port = proc.port;
+                *guard = Some(proc);
+                self.loaded.store(true, Ordering::Release);
+                Ok(Some(port))
+            }
+            Err((err, stderr_text)) => {
+                let low_err = stderr_text.to_ascii_lowercase();
+                // 1. Retry without `--reasoning-budget` if an older llama-server binary rejects the flag.
+                if use_rb
+                    && (low_err.contains("reasoning-budget")
+                        || low_err.contains("unknown argument")
+                        || low_err.contains("invalid argument"))
+                {
+                    tracing::warn!(
+                        tier = %tier,
+                        "llama-server rejected --reasoning-budget; latching off and retrying"
+                    );
+                    self.no_reasoning_budget.store(true, Ordering::Release);
+                    if let Ok(proc) = self.spawn_and_wait_server(
+                        &bin_path,
+                        &gguf_path,
+                        mmproj_path.as_deref(),
+                        tier,
+                        want_cpu,
+                        false,
+                    ) {
+                        let port = proc.port;
+                        *guard = Some(proc);
+                        self.loaded.store(true, Ordering::Release);
+                        return Ok(Some(port));
+                    }
+                }
+                // 2. If GPU offload failed (Windows Vulkan driver missing/old or discrete VRAM OOM),
+                // latch CPU-only (`-ngl 0 -fa off`) for this tier and retry once so local LLM still works!
+                if !want_cpu && !self.shutting_down.load(Ordering::Acquire) {
+                    tracing::warn!(
+                        tier = %tier,
+                        error = %err,
+                        "llama-server GPU launch failed; latching CPU fallback (-ngl 0) and retrying"
+                    );
+                    self.cpu_fallback_tiers.lock().insert(tier);
+                    let use_rb_retry = !self.no_reasoning_budget.load(Ordering::Acquire);
+                    match self.spawn_and_wait_server(
+                        &bin_path,
+                        &gguf_path,
+                        mmproj_path.as_deref(),
+                        tier,
+                        true,
+                        use_rb_retry,
+                    ) {
+                        Ok(proc) => {
+                            let port = proc.port;
+                            *guard = Some(proc);
+                            self.loaded.store(true, Ordering::Release);
+                            return Ok(Some(port));
+                        }
+                        Err((cpu_err, _)) => return Err(cpu_err),
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 
     fn clear_if_dead(&self) {
@@ -235,8 +347,21 @@ impl SidecarLlamaRouter {
         if let Some(existing) = guard.as_mut() {
             if !matches!(existing.child.try_wait(), Ok(None)) {
                 *guard = None;
+                self.loaded.store(false, Ordering::Release);
             }
         }
+    }
+
+    fn latch_cpu_fallback_and_restart(&self, tier: ChatTier) -> bool {
+        let mut set = self.cpu_fallback_tiers.lock();
+        if !set.insert(tier) {
+            return false;
+        }
+        drop(set);
+        let mut guard = self.process.lock();
+        *guard = None;
+        self.loaded.store(false, Ordering::Release);
+        true
     }
 
     fn touch_last_used(&self) {
@@ -262,7 +387,7 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         let schema_val: Value = serde_json::from_str(ROUTER_PLAN_JSON_SCHEMA)
             .map_err(|e| AiError::InvalidInput(format!("invalid ROUTER_PLAN_JSON_SCHEMA: {e}")))?;
 
-        let system_prompt = build_router_system_prompt(input);
+        let system_prompt = build_router_system_prompt(tier, input);
         let mut messages = vec![json!({
             "role": "system",
             "content": system_prompt,
@@ -273,9 +398,10 @@ impl ChatRouterBackend for SidecarLlamaRouter {
                 ChatRole::User => "user",
                 ChatRole::Assistant => "assistant",
             };
+            let truncated: String = content.trim().chars().take(240).collect();
             messages.push(json!({
                 "role": role_str,
-                "content": content,
+                "content": truncated,
             }));
         }
         messages.push(json!({
@@ -286,7 +412,8 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         let payload = json!({
             "model": tier.chat_model_id().unwrap_or("gemma4"),
             "temperature": 0.0,
-            "max_tokens": 512,
+            "repeat_penalty": 1.08,
+            "max_tokens": 640,
             "cache_prompt": true,
             "id_slot": 0,
             "messages": messages,
@@ -300,10 +427,32 @@ impl ChatRouterBackend for SidecarLlamaRouter {
             }
         });
 
-        let content = match post_chat_completion(port, &payload) {
+        let content = match post_chat_completion(port, &payload, Duration::from_secs(60)) {
             Ok(c) => c,
             Err(err) => {
                 self.clear_if_dead();
+                // If mid-inference GPU/VRAM failure happened, latch CPU fallback and retry once.
+                if self.latch_cpu_fallback_and_restart(tier) {
+                    tracing::warn!(tier = %tier, error = %err, "llama-server inference failed on GPU; retrying on CPU");
+                    if let Ok(Some(cpu_port)) = self.ensure_server_port(tier) {
+                        if let Ok(c) =
+                            post_chat_completion(cpu_port, &payload, Duration::from_secs(90))
+                        {
+                            self.touch_last_used();
+                            if let Ok(mut parsed) = parse_and_validate_router_plan(&c) {
+                                sanitize_sidecar_plan(
+                                    &input.user_message,
+                                    &input.prior_filters,
+                                    &input.library.known_folders,
+                                    &input.known_person_names,
+                                    input.current_date_utc,
+                                    &mut parsed,
+                                );
+                                return Ok(merge_router_plan(&input.prior_filters, &parsed));
+                            }
+                        }
+                    }
+                }
                 tracing::warn!(tier = %tier, error = %err, "llama-server completion failed; falling back to ClassicChatRouter");
                 return self.classic.route_turn(tier, input);
             }
@@ -316,6 +465,7 @@ impl ChatRouterBackend for SidecarLlamaRouter {
                     &input.user_message,
                     &input.prior_filters,
                     &input.library.known_folders,
+                    &input.known_person_names,
                     input.current_date_utc,
                     &mut parsed,
                 );
@@ -357,20 +507,34 @@ impl ChatRouterBackend for SidecarLlamaRouter {
             return Ok(None);
         }
 
+        // Interleave short 1-based integer indices + metadata caption_hints directly before each
+        // thumbnail so the VLM binds every image cleanly without ever having to copy 36-char UUIDs.
         let mut user_parts = vec![json!({
             "type": "text",
             "text": format!(
-                "Score each candidate photo/video frame (0.0 to 1.0) for relevance to: \"{}\". Candidate IDs in order: {}",
+                "User request: \"{}\"\nEvaluate the {} candidate photos/frames below. Score each candidate from 0.0 (irrelevant/poor match) to 1.0 (exact, standout visual match) using their 1-based index (1..={}).",
                 user_message.trim(),
-                valid_candidates
-                    .iter()
-                    .map(|c| c.asset_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                valid_candidates.len(),
+                valid_candidates.len()
             )
         })];
 
-        for c in &valid_candidates {
+        for (idx, c) in valid_candidates.iter().enumerate() {
+            let num = idx + 1;
+            let label = match c
+                .caption_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(hint) => format!("Image #{num} (metadata: {hint}):"),
+                None => format!("Image #{num}:"),
+            };
+            user_parts.push(json!({
+                "type": "text",
+                "text": label,
+            }));
+
             let mime = if c.thumb_bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
                 "image/jpeg"
             } else if c.thumb_bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
@@ -397,10 +561,10 @@ impl ChatRouterBackend for SidecarLlamaRouter {
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
-                        "required": ["asset_id", "score"],
+                        "required": ["index", "score"],
                         "properties": {
-                            "asset_id": { "type": "string" },
-                            "score": { "type": "number" }
+                            "index": { "type": "integer", "minimum": 1, "maximum": valid_candidates.len() },
+                            "score": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
                         }
                     }
                 },
@@ -411,12 +575,13 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         let payload = json!({
             "model": tier.chat_model_id().unwrap_or("gemma4-26b-a4b"),
             "temperature": 0.0,
-            "max_tokens": 512,
+            "repeat_penalty": 1.05,
+            "max_tokens": 640,
             "cache_prompt": false,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a visual reranker for a private photo library. Score the provided thumbnails strictly against the user query and return valid JSON."
+                    "content": "You are a visual reranker for a private photo library. Visually inspect every numbered image and score how well it matches the user's request (0.0 = unrelated, 0.5 = partial, 0.9-1.0 = best match). Return valid JSON with integer `index` (1..N) and `score` (0.0..1.0). In `observation`, write one concise, helpful natural sentence describing what stands out visually in the top matches — NEVER mention image numbers, candidate indices, scores, or IDs."
                 },
                 {
                     "role": "user",
@@ -433,7 +598,7 @@ impl ChatRouterBackend for SidecarLlamaRouter {
             }
         });
 
-        let content = match post_chat_completion(port, &payload) {
+        let content = match post_chat_completion(port, &payload, Duration::from_secs(150)) {
             Ok(c) => c,
             Err(e) => {
                 self.clear_if_dead();
@@ -442,15 +607,27 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         };
         self.touch_last_used();
 
-        let parsed: SidecarRerankPayload = serde_json::from_str(content.trim()).map_err(|e| {
+        let trimmed = strip_fence_for_rerank(&content);
+        let parsed: SidecarRerankPayload = serde_json::from_str(trimmed).map_err(|e| {
             AiError::InvalidInput(format!("invalid sidecar VLM rerank response JSON: {e}"))
         })?;
 
-        let score_map: HashMap<String, f32> = parsed
-            .scores
-            .into_iter()
-            .map(|entry| (entry.asset_id, entry.score))
-            .collect();
+        let mut score_map: HashMap<String, f32> = HashMap::with_capacity(valid_candidates.len());
+        for entry in parsed.scores {
+            let clamped = if entry.score.is_finite() {
+                entry.score.clamp(0.0, 1.0)
+            } else {
+                continue;
+            };
+            if let Some(idx_1based) = entry.index {
+                if idx_1based >= 1 && idx_1based <= valid_candidates.len() {
+                    let aid = &valid_candidates[idx_1based - 1].asset_id;
+                    score_map.insert(aid.clone(), clamped);
+                }
+            } else if let Some(aid) = entry.asset_id {
+                score_map.insert(aid, clamped);
+            }
+        }
 
         let mut ordered: Vec<(String, f32)> = candidates
             .iter()
@@ -480,6 +657,7 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         };
         if Instant::now().saturating_duration_since(proc.last_used) >= max_idle {
             *guard = None;
+            self.loaded.store(false, Ordering::Release);
             1
         } else {
             0
@@ -487,7 +665,7 @@ impl ChatRouterBackend for SidecarLlamaRouter {
     }
 
     fn is_loaded(&self) -> bool {
-        self.process.lock().is_some()
+        self.loaded.load(Ordering::Acquire)
     }
 
     fn warmup(&self, tier: ChatTier) -> bool {
@@ -496,14 +674,31 @@ impl ChatRouterBackend for SidecarLlamaRouter {
 
     fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        self.loaded.store(false, Ordering::Release);
         let mut guard = self.process.lock();
         *guard = None;
     }
 }
 
+fn strip_fence_for_rerank(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let body = rest.split_once('\n').map(|(_, b)| b).unwrap_or(rest);
+        body.trim()
+            .strip_suffix("```")
+            .map(str::trim)
+            .unwrap_or_else(|| body.trim())
+    } else {
+        trimmed
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SidecarScoreEntry {
-    asset_id: String,
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    asset_id: Option<String>,
     score: f32,
 }
 
@@ -589,6 +784,37 @@ fn discover_llama_server_bin_opt(models_dir: Option<&Path>) -> Option<PathBuf> {
                 return Some(p.to_path_buf());
             }
         }
+    } else if cfg!(target_os = "windows") {
+        let mut win_dirs = vec![
+            PathBuf::from(r"C:\ProgramData\chocolatey\bin"),
+            PathBuf::from(r"C:\llama.cpp\bin"),
+        ];
+        if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+            win_dirs.push(
+                PathBuf::from(local_app)
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links"),
+            );
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            win_dirs.push(PathBuf::from(profile).join("scoop").join("shims"));
+        }
+        for dir in win_dirs {
+            let cand = dir.join(bin_name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let cand = dir.join(bin_name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
     }
 
     None
@@ -634,8 +860,17 @@ fn compact_prior_filters_json(prior: &RouterPlan) -> String {
     if !prior.person_names.is_empty() {
         map.insert("person_names".into(), json!(prior.person_names));
     }
+    if !prior.exclude_person_names.is_empty() {
+        map.insert(
+            "exclude_person_names".into(),
+            json!(prior.exclude_person_names),
+        );
+    }
     if let Some(v) = &prior.location_query {
         map.insert("location_query".into(), json!(v));
+    }
+    if let Some(v) = &prior.exclude_location_query {
+        map.insert("exclude_location_query".into(), json!(v));
     }
     if let Some(v) = &prior.camera_model {
         map.insert("camera_model".into(), json!(v));
@@ -673,6 +908,12 @@ fn compact_prior_filters_json(prior: &RouterPlan) -> String {
     if let Some(v) = prior.has_people {
         map.insert("has_people".into(), json!(v));
     }
+    if let Some(v) = prior.min_faces {
+        map.insert("min_faces".into(), json!(v));
+    }
+    if let Some(v) = prior.max_faces {
+        map.insert("max_faces".into(), json!(v));
+    }
     if let Some(v) = &prior.sort_by {
         map.insert("sort_by".into(), json!(v));
     }
@@ -681,6 +922,9 @@ fn compact_prior_filters_json(prior: &RouterPlan) -> String {
     }
     if let Some(v) = prior.kind {
         map.insert("kind".into(), json!(v));
+    }
+    if let Some(v) = prior.exclude_kind {
+        map.insert("exclude_kind".into(), json!(v));
     }
     if let Some(v) = prior.favorite {
         map.insert("favorite".into(), json!(v));
@@ -698,7 +942,7 @@ fn compact_prior_filters_json(prior: &RouterPlan) -> String {
     serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".into())
 }
 
-fn build_router_system_prompt(input: &ChatTurnInput) -> String {
+fn build_router_system_prompt(tier: ChatTier, input: &ChatTurnInput) -> String {
     let prior_json = compact_prior_filters_json(&input.prior_filters);
     let today = input.current_date_utc.date_naive();
     let cur_y = today.year();
@@ -713,7 +957,11 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
     let days_from_mon = today.weekday().num_days_from_monday() as i64;
     let this_week_start = today - chrono::Duration::days(days_from_mon);
     let last_week_start = today - chrono::Duration::days(7);
+    let last_30_days_start = today - chrono::Duration::days(30);
     let (last_wknd_sat, last_wknd_sun) = last_weekend_dates(today);
+
+    // Keep Tier 1 (Fast 2B) entity lists compact so the small model stays laser-focused.
+    let entity_cap = if tier == ChatTier::Tier1 { 15 } else { 25 };
 
     let date_span = match &input.library.date_range {
         Some((lo, hi)) => format!("{lo} to {hi}"),
@@ -724,50 +972,122 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
             .library
             .person_counts
             .iter()
+            .take(entity_cap)
             .map(|(name, cnt)| format!("{name} ({cnt})"))
             .collect()
     } else {
-        input.known_person_names.clone()
+        input
+            .known_person_names
+            .iter()
+            .take(entity_cap)
+            .cloned()
+            .collect()
     };
+    let folders_overview: Vec<String> = input
+        .library
+        .known_folders
+        .iter()
+        .take(entity_cap)
+        .cloned()
+        .collect();
+    let cameras_overview: Vec<String> = if !input.library.camera_counts.is_empty() {
+        input
+            .library
+            .camera_counts
+            .iter()
+            .take(entity_cap)
+            .map(|(name, cnt)| format!("{name} ({cnt})"))
+            .collect()
+    } else {
+        input
+            .known_cameras
+            .iter()
+            .take(entity_cap)
+            .cloned()
+            .collect()
+    };
+    let lenses_overview: Vec<String> = if !input.library.lens_counts.is_empty() {
+        input
+            .library
+            .lens_counts
+            .iter()
+            .take(entity_cap)
+            .map(|(name, cnt)| format!("{name} ({cnt})"))
+            .collect()
+    } else {
+        input
+            .known_lenses
+            .iter()
+            .take(entity_cap)
+            .cloned()
+            .collect()
+    };
+    let kinds_overview: Vec<String> = input
+        .library
+        .kind_counts
+        .iter()
+        .map(|(k, cnt)| format!("{k}: {cnt}"))
+        .collect();
+    let places_overview: Vec<String> = input
+        .library
+        .top_places
+        .iter()
+        .take(12)
+        .map(|(p, cnt)| format!("{p} ({cnt})"))
+        .collect();
+    let months_overview: Vec<String> = input
+        .library
+        .top_months
+        .iter()
+        .take(8)
+        .map(|(m, cnt)| format!("{m} ({cnt})"))
+        .collect();
 
     // Static instructions FIRST so llama-server reuses the KV prompt cache (>90% prefix hit) across turns!
     format!(
-        "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a compact RouterPlan JSON object. ALWAYS include the 7 required keys (intent, semantic_query, person_names, location_query, clear_prior_filters, assistant_reply, follow_up_suggestions), and include optional EXIF/date/sort/camera/lens/has_people/ocr/kind/favorite keys whenever the user asks for them (omit unused optional keys for speed).\n\
+        "You are TruongPhoto's private offline photo library assistant and query router. Convert the user's message into a compact RouterPlan JSON object. ALWAYS include the 7 required keys (intent, semantic_query, person_names, location_query, clear_prior_filters, assistant_reply, follow_up_suggestions), and include optional EXIF/date/sort/camera/lens/has_people/faces/exclude/ocr/kind/favorite keys whenever relevant (omit unused optional keys for speed).\n\
          Examples:\n\
-         - \"show me photos of Sebastian\" -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[\"Sebastian\"],\"location_query\":null,\"clear_prior_filters\":true,\"assistant_reply\":\"Here are your photos of Sebastian.\",\"follow_up_suggestions\":[\"Sebastian at Portland Zoo\",\"Wide-open portraits of Sebastian\"]}}\n\
+         - \"show me photos of Sebastian\" -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[\"Sebastian\"],\"location_query\":null,\"clear_prior_filters\":true,\"assistant_reply\":\"Here are your photos of Sebastian.\",\"follow_up_suggestions\":[\"Solo photos of Sebastian\",\"Sebastian at Portland Zoo\"]}}\n\
+         - \"just the vertical ones\" (narrowing prior filters) -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[],\"location_query\":null,\"orientation\":\"portrait\",\"clear_prior_filters\":false,\"assistant_reply\":\"Narrowing to vertical photos.\",\"follow_up_suggestions\":[\"Show favorites only\",\"Clear orientation filter\"]}}\n\
          - \"photos shot with 56mm f/1.4\" -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[],\"location_query\":null,\"focal_length_min_mm\":56,\"focal_length_max_mm\":56,\"aperture_min_f\":1.4,\"aperture_max_f\":1.4,\"clear_prior_filters\":true,\"assistant_reply\":\"Here are your 56mm f/1.4 shots.\",\"follow_up_suggestions\":[\"Photos at 12mm\",\"Widest aperture shots\"]}}\n\
+         - \"cool pics\" / \"best photos\" -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[],\"location_query\":null,\"sort_by\":\"best\",\"clear_prior_filters\":true,\"assistant_reply\":\"Here are standout highlights from your library.\",\"follow_up_suggestions\":[\"Favorites only\",\"Wide-open portraits\"]}}\n\
+         - \"zoo pics not with Sebastian\" -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[],\"exclude_person_names\":[\"Sebastian\"],\"location_query\":\"Portland Zoo\",\"clear_prior_filters\":true,\"assistant_reply\":\"Here are Portland Zoo photos without Sebastian.\",\"follow_up_suggestions\":[\"Solo photos of Sebastian\",\"Animals at Portland Zoo\"]}}\n\
+         - \"solo photo of Sebastian\" -> {{\"intent\":\"search\",\"semantic_query\":null,\"person_names\":[\"Sebastian\"],\"max_faces\":1,\"location_query\":null,\"clear_prior_filters\":true,\"assistant_reply\":\"Here are solo photos of Sebastian.\",\"follow_up_suggestions\":[\"Group shots with Sebastian\",\"Wide-open portraits of Sebastian\"]}}\n\
          - \"who are in my pics\" -> {{\"intent\":\"answer\",\"semantic_query\":null,\"person_names\":[],\"location_query\":null,\"clear_prior_filters\":true,\"assistant_reply\":\"Your library features ...\",\"follow_up_suggestions\":[\"Show me photos of ...\"]}}\n\
          Rules:\n\
          - Choose \"intent\" FIRST:\n\
-           * \"intent\": \"answer\" for ANY conversational message or meta-question ABOUT the library itself (e.g. \"who are in my pics\", \"what's in my library\", \"tell me about my photos\", \"what trips or folders do I have\", \"how many photos do I have\", \"what gear do I use\", \"when were my photos taken\", \"hi\", \"what can you do?\"). Answer concretely in \"assistant_reply\" using the exact names, counts, dates, folders, and gear in Library Overview below, set clear_prior_filters=true, and omit ALL filter keys so NO search runs.\n\
-           * \"intent\": \"search\" whenever the user wants to view, browse, or find photos/videos.\n\
+           * \"intent\": \"answer\" for ANY conversational message or meta-question ABOUT the library itself (e.g. \"who are in my pics\", \"what's in my library\", \"tell me about my photos\", \"what trips or folders do I have\", \"how many photos do I have\", \"what is my most used lens\", \"which month did I shoot the most\", \"do I have any videos\", \"what gear do I use\", \"when were my photos taken\", \"hi\", \"what can you do?\"). Answer concretely in \"assistant_reply\" using the exact names, counts, dates, folders, places, and gear in Library Overview below, set clear_prior_filters=true, and omit ALL filter keys so NO search runs.\n\
+           * \"intent\": \"search\" whenever the user wants to view, browse, or find photos/videos (or asks \"how many photos of <specific person/place/subject>\").\n\
          - Vague & exploratory photo requests (intent=\"search\"):\n\
-           * For subjective or open browsing requests (\"cool pics\", \"best photos\", \"something interesting\", \"surprise me\", \"good shots\"), omit \"semantic_query\" and \"has_people\", and set \"sort_by\": \"aperture_asc\" (or \"capture_desc\" for \"recent\", \"latest\", \"what did I shoot recently\", \"everything\", \"my photos\"). For concrete visual subjects (\"animals\", \"nature\", \"mountain\"), omit \"sort_by\" and \"has_people\". NEVER put subjective filler words (\"cool\", \"nice\", \"best\", \"good\", \"awesome\", \"interesting\", \"random\", \"stuff\", \"pics\", \"photos\") into \"semantic_query\".\n\
+           * For subjective/open browsing (\"cool pics\", \"best photos\", \"highlights\", \"something interesting\", \"surprise me\", \"good shots\", \"memories\"), omit \"semantic_query\" and \"has_people\", and set \"sort_by\": \"best\" (or \"capture_desc\" for \"recent\", \"latest\", \"what did I shoot recently\", \"everything\", \"my photos\"). For concrete visual subjects (\"animals\", \"nature\", \"mountain\"), omit \"sort_by\" and \"has_people\". NEVER put subjective filler words (\"cool\", \"nice\", \"best\", \"good\", \"awesome\", \"interesting\", \"random\", \"stuff\", \"pics\", \"photos\") into \"semantic_query\".\n\
            * For broad people requests without a specific name (\"show me people\", \"show me my friends\", \"pics with people\"), set \"has_people\": true and omit \"person_names\", \"semantic_query\", and \"sort_by\".\n\
-         - Folders, Events & Named Places (\"location_query\"):\n\
-           * \"location_query\" matches BOTH GPS places AND folder/event collection names! Check Folders / Events in Library Overview: if the user asks for a trip, folder, or event (e.g. \"graduation stuff\" -> \"CS Grad Pics 2026\", \"zoo pics\" -> \"Portland Zoo\", \"Misty\" -> \"Misty\", \"bald mountain\" -> \"Bald Mountain\", \"multnomah falls\" -> \"Multnomah Falls\"), put that matching folder/place name into \"location_query\" and omit \"semantic_query\" UNLESS they also asked for a specific visual subject inside it (e.g. \"monkeys at Portland Zoo\" -> location_query: \"Portland Zoo\", semantic_query: \"monkey\").\n\
+         - Folders, Events & Named Places (\"location_query\" / \"exclude_location_query\"):\n\
+           * Match BOTH GPS places AND folder/event names! NEVER include the trailing \"(count)\" number from Library Overview (output \"Portland Zoo\", NEVER \"Portland Zoo (146)\"). Check Folders / Events & Top places below: if the user asks for a trip, folder, or event (e.g. \"graduation stuff\", \"zoo pics\"), put the clean folder/place name in \"location_query\" and omit \"semantic_query\" UNLESS they also asked for a visual subject inside it.\n\
            * NEVER put generic terrain (\"mountain\", \"beach\", \"forest\", \"lake\", \"waterfall\", \"sunset\") into \"location_query\" unless it matches a named place/folder.\n\
-         - Visual subjects (\"semantic_query\"): Put ONLY positive visual subjects, animals, objects, scenes, or moods (e.g. \"waterfall in forest\", \"monkey behind a fence\", \"mountain sunrise\", \"Eiffel Tower\"). NEVER put negations (\"not graduation\", \"without people\") or EXIF adjectives (\"high ISO\", \"wide open\", \"telephoto\") into \"semantic_query\".\n\
+         - Negations & Exclusions: Use \"exclude_location_query\" (\"not at the zoo\", \"except graduation\"), \"exclude_person_names\" (\"without Sebastian\"), \"exclude_kind\" (\"no videos\" -> \"video\"), or \"has_people\": false (\"without people\", \"empty landscapes\"). NEVER put negations into \"semantic_query\".\n\
+         - Visual subjects (\"semantic_query\"): Put ONLY positive visual subjects, animals, objects, scenes, styles, or moods (expand shorthand like \"b&w\" -> \"black and white monochrome\", \"cozy\" -> \"cozy warm indoor lighting\", \"dramatic\" -> \"dramatic moody high contrast lighting\"). NEVER put EXIF adjectives (\"high ISO\", \"wide open\", \"telephoto\") into \"semantic_query\".\n\
          - Text in images (\"ocr_terms\"): Put specific literal words/phrases inside an image (e.g. \"receipt saying Target\" -> \"Target\"). For general \"photos with signs or readable text\", put \"sign or banner with readable text\" in \"semantic_query\".\n\
-         - People: Match named people (including typos/first names) against Known RBAC-visible people into \"person_names\". NEVER list all people in \"person_names\" unless asked for a group photo of all of them. For \"without people\" / \"no people\" / \"empty landscapes\", set \"has_people\": false.\n\
-         - Superlatives & sorting (\"sort_by\"): \"widest angle\" -> \"focal_asc\"; \"most zoomed in / longest focal\" -> \"focal_desc\"; \"highest ISO\" -> \"iso_desc\"; \"widest aperture\" -> \"aperture_asc\"; \"fastest shutter\" -> \"shutter_asc\"; \"longest exposure / slowest shutter\" -> \"shutter_desc\"; \"oldest\" -> \"capture_asc\"; \"newest / most recent\" -> \"capture_desc\".\n\
-         - Camera, Orientation & EXIF (ONLY include when explicitly mentioned; NEVER put focal/lens/aperture/ISO/shutter into \"camera_model\"; \"close up\" is NOT an aperture):\n\
-           * \"camera_model\": body only (match Known camera bodies, e.g. \"Canon R7\" -> \"Canon EOS R7\").\n\
-           * \"lens_model\": lens only (match Known lenses, e.g. \"17-40 Art\" -> \"17-40mm F1.8 DC | Art 025\").\n\
+         - People & Face Counts: Match named people (including typos/first names) against People below WITHOUT the \"(count)\" suffix. NEVER list all people unless asked for a group photo of all of them. Use \"max_faces\": 1 for \"solo\" / \"alone\" / \"just <Name>\"; \"min_faces\": 2, \"max_faces\": 2 for \"couple\" / \"two people\"; \"min_faces\": 3 for \"group shot\" / \"group photo\".\n\
+         - Superlatives & sorting (\"sort_by\"): \"best / highlights\" -> \"best\"; \"widest angle\" -> \"focal_asc\"; \"most zoomed in / longest focal\" -> \"focal_desc\"; \"highest ISO\" -> \"iso_desc\"; \"lowest ISO / cleanest\" -> \"iso_asc\"; \"widest aperture\" -> \"aperture_asc\"; \"fastest shutter\" -> \"shutter_asc\"; \"longest exposure / slowest shutter\" -> \"shutter_desc\"; \"longest video\" -> \"duration_desc\"; \"oldest\" -> \"capture_asc\"; \"newest / most recent\" -> \"capture_desc\".\n\
+         - Camera, Orientation & EXIF (ONLY include when explicitly mentioned; NEVER copy \"(count)\" suffixes; NEVER put focal/lens/aperture/ISO/shutter into \"camera_model\"; \"close up\" is NOT an aperture):\n\
+           * \"camera_model\": body only (e.g. \"Canon R7\" -> \"Canon EOS R7\").\n\
+           * \"lens_model\": lens only (match Known lenses below).\n\
            * \"focal_length_min_mm\" / \"focal_length_max_mm\": exact \"12mm\" -> both 12; \"under 15mm\" -> max 15; \"over 300mm\" -> min 300.\n\
            * \"aperture_min_f\" / \"aperture_max_f\": exact \"f/1.4\" -> both 1.4; \"wide open / bokeh / shallow\" without a number -> max 2.0 only; \"f/8 or narrower\" -> min 8.0 only.\n\
-           * \"iso_min\" / \"iso_max\": exact \"ISO 100\" -> both 100; \"ISO 3200+\" -> min 3200.\n\
+           * \"iso_min\" / \"iso_max\": exact \"ISO 100\" -> both 100; \"ISO 3200+\" / \"grainy\" / \"high ISO\" -> min 3200 only.\n\
            * \"shutter_speed_min_sec\" / \"shutter_speed_max_sec\": decimal seconds! Faster = smaller (\"1/1000s or faster\" -> max 0.001); slower/long exposure = larger (\"long exposure / silky water\" -> min 0.05 only).\n\
-           * \"orientation\": \"portrait\" (vertical/phone wallpaper), \"landscape\" (horizontal/desktop wallpaper), or \"square\" (square crop/1:1).\n\
-         - Dates: output ISO \"date_from\" / \"date_to\" (\"YYYY-MM-DD\"). Use Date reference below for \"yesterday\", \"this week\", \"last weekend\", \"last week\", \"this month\", \"last month\", \"two months ago\"; open-ended bounds like \"before October\" -> date_to only, \"after September\" -> date_from only; standalone month like \"in June\" -> that month in the current/most recent year.\n\
-         - Omit \"tags\" unless user explicitly asks for a tag (\"tagged X\" / \"#X\"). Omit \"kind\" unless explicitly asking for only photos/videos/raw/live photos.\n\
-         - Set clear_prior_filters=true when switching topic, starting over, or removing a prior filter (re-emit the remaining filters you want to keep); set false when narrowing prior active filters.\n\
+           * \"orientation\": \"portrait\" (vertical/tall/phone wallpaper), \"landscape\" (horizontal/desktop wallpaper), \"square\" (square/1:1), or \"panorama\" (panoramic/ultrawide pano).\n\
+         - Dates: output ISO \"date_from\" / \"date_to\" (\"YYYY-MM-DD\"). Use Date reference below for \"today\", \"yesterday\", \"this week\", \"last weekend\", \"last week\", \"last 30 days\", \"this month\", \"last month\", \"two months ago\", \"this year\", \"last year\"; open-ended bounds like \"before October\" -> date_to only, \"after September\" -> date_from only; standalone month like \"in June\" -> that month in the most recent past/current year.\n\
+         - Omit \"tags\" unless user explicitly asks for a tag (\"tagged X\" / \"#X\"). Omit \"kind\" unless explicitly asking for only videos/raw/live/motion/still photos. Omit \"favorite\" unless explicitly asking for favorites/starred.\n\
+         - Follow-ups: Set clear_prior_filters=false ONLY when narrowing prior active filters (e.g. \"just the vertical ones\", \"only favorites\"). Set clear_prior_filters=true when switching topic, swapping person (\"what about AJ?\" -> re-emit non-person prior filters with new person), starting over, or removing a filter.\n\
          - Write a crisp, natural \"assistant_reply\" (1–2 sentences for answers, 1 sentence for searches) and 2–3 short grounded \"follow_up_suggestions\". Never invent file paths or extra JSON keys.\n\
          Library Overview (RBAC-visible):\n\
-         - Today (UTC): {} | \"yesterday\": {} | \"this week\": {}..{} | \"last weekend\": {}..{} | \"last week\": {}..{}\n\
-         - Calendar months: \"this month\": {}..{} | \"last month\": {}..{} | \"two months ago\": {}..{}\n\
-         - Total items: {} (capture span: {})\n\
+         - Today: {} | \"yesterday\": {} | \"this week\": {}..{} | \"last weekend\": {}..{} | \"last week\": {}..{} | \"last 30 days\": {}..{}\n\
+         - Calendar: \"this month\": {}..{} | \"last month\": {}..{} | \"two months ago\": {}..{} | \"this year\": {}-01-01..{}-12-31 | \"last year\": {}-01-01..{}-12-31\n\
+         - Total items: {} | Favorites: {} | Kinds: {:?} | Capture span: {}\n\
+         - Top months: {:?}\n\
          - Folders / Events: {:?}\n\
+         - Top GPS places: {:?}\n\
          - People (photo counts): {:?}\n\
          - Cameras: {:?}\n\
          - Lenses: {:?}\n\
@@ -781,18 +1101,28 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
         last_wknd_sun.format("%Y-%m-%d"),
         last_week_start.format("%Y-%m-%d"),
         today.format("%Y-%m-%d"),
+        last_30_days_start.format("%Y-%m-%d"),
+        today.format("%Y-%m-%d"),
         this_m_from,
         this_m_to,
         last_m_from,
         last_m_to,
         two_m_from,
         two_m_to,
+        cur_y,
+        cur_y,
+        cur_y - 1,
+        cur_y - 1,
         input.library.total_assets,
+        input.library.favorite_count,
+        kinds_overview,
         date_span,
-        input.library.known_folders,
+        months_overview,
+        folders_overview,
+        places_overview,
         people_overview,
-        input.known_cameras,
-        input.known_lenses,
+        cameras_overview,
+        lenses_overview,
         input.library.top_tags,
         prior_json,
     )
@@ -816,7 +1146,9 @@ fn clear_all_search_filters(plan: &mut RouterPlan) {
     plan.semantic_query = None;
     plan.ocr_terms = None;
     plan.person_names.clear();
+    plan.exclude_person_names.clear();
     plan.location_query = None;
+    plan.exclude_location_query = None;
     plan.camera_model = None;
     plan.lens_model = None;
     plan.focal_length_min_mm = None;
@@ -829,19 +1161,24 @@ fn clear_all_search_filters(plan: &mut RouterPlan) {
     plan.shutter_speed_max_sec = None;
     plan.orientation = None;
     plan.has_people = None;
+    plan.min_faces = None;
+    plan.max_faces = None;
     plan.sort_by = None;
     plan.tags.clear();
     plan.kind = None;
+    plan.exclude_kind = None;
     plan.favorite = None;
     plan.date_from_ms = None;
     plan.date_to_ms = None;
 }
 
-fn plan_has_any_criteria(plan: &RouterPlan) -> bool {
+pub(crate) fn plan_has_any_criteria(plan: &RouterPlan) -> bool {
     plan.semantic_query.is_some()
         || plan.ocr_terms.is_some()
         || !plan.person_names.is_empty()
+        || !plan.exclude_person_names.is_empty()
         || plan.location_query.is_some()
+        || plan.exclude_location_query.is_some()
         || plan.camera_model.is_some()
         || plan.lens_model.is_some()
         || plan.focal_length_min_mm.is_some()
@@ -854,17 +1191,21 @@ fn plan_has_any_criteria(plan: &RouterPlan) -> bool {
         || plan.shutter_speed_max_sec.is_some()
         || plan.orientation.is_some()
         || plan.has_people.is_some()
+        || plan.min_faces.is_some()
+        || plan.max_faces.is_some()
         || plan.sort_by.is_some()
         || !plan.tags.is_empty()
         || plan.kind.is_some()
+        || plan.exclude_kind.is_some()
         || plan.favorite.is_some()
         || plan.date_from_ms.is_some()
         || plan.date_to_ms.is_some()
 }
 
 /// Removes subjective filler words and photo-wrapper nouns from `semantic_query` so SigLIP2
-/// receives clean visual concepts (e.g. `"cool mountain pics"` -> `"mountain"`, `"cool pics"` -> `None`).
-fn strip_semantic_filler(raw: &str) -> Option<String> {
+/// receives clean visual concepts (e.g. `"cool mountain pics"` -> `"mountain"`, `"cool pics"` -> `None`)
+/// while preserving capitalized proper nouns like `"Nice, France"` or `"Best Buy"`.
+pub(crate) fn strip_semantic_filler(raw: &str) -> Option<String> {
     const SUBJECTIVE_FILLERS: &[&str] = &[
         "cool",
         "nice",
@@ -890,6 +1231,12 @@ fn strip_semantic_filler(raw: &str) -> Option<String> {
         "recently",
         "latest",
         "newest",
+        "memories",
+        "throwback",
+        "vibes",
+        "aesthetic",
+        "epic",
+        "stunning",
         "stuff",
         "things",
         "something",
@@ -901,12 +1248,36 @@ fn strip_semantic_filler(raw: &str) -> Option<String> {
         "photos", "photo", "pictures", "picture", "shots", "shot", "images", "image",
     ];
 
-    let mut tokens: Vec<&str> = raw
+    let raw_words: Vec<&str> = raw
         .split_whitespace()
-        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '\''))
+        .map(|t| {
+            t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '\'' && c != '&')
+        })
         .filter(|t| !t.is_empty())
-        .filter(|t| !SUBJECTIVE_FILLERS.contains(&t.to_ascii_lowercase().as_str()))
         .collect();
+
+    let mut tokens: Vec<&str> = Vec::with_capacity(raw_words.len());
+    for (idx, &t) in raw_words.iter().enumerate() {
+        let low = t.to_ascii_lowercase();
+        let starts_upper = t.chars().next().is_some_and(|c| c.is_uppercase());
+        // Preserve proper nouns like "Best Buy" or "Nice France" when capitalized alongside another capitalized word or non-filler.
+        let looks_like_proper_noun = starts_upper
+            && raw_words.len() >= 2
+            && ((idx + 1 < raw_words.len()
+                && raw_words[idx + 1]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_uppercase()))
+                || (idx > 0
+                    && raw_words[idx - 1]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_uppercase())));
+        if !looks_like_proper_noun && SUBJECTIVE_FILLERS.contains(&low.as_str()) {
+            continue;
+        }
+        tokens.push(t);
+    }
 
     while let Some(first) = tokens.first() {
         if EDGE_WRAPPERS.contains(&first.to_ascii_lowercase().as_str()) {
@@ -924,16 +1295,23 @@ fn strip_semantic_filler(raw: &str) -> Option<String> {
     }
 
     if tokens.is_empty() {
-        None
+        return None;
+    }
+
+    // Expand photographic shorthand ("b&w" / "bw" -> "black and white monochrome") for SigLIP2.
+    let joined = tokens.join(" ");
+    let low_joined = joined.to_ascii_lowercase();
+    if matches!(low_joined.as_str(), "b&w" | "bw" | "b/w" | "black & white") {
+        Some("black and white monochrome".to_string())
     } else {
-        Some(tokens.join(" "))
+        Some(joined)
     }
 }
 
 /// Word-boundary check on an already-lowercased string so short tokens like `"mm"`, `"sec"`,
 /// `"top"`, `"nice"`, `"cool"`, or `"tall"` never match inside `"summer"`, `"second"`, `"rooftop"`,
 /// `"Venice"`, `"school"`, or `"install"`.
-fn has_word(lower: &str, word: &str) -> bool {
+pub(crate) fn has_word(lower: &str, word: &str) -> bool {
     let mut from = 0;
     while let Some(rel) = lower[from..].find(word) {
         let start = from + rel;
@@ -1063,9 +1441,31 @@ pub(crate) fn try_apply_filter_removal(
     }
     if has_word(target_clause, "orientation")
         || has_word(target_clause, "portrait")
+        || has_word(target_clause, "vertical")
         || has_word(target_clause, "landscape")
+        || has_word(target_clause, "horizontal")
+        || has_word(target_clause, "square")
+        || has_word(target_clause, "panorama")
     {
         updated.orientation = None;
+        removed_any = true;
+    }
+    if has_word(target_clause, "faces")
+        || has_word(target_clause, "solo")
+        || has_word(target_clause, "group")
+        || has_word(target_clause, "couple")
+    {
+        updated.min_faces = None;
+        updated.max_faces = None;
+        removed_any = true;
+    }
+    if has_word(target_clause, "exclude")
+        || has_word(target_clause, "excluding")
+        || has_word(target_clause, "exclusion")
+    {
+        updated.exclude_person_names.clear();
+        updated.exclude_location_query = None;
+        updated.exclude_kind = None;
         removed_any = true;
     }
     if has_word(target_clause, "sort") {
@@ -1079,14 +1479,19 @@ pub(crate) fn try_apply_filter_removal(
     if has_word(target_clause, "kind")
         || has_word(target_clause, "video")
         || has_word(target_clause, "videos")
+        || has_word(target_clause, "photo")
+        || has_word(target_clause, "photos")
+        || has_word(target_clause, "raw")
     {
         updated.kind = None;
+        updated.exclude_kind = None;
         removed_any = true;
     }
     if has_word(target_clause, "favorite")
         || has_word(target_clause, "favorites")
         || has_word(target_clause, "favourite")
         || has_word(target_clause, "favourites")
+        || has_word(target_clause, "starred")
     {
         updated.favorite = None;
         removed_any = true;
@@ -1105,24 +1510,33 @@ pub(crate) fn try_apply_filter_removal(
 }
 
 /// Strips count suffix `"CS Grad Pics 2026 (236)"` -> `"CS Grad Pics 2026"`.
-fn strip_folder_count(entry: &str) -> &str {
+pub(crate) fn strip_folder_count(entry: &str) -> &str {
     entry
         .rsplit_once(" (")
         .map(|(name, _)| name.trim())
         .unwrap_or_else(|| entry.trim())
 }
 
-fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64)> {
+pub(crate) fn extract_explicit_year(lower: &str) -> Option<i32> {
+    lower
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|tok| tok.len() == 4)
+        .filter_map(|tok| tok.parse::<i32>().ok())
+        .find(|&yr| (1970..=2099).contains(&yr))
+}
+
+pub(crate) fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64)> {
     let today = now_utc.date_naive();
     let y = today.year();
     let m = today.month();
+    let explicit_year = extract_explicit_year(lower);
     let wants_last = lower.contains("last summer")
         || lower.contains("last spring")
         || lower.contains("last fall")
         || lower.contains("last autumn")
         || lower.contains("last winter");
     let (start, end) = if has_word(lower, "summer") {
-        let sy = if wants_last {
+        let sy = explicit_year.unwrap_or(if wants_last {
             if m > 8 {
                 y
             } else {
@@ -1132,13 +1546,13 @@ fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64
             y
         } else {
             y - 1
-        };
+        });
         (
             NaiveDate::from_ymd_opt(sy, 6, 1)?,
             NaiveDate::from_ymd_opt(sy, 8, 31)?,
         )
     } else if has_word(lower, "spring") {
-        let sy = if wants_last {
+        let sy = explicit_year.unwrap_or(if wants_last {
             if m > 5 {
                 y
             } else {
@@ -1148,13 +1562,13 @@ fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64
             y
         } else {
             y - 1
-        };
+        });
         (
             NaiveDate::from_ymd_opt(sy, 3, 1)?,
             NaiveDate::from_ymd_opt(sy, 5, 31)?,
         )
     } else if has_word(lower, "fall") || has_word(lower, "autumn") {
-        let sy = if wants_last {
+        let sy = explicit_year.unwrap_or(if wants_last {
             if m > 11 {
                 y
             } else {
@@ -1164,13 +1578,15 @@ fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64
             y
         } else {
             y - 1
-        };
+        });
         (
             NaiveDate::from_ymd_opt(sy, 9, 1)?,
             NaiveDate::from_ymd_opt(sy, 11, 30)?,
         )
     } else if has_word(lower, "winter") {
-        let end_y = if wants_last {
+        let end_y = if let Some(ey) = explicit_year {
+            ey
+        } else if wants_last {
             if m >= 3 {
                 y
             } else {
@@ -1191,15 +1607,125 @@ fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64
     Some((s_dt.timestamp_millis(), e_dt.timestamp_millis()))
 }
 
+/// Shared classifier for library-overview / conversational meta-questions (used by both
+/// Tier 0 Classic and Tiers 1–3 sidecar sanitizer).
+pub(crate) fn is_meta_library_question(lower: &str) -> bool {
+    let trimmed_punct = lower.trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace());
+    let is_short_greeting = matches!(
+        trimmed_punct,
+        "hi" | "hello" | "hey" | "yo" | "sup" | "thanks" | "thank you" | "help"
+    );
+    if is_short_greeting {
+        return true;
+    }
+
+    // Explicit library-fact questions win even when phrased as "show me what cameras I use"
+    // or "show me who is in my library".
+    const STRICT_META_PHRASES: &[&str] = &[
+        "who are in my",
+        "who is in my",
+        "who's in my",
+        "whos in my",
+        "who are the people",
+        "who appears in",
+        "who do you know",
+        "who do i have",
+        "what people",
+        "which people",
+        "list the people",
+        "list people",
+        "people in my library",
+        "what's in my library",
+        "whats in my library",
+        "what is in my library",
+        "what's in my photo",
+        "whats in my photo",
+        "what is in my photo",
+        "what's in my pic",
+        "whats in my pic",
+        "what is in my pic",
+        "tell me about my",
+        "summarize my",
+        "overview of my",
+        "describe my library",
+        "what folder",
+        "which folder",
+        "list folder",
+        "what trip",
+        "what event",
+        "what album",
+        "what collection",
+        "where have i been",
+        "what places are in my",
+        "what camera",
+        "which camera",
+        "what lens",
+        "which lens",
+        "most used lens",
+        "most used camera",
+        "favorite lens",
+        "favourite lens",
+        "what gear",
+        "what equipment",
+        "which month",
+        "what month",
+        "which year",
+        "when were my",
+        "what dates",
+        "date range",
+        "what can you do",
+        "how do you work",
+    ];
+    if STRICT_META_PHRASES.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+
+    let is_explicit_show_search = [
+        "show me",
+        "show ",
+        "find ",
+        "pull up",
+        "get me",
+        "give me",
+        "search ",
+        "look for",
+        "browse",
+        "pics of",
+        "photos of",
+        "pictures of",
+        "shots of",
+        "what did i shoot",
+        "what have i shot",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+
+    !is_explicit_show_search
+        && [
+            "how many photo",
+            "how many pic",
+            "how many image",
+            "how many video",
+            "how many item",
+            "how many file",
+            "how many favorite",
+            "how many favourite",
+            "total photo",
+            "total pic",
+        ]
+        .iter()
+        .any(|kw| lower.contains(kw))
+}
+
 fn sanitize_sidecar_plan(
     user_message: &str,
     prior: &RouterPlan,
     known_folders: &[String],
+    known_people: &[String],
     now_utc: DateTime<Utc>,
     plan: &mut RouterPlan,
 ) {
     let lower = user_message.trim().to_ascii_lowercase();
-    let trimmed_punct = lower.trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace());
 
     // 0. Deterministic single-filter removal ("remove the location filter", clickable chip removal).
     if try_apply_filter_removal(&lower, prior, plan) {
@@ -1227,71 +1753,7 @@ fn sanitize_sidecar_plan(
     .iter()
     .any(|kw| lower.contains(kw));
 
-    let is_short_greeting = matches!(
-        trimmed_punct,
-        "hi" | "hello" | "hey" | "yo" | "sup" | "thanks" | "thank you" | "help"
-    );
-
-    let is_meta_info_question = is_short_greeting
-        || (!is_explicit_show_search
-            && [
-                "who are in my",
-                "who is in my",
-                "who's in my",
-                "whos in my",
-                "who are the people",
-                "who appears in",
-                "who do you know",
-                "who do i have",
-                "what people",
-                "which people",
-                "list the people",
-                "list people",
-                "people in my library",
-                "what's in my library",
-                "whats in my library",
-                "what is in my library",
-                "what's in my photo",
-                "whats in my photo",
-                "what is in my photo",
-                "what's in my pic",
-                "whats in my pic",
-                "what is in my pic",
-                "tell me about my",
-                "summarize my",
-                "overview of my",
-                "describe my library",
-                "how many photo",
-                "how many pic",
-                "how many image",
-                "how many video",
-                "how many item",
-                "how many file",
-                "total photo",
-                "total pic",
-                "what folder",
-                "which folder",
-                "list folder",
-                "what trip",
-                "what event",
-                "what album",
-                "what collection",
-                "where have i been",
-                "what places are in my",
-                "what camera",
-                "which camera",
-                "what lens",
-                "which lens",
-                "what gear",
-                "what equipment",
-                "when were my",
-                "what dates",
-                "date range",
-                "what can you do",
-                "how do you work",
-            ]
-            .iter()
-            .any(|kw| lower.contains(kw)));
+    let is_meta_info_question = is_meta_library_question(&lower);
 
     let has_specific_count_filter = (!plan.person_names.is_empty()
         || plan.date_from_ms.is_some()
@@ -1317,6 +1779,50 @@ fn sanitize_sidecar_plan(
     }
 
     plan.intent = Some("search".to_string());
+
+    // 1b. Follow-up entity swap ("what about AJ?", "how about Sebastian?"): when prior had a
+    // person filter and the user swaps to another person without naming the prior person, replace
+    // `person_names` cleanly while carrying over the remaining non-person prior filters.
+    let is_what_about = lower.starts_with("what about ")
+        || lower.starts_with("how about ")
+        || lower.contains("instead of ");
+    if is_what_about && !prior.person_names.is_empty() && !plan.person_names.is_empty() {
+        let prior_low: HashSet<String> = prior
+            .person_names
+            .iter()
+            .map(|p| p.to_ascii_lowercase())
+            .collect();
+        let has_new_person = plan
+            .person_names
+            .iter()
+            .any(|p| !prior_low.contains(&p.to_ascii_lowercase()));
+        let mentions_prior = prior.person_names.iter().any(|p| {
+            let first = p
+                .split_whitespace()
+                .next()
+                .unwrap_or(p)
+                .to_ascii_lowercase();
+            !first.is_empty() && has_word(&lower, &first)
+        });
+        if has_new_person && !mentions_prior {
+            let new_people: Vec<String> = plan
+                .person_names
+                .iter()
+                .filter(|p| !prior_low.contains(&p.to_ascii_lowercase()))
+                .cloned()
+                .collect();
+            let reply = plan.assistant_reply.clone();
+            let suggestions = plan.follow_up_suggestions.clone();
+            let mut swapped = prior.clone();
+            swapped.intent = Some("search".to_string());
+            swapped.person_names = new_people;
+            swapped.clear_prior_filters = true;
+            swapped.assistant_reply = reply;
+            swapped.follow_up_suggestions = suggestions;
+            *plan = swapped;
+        }
+    }
+    let _ = known_people;
 
     // Strip speculative tags when the user never asked for a tag ("tagged X" / "#X").
     // If a stripped tag matches a known folder or was the only subject cue (e.g. "highest ISO zoo photos"
@@ -1448,6 +1954,8 @@ fn sanitize_sidecar_plan(
     let has_iso_cue = has_word(&lower, "iso")
         || has_numeric_unit(&lower, "iso")
         || lower.contains("film grain")
+        || lower.contains("low light")
+        || lower.contains("low-light")
         || has_word(&lower, "grainy")
         || has_word(&lower, "noisy")
         || has_word(&lower, "noise");
@@ -1457,12 +1965,21 @@ fn sanitize_sidecar_plan(
         plan.iso_min = None;
         plan.iso_max = None;
     } else if has_iso_cue {
+        let is_high_iso_vague = lower.contains("high iso")
+            || lower.contains("film grain")
+            || lower.contains("low light")
+            || lower.contains("low-light")
+            || has_word(&lower, "grainy")
+            || has_word(&lower, "noisy")
+            || has_word(&lower, "noise");
+        let is_low_iso_vague =
+            lower.contains("low iso") || lower.contains("base iso") || has_word(&lower, "cleanest");
         if let (Some(lo), None) = (plan.iso_min, plan.iso_max) {
-            if !has_lower_bound_cue && !lower.contains("high iso") {
+            if !has_lower_bound_cue && !is_high_iso_vague {
                 plan.iso_max = Some(lo);
             }
         } else if let (None, Some(hi)) = (plan.iso_min, plan.iso_max) {
-            if !has_upper_bound_cue && !lower.contains("low iso") {
+            if !has_upper_bound_cue && !is_low_iso_vague {
                 plan.iso_min = Some(hi);
             }
         }
@@ -1493,6 +2010,8 @@ fn sanitize_sidecar_plan(
         } else if let (None, Some(hi)) = (plan.focal_length_min_mm, plan.focal_length_max_mm) {
             if !has_upper_bound_cue
                 && !has_word(&lower_no_wide_open, "wide")
+                && !lower_no_wide_open.contains("ultrawide")
+                && !lower_no_wide_open.contains("ultra-wide")
                 && !lower_no_wide_open.contains("fisheye")
             {
                 plan.focal_length_min_mm = Some(hi);
@@ -1522,10 +2041,10 @@ fn sanitize_sidecar_plan(
             if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit() || c == '.') {
                 return false;
             }
-            // Exclude decades like "90s", "80s", "1990s", "2000s".
+            // Exclude decades like "60s"-"90s", "1990s", "2000s", while keeping common long exposures ("20s", "30s").
             if !num.contains('.') {
                 if let Ok(v) = num.parse::<u32>() {
-                    if matches!(v, 20 | 30 | 40 | 50 | 60 | 70 | 80 | 90 | 1900..=2099) {
+                    if matches!(v, 60 | 70 | 80 | 90 | 1900..=2099) {
                         return false;
                     }
                 }
@@ -1576,22 +2095,111 @@ fn sanitize_sidecar_plan(
 
     let has_orientation_cue = has_word(&lower, "vertical")
         || has_word(&lower, "horizontal")
+        || has_word(&lower, "landscape")
+        || has_word(&lower, "square")
+        || has_word(&lower, "tall")
+        || has_word(&lower, "panorama")
+        || has_word(&lower, "panoramas")
+        || has_word(&lower, "panoramic")
+        || has_word(&lower, "pano")
         || lower.contains("wallpaper")
+        || lower.contains("phone background")
+        || lower.contains("lock screen")
+        || lower.contains("desktop background")
         || lower.contains("portrait orientation")
         || lower.contains("portrait mode")
         || lower.contains("portrait aspect")
-        || lower.contains("landscape orientation")
-        || lower.contains("landscape mode")
-        || lower.contains("landscape aspect")
-        || lower.contains("square crop")
-        || lower.contains("square format")
-        || lower.contains("square orientation")
-        || lower.contains("square aspect")
+        || lower.contains("portrait ones")
+        || lower.contains("only portrait")
+        || lower.contains("portrait only")
+        || lower.contains("portrait shot")
         || lower.contains("aspect ratio")
         || lower.contains("1:1");
 
     if !has_orientation_cue && (!inherit_prior || prior.orientation.is_none()) {
         plan.orientation = None;
+    }
+    if plan.orientation.is_none() {
+        if has_word(&lower, "panorama")
+            || has_word(&lower, "panoramas")
+            || has_word(&lower, "panoramic")
+            || has_word(&lower, "pano")
+        {
+            plan.orientation = Some("panorama".to_string());
+        } else if lower.contains("phone wallpaper")
+            || lower.contains("phone background")
+            || lower.contains("lock screen")
+        {
+            plan.orientation = Some("portrait".to_string());
+        } else if lower.contains("desktop wallpaper") || lower.contains("desktop background") {
+            plan.orientation = Some("landscape".to_string());
+        }
+    }
+
+    // Small-model (Tier 1) hallucination guards:
+    // 1. Do not restrict `kind: Photo` when user casually says "photos of X" (excludes Live Photos & RAW+JPG stacks!).
+    let wants_still_only = lower.contains("only photo")
+        || lower.contains("photos only")
+        || lower.contains("photo only")
+        || lower.contains("still photo")
+        || lower.contains("stills only")
+        || lower.contains("no video")
+        || lower.contains("not video")
+        || lower.contains("without video");
+    if plan.kind == Some(AssetKind::Photo)
+        && !wants_still_only
+        && (!inherit_prior || prior.kind != Some(AssetKind::Photo))
+    {
+        plan.kind = None;
+    }
+    if (lower.contains("no video")
+        || lower.contains("not video")
+        || lower.contains("without video"))
+        && plan.kind.is_none()
+        && plan.exclude_kind.is_none()
+    {
+        plan.exclude_kind = Some(AssetKind::Video);
+    }
+
+    // 2. Do not restrict `favorite: false` unless explicitly requested.
+    let wants_non_favorite = lower.contains("not favorite")
+        || lower.contains("not favourite")
+        || lower.contains("non-favorite")
+        || lower.contains("non favorite")
+        || lower.contains("unfavorited")
+        || lower.contains("unstarred");
+    if plan.favorite == Some(false)
+        && !wants_non_favorite
+        && (!inherit_prior || prior.favorite != Some(false))
+    {
+        plan.favorite = None;
+    }
+
+    // 3. Face-count rescue ("solo", "couple", "group shot").
+    if plan.min_faces.is_none() && plan.max_faces.is_none() {
+        if has_word(&lower, "solo")
+            || lower.contains("by themselves")
+            || lower.contains("by himself")
+            || lower.contains("by herself")
+            || (has_word(&lower, "alone") && !plan.person_names.is_empty())
+        {
+            plan.max_faces = Some(1);
+            if plan.person_names.is_empty() {
+                plan.min_faces = Some(1);
+            }
+        } else if lower.contains("two people")
+            || lower.contains("2 people")
+            || has_word(&lower, "couple")
+        {
+            plan.min_faces = Some(2);
+            plan.max_faces = Some(2);
+        } else if lower.contains("group shot")
+            || lower.contains("group photo")
+            || lower.contains("group pic")
+            || lower.contains("big group")
+        {
+            plan.min_faces = Some(3);
+        }
     }
 
     // Superlative safety net: ensure superlatives always populate `sort_by` so they never execute
@@ -1632,8 +2240,41 @@ fn sanitize_sidecar_plan(
         || lower.contains("without faces");
     if wants_no_people {
         plan.has_people = Some(false);
-    } else if plan.has_people == Some(false) && prior.has_people != Some(false) {
+    } else if plan.has_people == Some(false) && (!inherit_prior || prior.has_people != Some(false))
+    {
         plan.has_people = None;
+    } else if plan.has_people == Some(true)
+        && plan.person_names.is_empty()
+        && (!inherit_prior || prior.has_people != Some(true))
+    {
+        let mentions_people = [
+            "people",
+            "person",
+            "friends",
+            "friend",
+            "family",
+            "fam",
+            "portraits",
+            "portrait",
+            "faces",
+            "face",
+            "someone",
+            "anyone",
+            "everyone",
+            "folks",
+            "crowd",
+            "group",
+            "couple",
+            "selfie",
+            "selfies",
+            "kiddos",
+            "kids",
+        ]
+        .iter()
+        .any(|kw| has_word(&lower, kw));
+        if !mentions_people {
+            plan.has_people = None;
+        }
     }
 
     // Strip hallucinated `sort_by: "aperture_asc"` when the user did not ask for aperture/bokeh
@@ -1654,6 +2295,8 @@ fn sanitize_sidecar_plan(
         "highlights",
         "standout",
         "top",
+        "memories",
+        "throwback",
         "something",
         "anything",
     ]
@@ -1662,7 +2305,7 @@ fn sanitize_sidecar_plan(
     if plan.sort_by.as_deref() == Some("aperture_asc")
         && !has_aperture_cue
         && !wants_exploratory
-        && prior.sort_by.as_deref() != Some("aperture_asc")
+        && (!inherit_prior || prior.sort_by.as_deref() != Some("aperture_asc"))
     {
         plan.sort_by = None;
     }
@@ -1709,7 +2352,14 @@ fn sanitize_sidecar_plan(
     // and allow combining with person/camera filters (e.g. "summer photos of Sebastian").
     if plan.date_from_ms.is_none() && plan.date_to_ms.is_none() {
         let today = now_utc.date_naive();
-        let rescue_range: Option<((i64, i64), &str)> = if has_word(&lower, "yesterday") {
+        let cur_y = today.year();
+        let cur_m = today.month();
+        let rescue_range: Option<((i64, i64), &str)> = if has_word(&lower, "today") {
+            let s = Utc.from_utc_datetime(&today.and_hms_opt(0, 0, 0).expect("valid"));
+            let e =
+                Utc.from_utc_datetime(&today.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "today"))
+        } else if has_word(&lower, "yesterday") {
             let yday = today - chrono::Duration::days(1);
             let s = Utc.from_utc_datetime(&yday.and_hms_opt(0, 0, 0).expect("valid"));
             let e = Utc.from_utc_datetime(&yday.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
@@ -1719,12 +2369,72 @@ fn sanitize_sidecar_plan(
             let s = Utc.from_utc_datetime(&sat.and_hms_opt(0, 0, 0).expect("valid"));
             let e = Utc.from_utc_datetime(&sun.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
             Some(((s.timestamp_millis(), e.timestamp_millis()), "last weekend"))
+        } else if lower.contains("this week") {
+            let days_from_mon = today.weekday().num_days_from_monday() as i64;
+            let mon = today - chrono::Duration::days(days_from_mon);
+            let s = Utc.from_utc_datetime(&mon.and_hms_opt(0, 0, 0).expect("valid"));
+            let e =
+                Utc.from_utc_datetime(&today.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "this week"))
+        } else if lower.contains("last week") {
+            let start = today - chrono::Duration::days(7);
+            let s = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).expect("valid"));
+            let e =
+                Utc.from_utc_datetime(&today.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "last week"))
+        } else if lower.contains("last 30 days") || lower.contains("past 30 days") {
+            let start = today - chrono::Duration::days(30);
+            let s = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).expect("valid"));
+            let e =
+                Utc.from_utc_datetime(&today.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "last 30 days"))
+        } else if lower.contains("this month") {
+            let s_d = NaiveDate::from_ymd_opt(cur_y, cur_m, 1).expect("valid");
+            let e_d = NaiveDate::from_ymd_opt(cur_y, cur_m, calendar_month_last_day(cur_y, cur_m))
+                .expect("valid");
+            let s = Utc.from_utc_datetime(&s_d.and_hms_opt(0, 0, 0).expect("valid"));
+            let e = Utc.from_utc_datetime(&e_d.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "this month"))
+        } else if lower.contains("last month") {
+            let (py, pm) = shift_calendar_month(cur_y, cur_m, -1);
+            let s_d = NaiveDate::from_ymd_opt(py, pm, 1).expect("valid");
+            let e_d =
+                NaiveDate::from_ymd_opt(py, pm, calendar_month_last_day(py, pm)).expect("valid");
+            let s = Utc.from_utc_datetime(&s_d.and_hms_opt(0, 0, 0).expect("valid"));
+            let e = Utc.from_utc_datetime(&e_d.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "last month"))
+        } else if lower.contains("two months ago") || lower.contains("2 months ago") {
+            let (py, pm) = shift_calendar_month(cur_y, cur_m, -2);
+            let s_d = NaiveDate::from_ymd_opt(py, pm, 1).expect("valid");
+            let e_d =
+                NaiveDate::from_ymd_opt(py, pm, calendar_month_last_day(py, pm)).expect("valid");
+            let s = Utc.from_utc_datetime(&s_d.and_hms_opt(0, 0, 0).expect("valid"));
+            let e = Utc.from_utc_datetime(&e_d.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some((
+                (s.timestamp_millis(), e.timestamp_millis()),
+                "two months ago",
+            ))
+        } else if lower.contains("this year") {
+            let s_d = NaiveDate::from_ymd_opt(cur_y, 1, 1).expect("valid");
+            let e_d = NaiveDate::from_ymd_opt(cur_y, 12, 31).expect("valid");
+            let s = Utc.from_utc_datetime(&s_d.and_hms_opt(0, 0, 0).expect("valid"));
+            let e = Utc.from_utc_datetime(&e_d.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "this year"))
+        } else if lower.contains("last year") {
+            let py = cur_y - 1;
+            let s_d = NaiveDate::from_ymd_opt(py, 1, 1).expect("valid");
+            let e_d = NaiveDate::from_ymd_opt(py, 12, 31).expect("valid");
+            let s = Utc.from_utc_datetime(&s_d.and_hms_opt(0, 0, 0).expect("valid"));
+            let e = Utc.from_utc_datetime(&e_d.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "last year"))
         } else if has_word(&lower, "christmas") || has_word(&lower, "xmas") {
-            let cy = if today.month() == 12 && today.day() >= 24 {
-                today.year()
-            } else {
-                today.year() - 1
-            };
+            let cy = extract_explicit_year(&lower).unwrap_or(
+                if today.month() == 12 && today.day() >= 24 {
+                    today.year()
+                } else {
+                    today.year() - 1
+                },
+            );
             let s_d = NaiveDate::from_ymd_opt(cy, 12, 24).expect("valid");
             let e_d = NaiveDate::from_ymd_opt(cy, 12, 26).expect("valid");
             let s = Utc.from_utc_datetime(&s_d.and_hms_opt(0, 0, 0).expect("valid"));
@@ -1805,9 +2515,31 @@ fn sanitize_sidecar_plan(
         }
     }
 
-    // Strip subjective filler words ("cool", "best", "nice", "stuff", "pics") from semantic_query.
+    // Strip subjective filler words ("cool", "best", "nice", "stuff", "pics") from semantic_query,
+    // and strip "wallpaper"/"wallpapers" when an orientation filter is already active.
     if let Some(sq) = plan.semantic_query.take() {
-        plan.semantic_query = strip_semantic_filler(&sq);
+        let cleaned = strip_semantic_filler(&sq);
+        plan.semantic_query = cleaned.and_then(|s| {
+            let low = s.to_ascii_lowercase();
+            if plan.orientation.is_some()
+                && matches!(
+                    low.as_str(),
+                    "wallpaper"
+                        | "wallpapers"
+                        | "phone wallpaper"
+                        | "phone wallpapers"
+                        | "desktop wallpaper"
+                        | "desktop wallpapers"
+                        | "phone background"
+                        | "desktop background"
+                        | "lock screen"
+                )
+            {
+                None
+            } else {
+                Some(s)
+            }
+        });
     }
 
     // Broad people request rescue ("show me people" / "show me my friends" with no specific name).
@@ -1867,10 +2599,22 @@ fn sanitize_sidecar_plan(
             plan.sort_by = Some("capture_desc".to_string());
             plan.clear_prior_filters = true;
         } else if wants_exploratory {
-            plan.sort_by = Some("aperture_asc".to_string());
+            plan.sort_by = Some("best".to_string());
             plan.clear_prior_filters = true;
         }
     }
+}
+
+fn calendar_month_last_day(year: i32, month: u32) -> u32 {
+    let (next_y, next_m) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    NaiveDate::from_ymd_opt(next_y, next_m, 1)
+        .and_then(|d| d.pred_opt())
+        .map(|d| d.day())
+        .unwrap_or(28)
 }
 
 static SIDECAR_HTTP: OnceLock<Result<(tokio::runtime::Runtime, reqwest::Client), String>> =
@@ -1960,7 +2704,7 @@ fn wait_for_server_health(
     }
 }
 
-fn post_chat_completion(port: u16, payload: &Value) -> Result<String, AiError> {
+fn post_chat_completion(port: u16, payload: &Value, timeout: Duration) -> Result<String, AiError> {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let body = payload.clone();
 
@@ -1968,6 +2712,7 @@ fn post_chat_completion(port: u16, payload: &Value) -> Result<String, AiError> {
         Box::pin(async move {
             let resp = client
                 .post(&url)
+                .timeout(timeout)
                 .json(&body)
                 .send()
                 .await
@@ -2045,6 +2790,7 @@ mod tests {
             "who are in my pics",
             &RouterPlan::default(),
             &[],
+            &[],
             fixed_now(),
             &mut plan,
         );
@@ -2052,6 +2798,23 @@ mod tests {
         assert!(plan.person_names.is_empty());
         assert_eq!(plan.has_people, None);
         assert!(plan.clear_prior_filters);
+
+        // Filtered count question ("how many photos of Sebastian") must stay a search!
+        let mut count_person = RouterPlan {
+            intent: Some("search".to_string()),
+            person_names: vec!["Sebastian".to_string()],
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "how many photos of Sebastian do I have?",
+            &RouterPlan::default(),
+            &[],
+            &["Sebastian".to_string()],
+            fixed_now(),
+            &mut count_person,
+        );
+        assert_eq!(count_person.intent.as_deref(), Some("search"));
+        assert_eq!(count_person.person_names, vec!["Sebastian".to_string()]);
     }
 
     #[test]
@@ -2066,6 +2829,7 @@ mod tests {
         sanitize_sidecar_plan(
             "show me animals",
             &RouterPlan::default(),
+            &[],
             &[],
             fixed_now(),
             &mut plan,
@@ -2084,6 +2848,7 @@ mod tests {
             "mountain photos without people",
             &RouterPlan::default(),
             &[],
+            &[],
             fixed_now(),
             &mut no_people,
         );
@@ -2100,6 +2865,7 @@ mod tests {
             "show me cool mountain pics",
             &RouterPlan::default(),
             &[],
+            &[],
             fixed_now(),
             &mut mountain,
         );
@@ -2113,16 +2879,18 @@ mod tests {
             "show me cool pics",
             &RouterPlan::default(),
             &[],
+            &[],
             fixed_now(),
             &mut cool,
         );
         assert_eq!(cool.semantic_query, None);
-        assert_eq!(cool.sort_by.as_deref(), Some("aperture_asc"));
+        assert_eq!(cool.sort_by.as_deref(), Some("best"));
 
         let mut recent = RouterPlan::default();
         sanitize_sidecar_plan(
             "what did I shoot recently?",
             &RouterPlan::default(),
+            &[],
             &[],
             fixed_now(),
             &mut recent,
@@ -2143,6 +2911,7 @@ mod tests {
             "remove the location filter",
             &prior,
             &[],
+            &[],
             fixed_now(),
             &mut removed,
         );
@@ -2160,6 +2929,7 @@ mod tests {
             "highest ISO zoo photos",
             &RouterPlan::default(),
             &folders,
+            &[],
             fixed_now(),
             &mut zoo_tag,
         );
@@ -2174,6 +2944,7 @@ mod tests {
         sanitize_sidecar_plan(
             "show me outdoors",
             &RouterPlan::default(),
+            &[],
             &[],
             fixed_now(),
             &mut outdoors,
@@ -2190,10 +2961,157 @@ mod tests {
             "show me summer photos",
             &RouterPlan::default(),
             &[],
+            &[],
             fixed_now(),
             &mut summer,
         );
         assert!(summer.date_from_ms.is_some());
         assert!(summer.date_to_ms.is_some());
+    }
+
+    #[test]
+    fn sanitize_all_tier_edge_cases_and_small_model_guards() {
+        // 1. "grainy" / "noisy" ISO min must NOT collapse into exact ISO band.
+        let mut grainy = RouterPlan {
+            iso_min: Some(3200),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "grainy night photos",
+            &RouterPlan::default(),
+            &[],
+            &[],
+            fixed_now(),
+            &mut grainy,
+        );
+        assert_eq!(grainy.iso_min, Some(3200));
+        assert_eq!(grainy.iso_max, None);
+
+        // 2. "ultrawide" focal max must NOT collapse into exact focal length.
+        let mut ultrawide = RouterPlan {
+            focal_length_max_mm: Some(24.0),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "ultrawide architecture shots",
+            &RouterPlan::default(),
+            &[],
+            &[],
+            fixed_now(),
+            &mut ultrawide,
+        );
+        assert_eq!(ultrawide.focal_length_min_mm, None);
+        assert_eq!(ultrawide.focal_length_max_mm, Some(24.0));
+
+        // 3. Long exposure "20s" must NOT be stripped as a decade!
+        let mut twenty_s = RouterPlan {
+            shutter_speed_min_sec: Some(20.0),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "20s star trails",
+            &RouterPlan::default(),
+            &[],
+            &[],
+            fixed_now(),
+            &mut twenty_s,
+        );
+        assert_eq!(twenty_s.shutter_speed_min_sec, Some(20.0));
+
+        // 4. Orientation cues: panorama & phone wallpaper.
+        let mut pano = RouterPlan::default();
+        sanitize_sidecar_plan(
+            "show me panoramas",
+            &RouterPlan::default(),
+            &[],
+            &[],
+            fixed_now(),
+            &mut pano,
+        );
+        assert_eq!(pano.orientation.as_deref(), Some("panorama"));
+
+        // 5. Tier 1 hallucinated kind=Photo and favorite=false stripped on casual queries.
+        let mut hallucinated = RouterPlan {
+            semantic_query: Some("dogs".to_string()),
+            kind: Some(AssetKind::Photo),
+            favorite: Some(false),
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "photos of dogs",
+            &RouterPlan::default(),
+            &[],
+            &[],
+            fixed_now(),
+            &mut hallucinated,
+        );
+        assert_eq!(hallucinated.kind, None);
+        assert_eq!(hallucinated.favorite, None);
+
+        // 6. Face-count rescue: "solo photo of Sebastian" -> max_faces = 1.
+        let mut solo = RouterPlan {
+            person_names: vec!["Sebastian".to_string()],
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "solo photo of Sebastian",
+            &RouterPlan::default(),
+            &[],
+            &["Sebastian".to_string()],
+            fixed_now(),
+            &mut solo,
+        );
+        assert_eq!(solo.max_faces, Some(1));
+
+        // 7. Entity swap ("what about AJ?") replaces prior person_names cleanly.
+        let prior_seb = RouterPlan {
+            person_names: vec!["Sebastian".to_string()],
+            location_query: Some("Portland Zoo".to_string()),
+            ..Default::default()
+        };
+        let mut swap = RouterPlan {
+            person_names: vec!["AJ".to_string()],
+            ..Default::default()
+        };
+        sanitize_sidecar_plan(
+            "what about AJ?",
+            &prior_seb,
+            &[],
+            &["Sebastian".to_string(), "AJ".to_string()],
+            fixed_now(),
+            &mut swap,
+        );
+        assert!(swap.clear_prior_filters);
+        assert_eq!(swap.person_names, vec!["AJ".to_string()]);
+        assert_eq!(swap.location_query.as_deref(), Some("Portland Zoo"));
+
+        // 8. Proper-noun preservation & b&w expansion in strip_semantic_filler.
+        assert_eq!(
+            strip_semantic_filler("Best Buy").as_deref(),
+            Some("Best Buy")
+        );
+        assert_eq!(
+            strip_semantic_filler("b&w").as_deref(),
+            Some("black and white monochrome")
+        );
+
+        // 9. Explicit year on season: "summer 2025".
+        let mut s25 = RouterPlan::default();
+        sanitize_sidecar_plan(
+            "summer 2025",
+            &RouterPlan::default(),
+            &[],
+            &[],
+            fixed_now(),
+            &mut s25,
+        );
+        assert_eq!(
+            s25.date_from_ms,
+            Some(
+                Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0)
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
     }
 }

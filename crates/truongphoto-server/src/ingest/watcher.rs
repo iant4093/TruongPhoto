@@ -60,6 +60,14 @@ impl FolderWatcherManager {
         }
     }
 
+    /// Ensures a filesystem watcher is running for `folder_id` without tearing down an existing one.
+    pub fn ensure_watched(&self, state: &Arc<AppState>, folder_id: String, root_path: PathBuf) {
+        if self.watchers.lock().contains_key(&folder_id) {
+            return;
+        }
+        self.watch_folder(state, folder_id, root_path);
+    }
+
     /// Starts or replaces the filesystem watcher for `folder_id` at `root_path`.
     pub fn watch_folder(&self, state: &Arc<AppState>, folder_id: String, root_path: PathBuf) {
         self.unwatch_folder(&folder_id);
@@ -150,11 +158,17 @@ async fn run_folder_debounce_loop(
                 };
                 match res {
                     Ok(event) => {
+                        let all_ignored = !event.paths.is_empty()
+                            && event
+                                .paths
+                                .iter()
+                                .all(|p| should_ignore_watch_path(&root_path, p));
                         if event.need_rescan()
-                            || matches!(
-                                event.kind,
-                                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-                            )
+                            || (!all_ignored
+                                && matches!(
+                                    event.kind,
+                                    EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+                                ))
                         {
                             needs_full_scan = true;
                             debounce_active = true;

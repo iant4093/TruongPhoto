@@ -181,12 +181,20 @@ pub fn rename_with_windows_retry(from: &Path, to: &Path) -> std::io::Result<()> 
 
 fn strip_windows_verbatim(path: &str) -> String {
     if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{unc}")
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        path.to_string()
+        let candidate = format!(r"\\{unc}");
+        if candidate.len() < 248 {
+            return candidate;
+        }
+        return path.to_string();
     }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        // Preserve `\\?\` extended-length prefix for Windows paths >= 248 chars.
+        if rest.len() < 248 {
+            return rest.to_string();
+        }
+        return path.to_string();
+    }
+    path.to_string()
 }
 
 #[cfg(test)]

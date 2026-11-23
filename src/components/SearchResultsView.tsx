@@ -200,7 +200,7 @@ export const SearchResultsView: React.FC = () => {
             </div>
           )}
         </>
-      ) : (
+      ) : searchError ? null : (
         <EmptyState
           icon={<Search size={28} strokeWidth={1.3} />}
           title="No matching photos or videos"

@@ -644,10 +644,17 @@ pub fn remove_album_assets(
         }
 
         if removed > 0 {
-            let cover_removed = current_cover
-                .as_deref()
-                .map(|c| seen.contains(c))
-                .unwrap_or(false);
+            let cover_removed = match current_cover.as_deref() {
+                Some(c) => conn
+                    .query_row(
+                        "SELECT 1 FROM album_assets WHERE album_id = ?1 AND asset_id = ?2 LIMIT 1",
+                        params![album_id, c],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .is_none(),
+                None => false,
+            };
             if cover_removed {
                 let next_cover: Option<String> = conn
                     .query_row(

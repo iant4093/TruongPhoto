@@ -622,6 +622,7 @@ pub fn create_person_for_cluster(
             params![person_id, cover_face_id, now_ms],
         )?;
 
+        let mut claimed_faces: usize = 0;
         for chunk in face_ids.chunks(400) {
             let mut u_params: Vec<Value> =
                 vec![Value::Text(person_id.clone()), Value::Integer(now_ms)];
@@ -633,19 +634,23 @@ pub fn create_person_for_cluster(
             let u_sql = format!(
                 "UPDATE faces
                  SET person_id = ?1, assigned_by = 'auto', updated_at_ms = ?2
-                 WHERE id IN ({})",
+                 WHERE id IN ({}) AND person_id IS NULL",
                 ph.join(", ")
             );
-            conn.execute(&u_sql, params_from_iter(u_params))?;
+            claimed_faces += conn.execute(&u_sql, params_from_iter(u_params))?;
         }
 
-        ai::upsert_person_centroid(
-            conn,
-            &person_id,
-            face_ids.len() as u64,
-            centroid_blob,
-            now_ms,
-        )?;
+        if claimed_faces == 0 {
+            conn.execute("DELETE FROM people WHERE id = ?1", params![person_id])?;
+        } else {
+            ai::upsert_person_centroid(
+                conn,
+                &person_id,
+                claimed_faces as u64,
+                centroid_blob,
+                now_ms,
+            )?;
+        }
         Ok(())
     })?;
 

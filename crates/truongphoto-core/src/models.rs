@@ -1087,7 +1087,13 @@ pub struct SearchRequest {
     pub folder_id: Option<String>,
     pub person_ids: Option<Vec<String>>,
     #[serde(default)]
+    pub exclude_person_ids: Option<Vec<String>>,
+    #[serde(default)]
     pub has_people: Option<bool>,
+    #[serde(default)]
+    pub min_faces: Option<u32>,
+    #[serde(default)]
+    pub max_faces: Option<u32>,
     pub tags: Option<Vec<String>>,
     pub camera_model: Option<String>,
     #[serde(default)]
@@ -1113,7 +1119,11 @@ pub struct SearchRequest {
     #[serde(default)]
     pub sort_by: Option<String>,
     pub geo_query: Option<String>,
+    #[serde(default)]
+    pub exclude_geo_query: Option<String>,
     pub kind: Option<AssetKind>,
+    #[serde(default)]
+    pub exclude_kind: Option<AssetKind>,
     pub favorite: Option<bool>,
     pub date_from_ms: Option<i64>,
     pub date_to_ms: Option<i64>,
@@ -1420,7 +1430,11 @@ pub struct RouterPlan {
     pub ocr_terms: Option<String>,
     #[serde(default)]
     pub person_names: Vec<String>,
+    #[serde(default)]
+    pub exclude_person_names: Vec<String>,
     pub location_query: Option<String>,
+    #[serde(default)]
+    pub exclude_location_query: Option<String>,
     pub camera_model: Option<String>,
     #[serde(default)]
     pub lens_model: Option<String>,
@@ -1445,10 +1459,16 @@ pub struct RouterPlan {
     #[serde(default)]
     pub has_people: Option<bool>,
     #[serde(default)]
+    pub min_faces: Option<u32>,
+    #[serde(default)]
+    pub max_faces: Option<u32>,
+    #[serde(default)]
     pub sort_by: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub kind: Option<AssetKind>,
+    #[serde(default)]
+    pub exclude_kind: Option<AssetKind>,
     pub favorite: Option<bool>,
     pub date_from_ms: Option<i64>,
     pub date_to_ms: Option<i64>,
@@ -1549,6 +1569,10 @@ pub struct SendChatMessageRequest {
     pub content: String,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Client's local timezone offset from UTC in minutes (e.g. `-480` for PST, `+60` for CET)
+    /// so relative date queries like "today" and "yesterday" align with local wall-clock time.
+    #[serde(default)]
+    pub tz_offset_minutes: Option<i32>,
 }
 
 /// Response returned by `POST /api/chat/sessions/{id}/messages`.

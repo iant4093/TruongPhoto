@@ -179,6 +179,14 @@ impl AiCoordinator {
         );
     }
 
+    /// Returns the number of assets currently in active decode-failure backoff (pruning expired entries).
+    pub fn decode_backoff_len(&self) -> usize {
+        let now = Instant::now();
+        let mut map = self.decode_backoff.lock();
+        map.retain(|_, (_, until)| *until > now);
+        map.len()
+    }
+
     /// Clears any decode failure backoff entry once an asset decodes successfully.
     pub fn clear_decode_failure(&self, asset_id: &str) {
         self.decode_backoff.lock().remove(asset_id);

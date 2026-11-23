@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use truongphoto_core::{
     config::{ServerConfig, StoragePaths},
     models::{DesktopBootstrapInfo, PowerState},
@@ -42,7 +42,7 @@ impl ShutdownCoordinator {
         }))))
     }
 
-    fn shutdown_blocking(&self) {
+    pub(crate) async fn shutdown(&self) {
         let Some(mut handles) = self.0.lock().take() else {
             return;
         };
@@ -51,7 +51,26 @@ impl ShutdownCoordinator {
             power_monitor.stop();
         }
 
-        tauri::async_runtime::block_on(async move {
+        if let Some(server_handle) = handles.server_handle.take() {
+            server_handle.shutdown().await;
+        }
+        if let Some(db_handle) = handles.db_handle.take() {
+            if let Err(err) = db_handle.shutdown().await {
+                tracing::warn!(error = %err, "database shutdown failed");
+            }
+        }
+    }
+
+    pub(crate) fn shutdown_blocking(&self) {
+        let Some(mut handles) = self.0.lock().take() else {
+            return;
+        };
+
+        if let Some(power_monitor) = handles.power_monitor.take() {
+            power_monitor.stop();
+        }
+
+        let fut = async move {
             if let Some(server_handle) = handles.server_handle.take() {
                 server_handle.shutdown().await;
             }
@@ -60,7 +79,21 @@ impl ShutdownCoordinator {
                     tracing::warn!(error = %err, "database shutdown failed");
                 }
             }
-        });
+        };
+
+        // Never call `block_on` directly from within an active Tokio runtime thread
+        // (e.g. `tauri-plugin-updater`'s `on_before_exit` callback during `install_native_update`),
+        // which would panic and abort the process before NSIS launches.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = std::thread::Builder::new()
+                .name("tp-shutdown".into())
+                .spawn(move || {
+                    tauri::async_runtime::block_on(fut);
+                })
+                .map(|h| h.join());
+        } else {
+            tauri::async_runtime::block_on(fut);
+        }
     }
 }
 
@@ -207,6 +240,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .or_else(|| app.path().home_dir().ok().map(|h| h.join("Downloads")));
 
+    let last_download_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let dl_name_cb = Arc::clone(&last_download_name);
+
     let builder = tauri::WebviewWindowBuilder::new(app, "main", main_url)
         .title("TruongPhoto")
         .visible(false)
@@ -217,7 +253,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .shadow(true)
         .center()
         .theme(Some(tauri::Theme::Dark))
-        .on_download(move |_webview, event| match event {
+        .on_download(move |webview, event| match event {
             tauri::webview::DownloadEvent::Requested { url, destination } => {
                 if !tray::is_allowed_navigation_url(&url, bound_port) {
                     return false;
@@ -230,11 +266,34 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         .filter(|s| !s.trim().is_empty())
                         .unwrap_or("download.bin")
                         .to_string();
-                    *destination = unique_download_path(dl_dir, &suggested);
+                    let target = unique_download_path(dl_dir, &suggested);
+                    let final_name = target
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string)
+                        .unwrap_or(suggested);
+                    *dl_name_cb.lock() = Some(final_name);
+                    *destination = target;
                 }
                 true
             }
-            tauri::webview::DownloadEvent::Finished { .. } => true,
+            tauri::webview::DownloadEvent::Finished { path, success, .. } => {
+                let filename = path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                    .or_else(|| dl_name_cb.lock().take());
+                let _ = webview.emit(
+                    "desktop-download-finished",
+                    serde_json::json!({
+                        "success": success,
+                        "filename": filename,
+                        "path": path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                    }),
+                );
+                true
+            }
             _ => true,
         });
 

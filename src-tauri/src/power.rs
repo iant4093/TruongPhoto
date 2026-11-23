@@ -222,7 +222,8 @@ mod platform {
     use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Power::{
-        GetSystemPowerStatus, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
+        GetSystemPowerStatus, RegisterPowerSettingNotification, RegisterSuspendResumeNotification,
+        UnregisterPowerSettingNotification, UnregisterSuspendResumeNotification,
         POWERBROADCAST_SETTING, SYSTEM_POWER_STATUS,
     };
     use windows::Win32::System::RemoteDesktop::{
@@ -365,6 +366,15 @@ mod platform {
                     } else {
                         None
                     };
+                    let suspend_notify = if !stop.load(Ordering::Acquire) {
+                        RegisterSuspendResumeNotification(
+                            HANDLE(hwnd.0),
+                            REGISTER_NOTIFICATION_FLAGS(0),
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
                     if !stop.load(Ordering::Acquire) {
                         let mut msg = MSG::default();
                         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -372,6 +382,9 @@ mod platform {
                         }
                     }
                     WATCHER_HWND.store(0, Ordering::Release);
+                    if let Some(handle) = suspend_notify {
+                        let _ = UnregisterSuspendResumeNotification(handle);
+                    }
                     if let Some(handle) = power_notify {
                         let _ = UnregisterPowerSettingNotification(handle);
                     }

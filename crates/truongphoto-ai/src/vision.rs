@@ -108,13 +108,19 @@ impl OrtSiglip2Backend {
                     .encode(normalized_query, true)
                     .map_err(|e| AiError::Tokenizer(e.to_string()))?;
                 let row_offset = row_idx * SIGLIP2_MAX_SEQ_LEN;
-                for (i, &tok) in encoding
-                    .get_ids()
-                    .iter()
-                    .take(SIGLIP2_MAX_SEQ_LEN)
-                    .enumerate()
-                {
-                    input_ids[row_offset + i] = tok as i64;
+                let ids = encoding.get_ids();
+                if ids.len() <= SIGLIP2_MAX_SEQ_LEN {
+                    for (i, &tok) in ids.iter().enumerate() {
+                        input_ids[row_offset + i] = tok as i64;
+                    }
+                } else {
+                    for (i, &tok) in ids.iter().take(SIGLIP2_MAX_SEQ_LEN - 1).enumerate() {
+                        input_ids[row_offset + i] = tok as i64;
+                    }
+                    // Preserve trailing <eos> token when truncating long text prompts.
+                    if let Some(&last_tok) = ids.last() {
+                        input_ids[row_offset + SIGLIP2_MAX_SEQ_LEN - 1] = last_tok as i64;
+                    }
                 }
             }
 
@@ -196,8 +202,10 @@ impl OrtSiglip2Backend {
         }
 
         let tmp_path = cache_path.with_extension("bin.tmp");
-        if std::fs::write(&tmp_path, bytemuck::cast_slice(&flat)).is_ok() {
-            let _ = std::fs::rename(&tmp_path, &cache_path);
+        if std::fs::write(&tmp_path, bytemuck::cast_slice(&flat)).is_ok()
+            && truongphoto_core::process::rename_with_windows_retry(&tmp_path, &cache_path).is_err()
+        {
+            let _ = std::fs::remove_file(&tmp_path);
         }
 
         self.tag_bank_cache.write().insert(tier, entries.clone());
@@ -254,50 +262,38 @@ impl VisionBackend for OrtSiglip2Backend {
             return Ok(cached.clone());
         }
 
-        let tokenizer = self.get_or_load_tokenizer(tier)?;
-        let encoding = tokenizer
-            .encode(normalized_query, true)
-            .map_err(|e| AiError::Tokenizer(e.to_string()))?;
+        // SigLIP2 was pretrained with descriptive captions ("a photo of ..."). For concise queries
+        // not already framed, ensemble the framed prompt and raw query in a single batch=2 forward
+        // pass to boost cosine separation without sacrificing literal multi-word fidelity.
+        let already_framed = normalized_query.starts_with("a photo of ")
+            || normalized_query.starts_with("photo of ")
+            || normalized_query.starts_with("a picture of ")
+            || normalized_query.starts_with("picture of ")
+            || normalized_query.starts_with("an image of ")
+            || normalized_query.starts_with("image of ");
+        let word_count = normalized_query.split_whitespace().count();
 
-        let mut input_ids = vec![0i64; SIGLIP2_MAX_SEQ_LEN];
-        for (i, &tok) in encoding
-            .get_ids()
-            .iter()
-            .take(SIGLIP2_MAX_SEQ_LEN)
-            .enumerate()
-        {
-            input_ids[i] = tok as i64;
-        }
-
-        let model_path = model_dir(&self.models_dir, tier.vision_model_id())
-            .join("onnx")
-            .join("text_model_fp16.onnx");
-        let shape = [1usize, SIGLIP2_MAX_SEQ_LEN];
-        let dim = tier.dim();
-
-        let vec_out =
-            self.ort
-                .with_session(SessionKey::VisionText(tier), &model_path, |session| {
-                    let tensor = TensorRef::from_array_view((&shape[..], input_ids.as_slice()))
-                        .map_err(|e| AiError::Ort(e.to_string()))?;
-                    let outputs = session
-                        .run(ort::inputs!["input_ids" => tensor])
-                        .map_err(|e| AiError::Ort(e.to_string()))?;
-                    let value = outputs
-                        .get("pooler_output")
-                        .or_else(|| outputs.get("text_embeds"))
-                        .unwrap_or(&outputs[0]);
-                    let (_out_shape, data) = value
-                        .try_extract_tensor::<f32>()
-                        .map_err(|e| AiError::Ort(e.to_string()))?;
-                    if data.len() < dim {
-                        return Err(AiError::Ort(format!(
-                            "text output too short: expected >= {dim}, got {}",
-                            data.len()
-                        )));
-                    }
-                    Ok(l2_normalize(&data[..dim]))
-                })?;
+        let vec_out = if !already_framed && word_count > 0 && word_count <= 5 {
+            let framed = format!("a photo of {normalized_query}.");
+            let pair = self.embed_texts_batch(tier, &[framed, normalized_query.clone()])?;
+            if pair.len() == 2 {
+                let mut combined = vec![0.0f32; pair[0].len()];
+                for ((dst, &a), &b) in combined.iter_mut().zip(&pair[0]).zip(&pair[1]) {
+                    *dst = 0.65 * a + 0.35 * b;
+                }
+                l2_normalize(&combined)
+            } else {
+                pair.into_iter().next().unwrap_or_default()
+            }
+        } else {
+            let prompt = if already_framed || word_count == 0 {
+                normalized_query.clone()
+            } else {
+                format!("a photo of {normalized_query}.")
+            };
+            let single = self.embed_texts_batch(tier, &[prompt])?;
+            single.into_iter().next().unwrap_or_default()
+        };
 
         let mut cache = self.text_embed_cache.write();
         if cache.len() >= MAX_TEXT_EMBED_CACHE_ENTRIES {

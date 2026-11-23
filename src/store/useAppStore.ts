@@ -24,6 +24,7 @@ import {
   verifyServerPin,
 } from '../lib/api';
 import { getDesktopBootstrap, isTauri } from '../lib/tauri';
+import { useFeedback } from './feedback';
 import type {
   ActiveJobInfo,
   AdminUserView,
@@ -110,6 +111,8 @@ export interface AppState {
   chatSending: boolean;
   chatPendingStartedAt: number | null;
   chatLastReranked: boolean;
+  chatError: string | null;
+  chatFailedPrompt: string | null;
 
   setActiveNav: (nav: NavTab) => void;
   toggleInspector: () => void;
@@ -137,6 +140,8 @@ export interface AppState {
   selectChatSession: (sessionId: string) => Promise<void>;
   removeChatSession: (sessionId: string) => Promise<void>;
   sendChatPrompt: (content: string, limit?: number) => Promise<SendChatMessageResponse>;
+  abortChatPrompt: () => void;
+  clearChatError: () => void;
 
   bootstrap: () => Promise<void>;
   submitServerPin: (pin: string) => Promise<ProfileSummary[]>;
@@ -210,11 +215,21 @@ const initialDataState = {
   chatSending: false,
   chatPendingStartedAt: null as number | null,
   chatLastReranked: false,
+  chatError: null as string | null,
+  chatFailedPrompt: null as string | null,
 };
 
 let wsClient: WsClient | null = null;
 let searchSeq = 0;
 let chatSeq = 0;
+let chatAbortController: AbortController | null = null;
+
+function abortActiveChatRequest(): void {
+  if (chatAbortController) {
+    chatAbortController.abort();
+    chatAbortController = null;
+  }
+}
 
 const signedOutState = () => ({
   authenticated: false,
@@ -257,6 +272,8 @@ const signedOutState = () => ({
   chatSending: false,
   chatPendingStartedAt: null as number | null,
   chatLastReranked: false,
+  chatError: null as string | null,
+  chatFailedPrompt: null as string | null,
 });
 
 export function errorMessage(err: unknown): string {
@@ -511,8 +528,14 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     createNewChatSession: async (title) => {
+      abortActiveChatRequest();
       const seq = ++chatSeq;
-      set({ chatSending: false, chatPendingStartedAt: null });
+      set({
+        chatSending: false,
+        chatPendingStartedAt: null,
+        chatError: null,
+        chatFailedPrompt: null,
+      });
       const session = await createChatSession(title);
       if (seq === chatSeq) {
         set((state) => ({
@@ -523,14 +546,22 @@ export const useAppStore = create<AppState>((set, get) => {
           chatLastReranked: false,
           chatSending: false,
           chatPendingStartedAt: null,
+          chatError: null,
+          chatFailedPrompt: null,
         }));
       }
       return session;
     },
 
     selectChatSession: async (sessionId) => {
+      abortActiveChatRequest();
       const seq = ++chatSeq;
-      set({ chatSending: false, chatPendingStartedAt: null });
+      set({
+        chatSending: false,
+        chatPendingStartedAt: null,
+        chatError: null,
+        chatFailedPrompt: null,
+      });
       const detail = await getChatSession(sessionId);
       if (seq !== chatSeq) return;
       const lastAssistant = [...detail.messages]
@@ -543,12 +574,15 @@ export const useAppStore = create<AppState>((set, get) => {
         chatLastReranked: Boolean(lastAssistant?.reranked),
         chatSending: false,
         chatPendingStartedAt: null,
+        chatError: null,
+        chatFailedPrompt: null,
       });
     },
 
     removeChatSession: async (sessionId) => {
       const removingActive = get().activeChatSessionId === sessionId;
       if (removingActive) {
+        abortActiveChatRequest();
         chatSeq += 1;
       }
       await deleteChatSession(sessionId);
@@ -565,13 +599,32 @@ export const useAppStore = create<AppState>((set, get) => {
                 chatLastReranked: false,
                 chatSending: false,
                 chatPendingStartedAt: null,
+                chatError: null,
+                chatFailedPrompt: null,
               }
             : {}),
         };
       });
     },
 
+    abortChatPrompt: () => {
+      abortActiveChatRequest();
+      chatSeq += 1;
+      set((state) => ({
+        chatMessages: state.chatMessages.filter((m) => !m.id.startsWith('optimistic-user-')),
+        chatSending: false,
+        chatPendingStartedAt: null,
+        chatError: null,
+        chatFailedPrompt: null,
+      }));
+    },
+
+    clearChatError: () => set({ chatError: null, chatFailedPrompt: null }),
+
     sendChatPrompt: async (content, limit) => {
+      abortActiveChatRequest();
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      chatAbortController = controller;
       const seq = chatSeq;
       const nowMs = Date.now();
       const optimisticId = `optimistic-user-${nowMs}`;
@@ -591,6 +644,8 @@ export const useAppStore = create<AppState>((set, get) => {
       set((state) => ({
         chatSending: true,
         chatPendingStartedAt: nowMs,
+        chatError: null,
+        chatFailedPrompt: null,
         chatMessages: [...state.chatMessages, optimisticUserMsg],
       }));
 
@@ -614,7 +669,10 @@ export const useAppStore = create<AppState>((set, get) => {
           }));
         }
 
-        const res = await sendChatMessage(sessionId, content, limit);
+        const res = await sendChatMessage(sessionId, content, limit, controller?.signal);
+        if (chatAbortController === controller) {
+          chatAbortController = null;
+        }
         if (seq === chatSeq) {
           // Preserve stable React key from optimistic user bubble so it never remounts/re-animates on reply.
           const confirmedUserMsg = Object.assign({}, res.user_message, {
@@ -630,6 +688,8 @@ export const useAppStore = create<AppState>((set, get) => {
             chatLastReranked: res.reranked,
             chatSending: false,
             chatPendingStartedAt: null,
+            chatError: null,
+            chatFailedPrompt: null,
             chatSessions: state.chatSessions.map((s) =>
               s.id === sessionId
                 ? { ...s, updated_at_ms: res.assistant_message.created_at_ms }
@@ -639,11 +699,19 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         return res;
       } catch (err) {
+        if (chatAbortController === controller) {
+          chatAbortController = null;
+        }
+        const aborted =
+          (err instanceof DOMException && err.name === 'AbortError') ||
+          (err instanceof Error && err.name === 'AbortError');
         if (seq === chatSeq) {
           set((state) => ({
             chatMessages: state.chatMessages.filter((m) => m.id !== optimisticId),
             chatSending: false,
             chatPendingStartedAt: null,
+            chatError: aborted ? null : errorMessage(err),
+            chatFailedPrompt: aborted ? null : content,
           }));
         }
         throw err;
@@ -740,7 +808,9 @@ export const useAppStore = create<AppState>((set, get) => {
       } catch {
         // Ignore network errors during sign-out cleanup
       }
+      abortActiveChatRequest();
       get().disconnectWs();
+      useFeedback.getState().clearAll();
       searchSeq += 1;
       chatSeq += 1;
       set(signedOutState());
@@ -932,13 +1002,16 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     handleUnauthorized: () => {
+      abortActiveChatRequest();
       get().disconnectWs();
+      useFeedback.getState().clearAll();
       searchSeq += 1;
       chatSeq += 1;
       set(signedOutState());
     },
 
     resetForTest: () => {
+      abortActiveChatRequest();
       setUnauthorizedHandler(null);
       searchSeq += 1;
       chatSeq += 1;

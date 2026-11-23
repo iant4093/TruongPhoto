@@ -25,10 +25,17 @@ use truongphoto_core::{ChatRole, ChatTier, RouterPlan};
 #[derive(Debug, Clone, Default)]
 pub struct LibraryChatContext {
     pub total_assets: i64,
+    pub favorite_count: i64,
+    pub kind_counts: Vec<(String, i64)>,
     pub date_range: Option<(String, String)>,
     pub known_folders: Vec<String>,
     pub top_tags: Vec<String>,
     pub person_counts: Vec<(String, i64)>,
+    pub camera_counts: Vec<(String, i64)>,
+    pub lens_counts: Vec<(String, i64)>,
+    pub top_places: Vec<(String, i64)>,
+    pub year_counts: Vec<(String, i64)>,
+    pub top_months: Vec<(String, i64)>,
 }
 
 /// Context passed into [`ChatRouterBackend::route_turn`] for multi-turn query routing.

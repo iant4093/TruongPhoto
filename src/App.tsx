@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { LogOut, Search, Upload, UploadCloud, X } from 'lucide-react';
-import { ContextMenuHost } from './components/ContextMenu';
+import { ContextMenuHost, useContextMenuStore } from './components/ContextMenu';
 import { FeedbackHost } from './components/Feedback';
 import { InspectorDrawer } from './components/InspectorDrawer';
 import { Lightbox } from './components/Lightbox';
@@ -21,7 +21,7 @@ import { SetupWizardView } from './components/views/SetupWizardView';
 import { TimelineView } from './components/views/TimelineView';
 import { TrashView } from './components/views/TrashView';
 import { isTauri } from './lib/tauri';
-import { notifyError } from './store/feedback';
+import { notifyError, notifySuccess } from './store/feedback';
 import { useAppStore } from './store/useAppStore';
 import type { NavTab } from './types/api';
 
@@ -57,9 +57,28 @@ const SearchOmnibar: React.FC<{
       className="omnibar"
       onSubmit={(e) => {
         e.preventDefault();
-        void runSearch({ query: searchQuery.trim() || null, offset: 0 }).catch((err) =>
-          notifyError(err, 'Search failed'),
-        );
+        void runSearch({
+          query: searchQuery.trim() || null,
+          ocr_query: undefined,
+          exclude_person_ids: undefined,
+          has_people: undefined,
+          min_faces: undefined,
+          max_faces: undefined,
+          lens_model: undefined,
+          focal_length_min_mm: undefined,
+          focal_length_max_mm: undefined,
+          aperture_min_f: undefined,
+          aperture_max_f: undefined,
+          iso_min: undefined,
+          iso_max: undefined,
+          shutter_speed_min_sec: undefined,
+          shutter_speed_max_sec: undefined,
+          orientation: undefined,
+          sort_by: undefined,
+          exclude_geo_query: undefined,
+          exclude_kind: undefined,
+          offset: 0,
+        }).catch((err) => notifyError(err, 'Search failed'));
       }}
     >
       <label className="omnibar-field" aria-label="Search library">
@@ -161,6 +180,49 @@ export const App: React.FC = () => {
     void bootstrap();
   }, [bootstrap]);
 
+  // Clear local UI state (dropped files, context menus) when signed out or session expires.
+  useEffect(() => {
+    if (!authenticated) {
+      setDroppedFiles([]);
+      setWindowDragActive(false);
+      dragDepthRef.current = 0;
+      useContextMenuStore.getState().close();
+    }
+  }, [authenticated]);
+
+  // Surface a native toast when a desktop "Download Original" transfer finishes.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    let active = true;
+    void import('@tauri-apps/api/event')
+      .then(({ listen }) =>
+        listen<{ success: boolean; filename?: string | null; path?: string | null }>(
+          'desktop-download-finished',
+          (event) => {
+            if (!active) return;
+            const { success, filename } = event.payload ?? { success: false };
+            if (success) {
+              notifySuccess(
+                filename ? `Saved ${filename} to Downloads` : 'Download saved to Downloads',
+              );
+            } else {
+              notifyError('Could not complete file download.');
+            }
+          },
+        ),
+      )
+      .then((fn) => {
+        if (active) unlisten = fn;
+        else fn();
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
   // '/' focuses Omnibar when not typing in a control; Cmd/Ctrl+K jumps to Ask AI workspace.
   useEffect(() => {
     if (!authenticated) return;
@@ -227,7 +289,7 @@ export const App: React.FC = () => {
   if (bootstrapping) {
     return (
       <div
-        className={`auth-viewport${macDesktop ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
+        className={`app-window-frame auth-viewport${macDesktop ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
         data-tauri-drag-region
       >
         {winDesktop && (
@@ -249,7 +311,7 @@ export const App: React.FC = () => {
   if (bootstrapError && !authenticated) {
     return (
       <div
-        className={`auth-viewport${macDesktop ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
+        className={`app-window-frame auth-viewport${macDesktop ? ' native-titlebar' : ''}${winDesktop ? ' windows-caption' : ''}`}
         data-tauri-drag-region
       >
         {winDesktop && (

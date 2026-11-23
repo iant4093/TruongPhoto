@@ -7,13 +7,21 @@ use std::sync::Arc;
 use std::time::Instant;
 use truongphoto_ai::{collapse_video_keyframes, overfetch_k, AiError, KeyframeHit};
 use truongphoto_core::{
-    AssetSummary, PlannerMode, RbacScope, SearchHit, SearchMode, SearchRequest, SearchResponse,
+    AiTier, AssetSummary, PlannerMode, RbacScope, SearchHit, SearchMode, SearchRequest,
+    SearchResponse,
 };
 use truongphoto_db::repo;
 
 const DEFAULT_LIMIT: usize = 60;
 const MAX_LIMIT: usize = 500;
-const MIN_SEMANTIC_SCORE: f32 = 0.08;
+
+fn tier_min_semantic_score(tier: AiTier) -> f32 {
+    match tier {
+        AiTier::Tier1 => 0.075,
+        AiTier::Tier2 => 0.085,
+        AiTier::Tier3 => 0.090,
+    }
+}
 
 struct PendingHit {
     asset_id: String,
@@ -64,6 +72,17 @@ fn compare_sort_keys(
     };
 
     let primary = match sort_by {
+        "best" => match (ka, kb) {
+            (Some(a), Some(b)) => b
+                .is_favorite
+                .cmp(&a.is_favorite)
+                .then_with(|| b.rating.cmp(&a.rating))
+                .then_with(|| cmp_opt_f64(a.aperture_f, b.aperture_f, true))
+                .then_with(|| b.capture_at_ms.cmp(&a.capture_at_ms)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
         "capture_desc" => match (ka, kb) {
             (Some(a), Some(b)) => b.capture_at_ms.cmp(&a.capture_at_ms),
             (Some(_), None) => Ordering::Less,
@@ -87,6 +106,7 @@ fn compare_sort_keys(
             false,
         ),
         "iso_desc" => cmp_opt_i64(ka.and_then(|k| k.iso), kb.and_then(|k| k.iso), false),
+        "iso_asc" => cmp_opt_i64(ka.and_then(|k| k.iso), kb.and_then(|k| k.iso), true),
         "aperture_asc" => cmp_opt_f64(
             ka.and_then(|k| k.aperture_f),
             kb.and_then(|k| k.aperture_f),
@@ -100,6 +120,11 @@ fn compare_sort_keys(
         "shutter_desc" => cmp_opt_f64(
             ka.and_then(|k| k.shutter_speed_sec),
             kb.and_then(|k| k.shutter_speed_sec),
+            false,
+        ),
+        "duration_desc" => cmp_opt_i64(
+            ka.and_then(|k| k.duration_ms),
+            kb.and_then(|k| k.duration_ms),
             false,
         ),
         _ => Ordering::Equal,
@@ -215,10 +240,16 @@ fn validate_search_request(req: &SearchRequest) -> Result<(), AppError> {
     {
         if !matches!(
             orient.to_ascii_lowercase().as_str(),
-            "portrait" | "vertical" | "landscape" | "horizontal" | "square"
+            "portrait"
+                | "vertical"
+                | "landscape"
+                | "horizontal"
+                | "square"
+                | "panorama"
+                | "panoramic"
         ) {
             return Err(AppError::validation(
-                "orientation must be portrait, landscape, or square.",
+                "orientation must be portrait, landscape, square, or panorama.",
             ));
         }
     }
@@ -230,14 +261,17 @@ fn validate_search_request(req: &SearchRequest) -> Result<(), AppError> {
     {
         if !matches!(
             sort.to_ascii_lowercase().as_str(),
-            "capture_desc"
+            "best"
+                | "capture_desc"
                 | "capture_asc"
                 | "focal_asc"
                 | "focal_desc"
                 | "iso_desc"
+                | "iso_asc"
                 | "aperture_asc"
                 | "shutter_asc"
                 | "shutter_desc"
+                | "duration_desc"
         ) {
             return Err(AppError::validation("unsupported sort_by value."));
         }
@@ -474,9 +508,25 @@ pub(crate) async fn execute_hybrid_search(
     // visual matches (>= 0.12).
     const META_SEMANTIC_EXTRA_MIN_SCORE: f32 = 0.12;
 
+    let tier_min = tier_min_semantic_score(active_tier);
+    let top_semantic_score = collapsed.first().map(|h| h.score).unwrap_or(0.0);
+    // Dynamic relative cutoff trims low-relevance tail noise on larger vision tiers (Large/SO400M)
+    // when strong visual matches exist, while always keeping at least the top 3 hits above `tier_min`.
+    let relative_floor = if top_semantic_score >= 0.14 {
+        tier_min
+            .max(top_semantic_score * 0.62)
+            .max(top_semantic_score - 0.065)
+    } else {
+        tier_min
+    };
+
     let mut by_asset: HashMap<String, PendingHit> = HashMap::new();
+    let mut kept_semantic = 0usize;
     for hit in collapsed {
-        if hit.score <= MIN_SEMANTIC_SCORE {
+        if hit.score <= tier_min {
+            continue;
+        }
+        if kept_semantic >= 3 && hit.score < relative_floor {
             continue;
         }
         if has_meta_hits
@@ -485,6 +535,7 @@ pub(crate) async fn execute_hybrid_search(
         {
             continue;
         }
+        kept_semantic += 1;
         let pct = (hit.score.clamp(0.0, 1.0) * 100.0).round() as i32;
         by_asset.insert(
             hit.asset_id.clone(),

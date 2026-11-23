@@ -31,6 +31,7 @@ interface FeedbackState {
   dismiss: (id: number) => void;
   ask: (request: Omit<ConfirmRequest, 'id' | 'resolve'>) => Promise<boolean>;
   answer: (ok: boolean) => void;
+  clearAll: () => void;
 }
 
 let nextId = 1;
@@ -57,6 +58,11 @@ export const useFeedback = create<FeedbackState>((set, get) => ({
     const current = get().confirm;
     set({ confirm: null });
     current?.resolve(ok);
+  },
+  clearAll: () => {
+    const current = get().confirm;
+    set({ toasts: [], confirm: null });
+    current?.resolve(false);
   },
 }));
 

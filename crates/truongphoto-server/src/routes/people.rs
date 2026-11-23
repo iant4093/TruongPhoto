@@ -53,11 +53,24 @@ fn atomic_write_bytes_sync(dest: &Path, bytes: &[u8]) -> Result<(), std::io::Err
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     std::io::Write::write_all(&mut tmp, bytes)?;
     std::io::Write::flush(&mut tmp)?;
-    tmp.persist(dest).map_err(|e| e.error)?;
-    Ok(())
+    match tmp.persist(dest) {
+        Ok(_) => Ok(()),
+        Err(persist_err) => {
+            let tmp_path = persist_err
+                .file
+                .into_temp_path()
+                .keep()
+                .map_err(|k| k.error)?;
+            let res = truongphoto_core::process::rename_with_windows_retry(&tmp_path, dest);
+            if res.is_err() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            res
+        }
+    }
 }
 
-fn recompute_person_centroid(
+pub(crate) fn recompute_person_centroid(
     conn: &Connection,
     faces_index: &HybridVectorIndex,
     person_id: &str,
@@ -202,6 +215,7 @@ pub async fn get_face_thumb(
 
             let bbox = (src.bbox_x, src.bbox_y, src.bbox_w, src.bbox_h);
             let dest_clone = cache_path.clone();
+            let _decode_permit = state.cache_mgr.acquire_image_decode_permit().await;
             tokio::task::spawn_blocking(move || {
                 let rgb = decode_image_to_srgb(&img_path).map_err(|e| {
                     AppError::internal(format!("Failed to decode face source: {e}"))

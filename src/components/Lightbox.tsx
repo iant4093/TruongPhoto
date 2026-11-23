@@ -138,6 +138,7 @@ export const Lightbox: React.FC = () => {
 
   // Stacked zero-flash media readiness state
   const [previewLoadedUrl, setPreviewLoadedUrl] = useState<string | null>(null);
+  const [underlayDismissedUrl, setUnderlayDismissedUrl] = useState<string | null>(null);
   const [readyOverlayUrl, setReadyOverlayUrl] = useState<string | null>(null);
   const [overlayVisible, setOverlayVisible] = useState(false);
   const [hiResLoading, setHiResLoading] = useState(false);
@@ -156,9 +157,15 @@ export const Lightbox: React.FC = () => {
   const zoomRef = useRef(1);
   const panRef = useRef({ x: 0, y: 0 });
   const readyOverlayUrlRef = useRef<string | null>(null);
+  const infoOpenRef = useRef(false);
+  const closeLightboxRef = useRef(closeLightbox);
+  const lastTouchDoubleTapAtRef = useRef(0);
+  const touchLongPressLiveRef = useRef(false);
   zoomRef.current = zoom;
   panRef.current = pan;
   readyOverlayUrlRef.current = readyOverlayUrl;
+  infoOpenRef.current = infoOpen;
+  closeLightboxRef.current = closeLightbox;
 
   // Touch & pointer gesture tracking
   const gestureRef = useRef<{
@@ -289,7 +296,9 @@ export const Lightbox: React.FC = () => {
     setReadyOverlayUrl(null);
     setOverlayVisible(false);
     setHiResLoading(false);
-    setPreviewLoadedUrl(decodedUrlSet.has(nextPreview) ? nextPreview : null);
+    const alreadyDecoded = decodedUrlSet.has(nextPreview);
+    setPreviewLoadedUrl(alreadyDecoded ? nextPreview : null);
+    setUnderlayDismissedUrl(alreadyDecoded ? nextPreview : null);
 
     if (cached) {
       setDetail(cached);
@@ -416,7 +425,7 @@ export const Lightbox: React.FC = () => {
   const togglePixelPeepZoom = useCallback(() => {
     setAnimateZoom(true);
     setZoom((prev) => {
-      if (prev > 1.05) {
+      if (prev > 1.02) {
         setPan({ x: 0, y: 0 });
         return 1;
       }
@@ -424,20 +433,36 @@ export const Lightbox: React.FC = () => {
     });
   }, []);
 
-  // Escape layer + Lightbox keyboard shortcuts
+  // Dedicated Escape layer effect keyed ONLY on open/closed state so detail fetches or Info drawer
+  // toggles never re-register the Lightbox layer above open ContextMenus or confirm dialogs.
+  const isLightboxOpen = Boolean(lightboxAssetId);
   useEffect(() => {
-    if (!lightboxAssetId) return;
+    if (!isLightboxOpen) return;
     const layer = pushEscapeLayer();
-
-    const onKeyDown = (event: KeyboardEvent) => {
+    const onEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && isTopEscapeLayer(layer)) {
         event.preventDefault();
         event.stopPropagation();
-        if (infoOpen) {
+        if (infoOpenRef.current) {
           setInfoOpen(false);
         } else {
-          closeLightbox();
+          closeLightboxRef.current();
         }
+      }
+    };
+    document.addEventListener('keydown', onEscape);
+    return () => {
+      document.removeEventListener('keydown', onEscape);
+      popEscapeLayer(layer);
+    };
+  }, [isLightboxOpen]);
+
+  // Lightbox keyboard shortcuts
+  useEffect(() => {
+    if (!lightboxAssetId) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
         return;
       }
 
@@ -498,7 +523,11 @@ export const Lightbox: React.FC = () => {
           setAnimateZoom(true);
           setZoom((prev) => {
             const next = Math.max(1, Number((prev - 0.5).toFixed(2)));
-            if (next === 1) setPan({ x: 0, y: 0 });
+            if (next <= 1.02) {
+              setPan({ x: 0, y: 0 });
+              return 1;
+            }
+            setPan((p) => clampPan(p.x, p.y, next));
             return next;
           });
           break;
@@ -509,21 +538,24 @@ export const Lightbox: React.FC = () => {
           setPan({ x: 0, y: 0 });
           break;
         case ' ': {
-          const videoEl = stageRef.current?.querySelector('video');
-          if (videoEl) {
-            event.preventDefault();
-            if (videoEl.paused) void videoEl.play().catch(() => {});
-            else videoEl.pause();
-          } else if (
+          const isLivePhoto = Boolean(
             activeDetail?.playback.live_video_url ||
-            activeDetail?.summary.kind === 'live_photo' ||
-            activeDetail?.summary.kind === 'motion_photo'
-          ) {
+              activeDetail?.summary.kind === 'live_photo' ||
+              activeDetail?.summary.kind === 'motion_photo',
+          );
+          if (isLivePhoto) {
             event.preventDefault();
             setLivePlaying((prev) => {
               if (prev) setLiveVideoReady(false);
               return !prev;
             });
+            break;
+          }
+          const videoEl = stageRef.current?.querySelector('video');
+          if (videoEl) {
+            event.preventDefault();
+            if (videoEl.paused) void videoEl.play().catch(() => {});
+            else videoEl.pause();
           }
           break;
         }
@@ -533,16 +565,14 @@ export const Lightbox: React.FC = () => {
     document.addEventListener('keydown', onKeyDown);
     return () => {
       document.removeEventListener('keydown', onKeyDown);
-      popEscapeLayer(layer);
     };
   }, [
     activeDetail,
-    closeLightbox,
+    clampPan,
     currentIndex,
     goNext,
     goPrev,
     handleToggleFavorite,
-    infoOpen,
     lightboxAssetId,
     lightboxAssetIds,
     navigateWithSlide,
@@ -592,7 +622,7 @@ export const Lightbox: React.FC = () => {
   // and fades it in smoothly ONLY after load + decode(). Stays mounted on zoom-out so zooming
   // in and out never swaps src or flashes!
   const wantsOverlay = Boolean(
-    lightboxAssetId && !isVideo && fullResUrl && (rawDemosaic || zoom > 1.05),
+    lightboxAssetId && !isVideo && fullResUrl && (rawDemosaic || zoom > 1.02),
   );
 
   useEffect(() => {
@@ -671,7 +701,8 @@ export const Lightbox: React.FC = () => {
   const previewUrl = activeDetail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId);
   const thumbUrl = mediaThumbUrl(lightboxAssetId);
   const previewIsReady = previewLoadedUrl === previewUrl || decodedUrlSet.has(previewUrl);
-  const usingHiRes = Boolean(readyOverlayUrl && overlayVisible && (rawDemosaic || zoom > 1.05));
+  const showUnderlay = !previewIsReady || underlayDismissedUrl !== previewUrl;
+  const usingHiRes = Boolean(readyOverlayUrl && overlayVisible && (rawDemosaic || zoom > 1.02));
   const liveVideoUrl = activeDetail?.playback.live_video_url ?? mediaLiveVideoUrl(lightboxAssetId);
 
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
@@ -688,6 +719,7 @@ export const Lightbox: React.FC = () => {
       const now = Date.now();
       if (now - gestureRef.current.lastTapAt < 300) {
         gestureRef.current.lastTapAt = 0;
+        lastTouchDoubleTapAtRef.current = now;
         togglePixelPeepZoom();
         return;
       }
@@ -699,6 +731,7 @@ export const Lightbox: React.FC = () => {
       gestureRef.current.pinchStartDist = null;
       if (hasLiveClip && !isVideo) {
         gestureRef.current.longPressTimer = window.setTimeout(() => {
+          touchLongPressLiveRef.current = true;
           setLiveVideoReady(false);
           setLivePlaying(true);
         }, 420);
@@ -714,10 +747,14 @@ export const Lightbox: React.FC = () => {
       const scaleFactor = dist / gestureRef.current.pinchStartDist;
       const nextZoom = Math.min(4, Math.max(1, gestureRef.current.pinchStartZoom * scaleFactor));
       setZoom(nextZoom);
-      if (nextZoom <= 1.02) setPan({ x: 0, y: 0 });
+      if (nextZoom <= 1.02) {
+        setPan({ x: 0, y: 0 });
+      } else {
+        setPan((p) => clampPan(p.x, p.y, nextZoom));
+      }
       return;
     }
-    if (e.touches.length === 1 && zoom > 1) {
+    if (e.touches.length === 1 && zoom > 1.02) {
       setAnimateZoom(false);
       const t = e.touches[0];
       const dx = t.clientX - gestureRef.current.startX;
@@ -728,6 +765,12 @@ export const Lightbox: React.FC = () => {
 
   const handleTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
     clearLongPress();
+    if (touchLongPressLiveRef.current) {
+      touchLongPressLiveRef.current = false;
+      setLivePlaying(false);
+      setLiveVideoReady(false);
+      return;
+    }
     if (gestureRef.current.pinchStartDist !== null || gestureRef.current.wasPinching) {
       gestureRef.current.pinchStartDist = null;
       if (e.touches.length === 0) {
@@ -735,7 +778,7 @@ export const Lightbox: React.FC = () => {
       }
       return;
     }
-    if (zoom === 1 && e.changedTouches.length === 1) {
+    if (zoom <= 1.02 && e.changedTouches.length === 1) {
       const t = e.changedTouches[0];
       const dx = t.clientX - gestureRef.current.startX;
       const dy = t.clientY - gestureRef.current.startY;
@@ -748,6 +791,11 @@ export const Lightbox: React.FC = () => {
 
   const handleTouchCancel = () => {
     clearLongPress();
+    if (touchLongPressLiveRef.current) {
+      touchLongPressLiveRef.current = false;
+      setLivePlaying(false);
+      setLiveVideoReady(false);
+    }
     gestureRef.current.pinchStartDist = null;
     gestureRef.current.wasPinching = false;
   };
@@ -759,7 +807,7 @@ export const Lightbox: React.FC = () => {
     gestureRef.current.startY = e.clientY;
     gestureRef.current.startPanX = pan.x;
     gestureRef.current.startPanY = pan.y;
-    if (zoom > 1.05) {
+    if (zoom > 1.02) {
       setAnimateZoom(false);
       gestureRef.current.dragging = true;
       setIsDragging(true);
@@ -767,7 +815,7 @@ export const Lightbox: React.FC = () => {
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!gestureRef.current.dragging || zoom <= 1.05) return;
+    if (!gestureRef.current.dragging || zoom <= 1.02) return;
     const dx = e.clientX - gestureRef.current.startX;
     const dy = e.clientY - gestureRef.current.startY;
     if (Math.hypot(dx, dy) > 4) {
@@ -783,12 +831,15 @@ export const Lightbox: React.FC = () => {
 
   const handleImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
     if (isVideo) return;
+    if (Date.now() - lastTouchDoubleTapAtRef.current < 380) {
+      return;
+    }
     if (gestureRef.current.didDrag) {
       gestureRef.current.didDrag = false;
       return;
     }
     setAnimateZoom(true);
-    if (zoom > 1.05) {
+    if (zoom > 1.02) {
       setZoom(1);
       setPan({ x: 0, y: 0 });
       return;
@@ -1097,6 +1148,12 @@ export const Lightbox: React.FC = () => {
             >
               <div className="lightbox-zoom-surface">
                 <img
+                  className="lightbox-media lightbox-media-underlay"
+                  src={exitingSlide.thumbUrl}
+                  alt=""
+                  draggable={false}
+                />
+                <img
                   className="lightbox-media"
                   src={exitingSlide.previewUrl}
                   alt=""
@@ -1130,8 +1187,8 @@ export const Lightbox: React.FC = () => {
                     : 'none',
                 }}
               >
-                {/* Instant cached grid thumbnail underlay so rapid navigation never cuts to black */}
-                {!previewIsReady && (
+                {/* Instant cached grid thumbnail underlay stays mounted until preview fade finishes */}
+                {showUnderlay && (
                   <img
                     className="lightbox-media lightbox-media-underlay"
                     src={thumbUrl}
@@ -1152,13 +1209,24 @@ export const Lightbox: React.FC = () => {
                   onClick={handleImageClick}
                   onLoad={(e) => {
                     const el = e.currentTarget;
-                    if (el.naturalWidth > 0) {
+                    if (el.naturalWidth <= 0) return;
+                    const reveal = () => {
                       decodedUrlSet.add(previewUrl);
                       setPreviewLoadedUrl(previewUrl);
+                    };
+                    if (typeof el.decode === 'function') {
+                      el.decode().then(reveal, reveal);
+                    } else {
+                      reveal();
+                    }
+                  }}
+                  onTransitionEnd={(e) => {
+                    if (e.propertyName === 'opacity' && previewIsReady) {
+                      setUnderlayDismissedUrl(previewUrl);
                     }
                   }}
                   style={{
-                    cursor: zoom > 1.05 ? (isDragging ? 'grabbing' : 'grab') : 'zoom-in',
+                    cursor: zoom > 1.02 ? (isDragging ? 'grabbing' : 'grab') : 'zoom-in',
                     opacity: previewIsReady ? 1 : 0,
                     transition: 'opacity 140ms ease-out',
                   }}

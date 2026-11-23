@@ -318,7 +318,11 @@ async fn process_staging_tier_batch(
     cache_dir: &Path,
     max_assets: usize,
 ) -> Result<usize, anyhow::Error> {
-    let fetch_limit = max_assets.saturating_mul(4).max(32);
+    let backed_off_count = state.ai.decode_backoff_len();
+    let fetch_limit = max_assets
+        .saturating_add(backed_off_count)
+        .saturating_mul(2)
+        .clamp(32, 4096);
     let (raw_asset_ids, queue_stats) = state
         .db
         .read(move |conn| {
@@ -336,6 +340,7 @@ async fn process_staging_tier_batch(
 
     let mut processed = 0usize;
     let total_staging = queue_stats.staging_remaining;
+    let mut engine_unavailable = false;
 
     if !asset_ids.is_empty() {
         let staging_idx = state.ai.vision_index(staging_tier)?;
@@ -380,7 +385,7 @@ async fn process_staging_tier_batch(
             let kind = summary.kind;
             let preview_path = cached_preview_path(cache_dir, &asset_id);
             enum StagingInferOutcome {
-                Ready(Vec<(i64, Vec<f32>)>),
+                Ready(Vec<(i64, Vec<f32>)>, Vec<(String, f64)>),
                 DecodeSkipped,
                 EngineUnavailable,
             }
@@ -411,14 +416,24 @@ async fn process_staging_tier_batch(
                         Err(e) => return Err(e),
                     }
                 }
-                Ok(StagingInferOutcome::Ready(vecs))
+                let tags: Vec<(String, f64)> = if let Some((_, first_vec)) = vecs.first() {
+                    pipe.vision
+                        .score_zero_shot_tags(staging_tier, first_vec)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(t, c)| (t, f64::from(c)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(StagingInferOutcome::Ready(vecs, tags))
             })
             .await??;
 
-            let vision_vecs = match inferred {
-                StagingInferOutcome::Ready(v) => {
+            let (vision_vecs, staging_tags) = match inferred {
+                StagingInferOutcome::Ready(v, tags) => {
                     state.ai.clear_decode_failure(&asset_id);
-                    v
+                    (v, tags)
                 }
                 StagingInferOutcome::DecodeSkipped => {
                     state.ai.record_decode_failure(&asset_id);
@@ -426,6 +441,7 @@ async fn process_staging_tier_batch(
                 }
                 StagingInferOutcome::EngineUnavailable => {
                     // Vision model not installed or ORT unavailable; do not cut over prematurely.
+                    engine_unavailable = true;
                     break;
                 }
             };
@@ -456,6 +472,15 @@ async fn process_staging_tier_batch(
                         )?;
                         assigned.push((next_vid, vec));
                         next_vid = next_vid.saturating_add(1);
+                    }
+                    if !staging_tags.is_empty() {
+                        repo::ai::insert_ai_tags_ignoring_rejected(
+                            tx,
+                            &aid_write,
+                            &staging_tags,
+                            staging_tier.vision_model_id(),
+                            now_ms,
+                        )?;
                     }
                     *outbox_tx.lock() = Some((old_ids, assigned));
                     Ok(())
@@ -490,17 +515,33 @@ async fn process_staging_tier_batch(
         }
     }
 
-    let remaining = state
+    let remaining_now = state
         .db
         .read(move |conn| {
-            Ok(
-                repo::ai::count_ai_queue_stats(conn, active_tier, Some(staging_tier))?
-                    .staging_remaining,
-            )
+            let stats = repo::ai::count_ai_queue_stats(conn, active_tier, Some(staging_tier))?;
+            let rem_ids = if stats.staging_remaining > 0 && stats.staging_remaining <= 512 {
+                repo::ai::list_assets_needing_staging_tier(
+                    conn,
+                    staging_tier,
+                    stats.staging_remaining as usize,
+                )?
+            } else {
+                Vec::new()
+            };
+            Ok((stats.staging_remaining, rem_ids))
         })
         .await?;
 
-    if remaining == 0 {
+    let all_remaining_unindexable = !engine_unavailable
+        && remaining_now.0 > 0
+        && !remaining_now.1.is_empty()
+        && remaining_now.1.len() as u64 == remaining_now.0
+        && remaining_now
+            .1
+            .iter()
+            .all(|id| state.ai.is_decode_backed_off(id));
+
+    if remaining_now.0 == 0 || all_remaining_unindexable {
         // Persist/compact the staging HNSW base index before cutting over so the new active tier
         // immediately survives restarts and serves HNSW queries cleanly.
         if let Ok(staging_idx) = state.ai.vision_index(staging_tier) {
@@ -540,7 +581,11 @@ async fn process_active_stage2_batch(
     cache_dir: &Path,
     max_assets: usize,
 ) -> Result<usize, anyhow::Error> {
-    let fetch_limit = max_assets.saturating_mul(4).max(32);
+    let backed_off_count = state.ai.decode_backoff_len();
+    let fetch_limit = max_assets
+        .saturating_add(backed_off_count)
+        .saturating_mul(2)
+        .clamp(32, 4096);
     let (raw_asset_ids, raw_centroids, queue_stats) = state
         .db
         .read(move |conn| {
@@ -1078,7 +1123,9 @@ pub fn spawn_ai_background_tasks(state: Arc<AppState>) -> Vec<JoinHandle<()>> {
                     Ok(n) => {
                         processed_since_cluster += n;
                         if processed_since_cluster >= 48 {
+                            let _guard = worker_state.ai.worker_lock.lock().await;
                             let _ = run_face_clustering(&worker_state).await;
+                            drop(_guard);
                             processed_since_cluster = 0;
                         }
                         if throttle.active && throttle.reason.as_deref() == Some("high_cpu") {
@@ -1099,6 +1146,7 @@ pub fn spawn_ai_background_tasks(state: Arc<AppState>) -> Vec<JoinHandle<()>> {
                 }
             }
             if processed_since_cluster > 0 && !worker_state.shutdown_token.is_cancelled() {
+                let _guard = worker_state.ai.worker_lock.lock().await;
                 let _ = run_face_clustering(&worker_state).await;
             }
         }

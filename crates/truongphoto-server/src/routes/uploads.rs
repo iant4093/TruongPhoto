@@ -273,12 +273,10 @@ async fn resolve_upload_target_folder(
             let vol = tokio::task::spawn_blocking(move || resolve_volume_identity(&root_probe))
                 .await
                 .map_err(|e| AppError::internal(format!("Volume lookup panicked: {e}")))?;
-            if let Some(ref actual_uuid) = vol.volume_uuid {
-                if actual_uuid != expected_uuid {
-                    return Err(AppError::validation(
-                        "Target folder volume does not match the registered drive.",
-                    ));
-                }
+            if vol.volume_uuid.as_deref() != Some(expected_uuid.as_str()) {
+                return Err(AppError::validation(
+                    "Target folder volume does not match the registered drive.",
+                ));
             }
         }
         return Ok(folder);
@@ -341,7 +339,7 @@ async fn resolve_upload_target_folder(
 
     state
         .watcher
-        .watch_folder(state, folder.id.clone(), PathBuf::from(&folder.root_path));
+        .ensure_watched(state, folder.id.clone(), PathBuf::from(&folder.root_path));
 
     Ok(folder)
 }

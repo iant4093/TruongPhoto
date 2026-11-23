@@ -24,9 +24,31 @@ use truongphoto_db::{repo, DbError};
 
 const DEFAULT_CHAT_LIMIT: usize = 60;
 const MAX_CHAT_LIMIT: usize = 500;
-const MAX_VLM_RERANK_CANDIDATES: usize = 8;
+const MAX_VLM_RERANK_CANDIDATES: usize = 10;
 const RECENT_TURNS_WINDOW: usize = 6;
 const UNMATCHED_PERSON_SENTINEL: &str = "__unmatched_person__";
+
+fn levenshtein_ascii_ci(a: &str, b: &str) -> usize {
+    let a_bytes: Vec<u8> = a.bytes().map(|c| c.to_ascii_lowercase()).collect();
+    let b_bytes: Vec<u8> = b.bytes().map(|c| c.to_ascii_lowercase()).collect();
+    if a_bytes.is_empty() {
+        return b_bytes.len();
+    }
+    if b_bytes.is_empty() {
+        return a_bytes.len();
+    }
+    let mut prev: Vec<usize> = (0..=b_bytes.len()).collect();
+    let mut curr = vec![0usize; b_bytes.len() + 1];
+    for (i, &ac) in a_bytes.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bc) in b_bytes.iter().enumerate() {
+            let cost = usize::from(ac != bc);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_bytes.len()]
+}
 
 #[derive(Debug, Serialize)]
 pub struct ChatSessionListResponse {
@@ -114,8 +136,63 @@ fn resolve_rbac_people(
                 ambiguous.push((trimmed.to_string(), candidates));
                 None
             } else {
-                unmatched.push(trimmed.to_string());
-                None
+                // Bounded prefix + Levenshtein typo fallback (e.g. "Sebastain" -> "Sebastian",
+                // "Seb" -> "Sebastian") with strict ambiguity guard.
+                let q_low = trimmed.to_ascii_lowercase();
+                let q_len = q_low.chars().count();
+                let max_dist = if q_len >= 6 {
+                    2
+                } else if q_len >= 4 {
+                    1
+                } else {
+                    0
+                };
+                let mut fuzzy_matches: Vec<(&PersonSummary, usize)> = Vec::new();
+                if q_len >= 3 {
+                    for p in visible_people {
+                        let Some(name) = p.name.as_deref().map(str::trim) else {
+                            continue;
+                        };
+                        let n_low = name.to_ascii_lowercase();
+                        let prefix_hit = n_low
+                            .split_whitespace()
+                            .any(|w| w.len() >= q_len && w.starts_with(&q_low));
+                        if prefix_hit {
+                            fuzzy_matches.push((p, 0));
+                            continue;
+                        }
+                        if max_dist > 0 {
+                            let best_d = std::iter::once(n_low.as_str())
+                                .chain(n_low.split_whitespace())
+                                .map(|w| levenshtein_ascii_ci(&q_low, w))
+                                .min()
+                                .unwrap_or(usize::MAX);
+                            if best_d <= max_dist {
+                                fuzzy_matches.push((p, best_d));
+                            }
+                        }
+                    }
+                }
+                if let Some(&min_d) = fuzzy_matches.iter().map(|(_, d)| d).min() {
+                    let best: Vec<&PersonSummary> = fuzzy_matches
+                        .into_iter()
+                        .filter(|(_, d)| *d == min_d)
+                        .map(|(p, _)| p)
+                        .collect();
+                    if best.len() == 1 {
+                        Some(best[0].id.clone())
+                    } else {
+                        let candidates: Vec<String> = best
+                            .iter()
+                            .filter_map(|p| p.name.as_deref().map(str::trim).map(str::to_string))
+                            .collect();
+                        ambiguous.push((trimmed.to_string(), candidates));
+                        None
+                    }
+                } else {
+                    unmatched.push(trimmed.to_string());
+                    None
+                }
             }
         };
 
@@ -139,6 +216,7 @@ fn resolve_rbac_people(
 fn build_search_request_from_plan(
     plan: &RouterPlan,
     person_ids: Option<Vec<String>>,
+    exclude_person_ids: Option<Vec<String>>,
     limit: u32,
 ) -> SearchRequest {
     let semantic = plan
@@ -172,7 +250,10 @@ fn build_search_request_from_plan(
         mode,
         folder_id: None,
         person_ids,
+        exclude_person_ids,
         has_people: plan.has_people,
+        min_faces: plan.min_faces,
+        max_faces: plan.max_faces,
         tags,
         camera_model: plan.camera_model.clone(),
         lens_model: plan.lens_model.clone(),
@@ -187,7 +268,9 @@ fn build_search_request_from_plan(
         orientation: plan.orientation.clone(),
         sort_by: plan.sort_by.clone(),
         geo_query: plan.location_query.clone(),
+        exclude_geo_query: plan.exclude_location_query.clone(),
         kind: plan.kind,
+        exclude_kind: plan.exclude_kind,
         favorite: plan.favorite,
         date_from_ms: plan.date_from_ms,
         date_to_ms: plan.date_to_ms,
@@ -263,22 +346,85 @@ fn apply_vlm_rerank_order(hits: &mut Vec<SearchHit>, ordered_ids: &[(String, f32
     let mut by_id: HashMap<String, SearchHit> =
         hits.drain(..).map(|h| (h.asset.id.clone(), h)).collect();
 
-    let mut reordered = Vec::with_capacity(top_count + tail.len());
+    let has_confident_hit = ordered_ids.iter().any(|(_, score)| *score >= 0.15);
+    let mut strong = Vec::with_capacity(top_count);
+    let mut demoted = Vec::new();
     for (asset_id, rerank_score) in ordered_ids {
         if let Some(mut hit) = by_id.remove(asset_id) {
             hit.score = *rerank_score;
             hit.match_reasons.push("VLM Reranked".to_string());
-            reordered.push(hit);
+            if has_confident_hit && *rerank_score < 0.15 {
+                demoted.push(hit);
+            } else {
+                strong.push(hit);
+            }
         }
     }
     // Preserve original hybrid order for any remaining candidates not returned by the reranker.
     for asset_id in original_order {
         if let Some(hit) = by_id.remove(&asset_id) {
-            reordered.push(hit);
+            strong.push(hit);
         }
     }
-    reordered.extend(tail);
-    *hits = reordered;
+    strong.extend(tail);
+    strong.extend(demoted);
+    *hits = strong;
+}
+
+fn should_trigger_vlm_rerank(prompt: &str, plan: &RouterPlan) -> bool {
+    if plan.semantic_query.is_some() {
+        return true;
+    }
+    let lower = prompt.to_ascii_lowercase();
+    [
+        "best",
+        "cool",
+        "standout",
+        "highlight",
+        "favorite",
+        "favourite",
+        "funniest",
+        "funny",
+        "smiling",
+        "laughing",
+        "happy",
+        "candid",
+        "dramatic",
+        "sharpest",
+        "wallpaper",
+        "mood",
+        "vibe",
+        "aesthetic",
+        "cute",
+        "pretty",
+        "looking at camera",
+        "eye contact",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+fn strip_third_party_lens_brand(lens: &str) -> Option<String> {
+    const BRANDS: &[&str] = &[
+        "sigma",
+        "tamron",
+        "samyang",
+        "tokina",
+        "viltrox",
+        "rokinon",
+        "zeiss",
+        "laowa",
+        "ttartisan",
+        "7artisans",
+    ];
+    let trimmed = lens.trim();
+    let (first, rest) = trimmed.split_once(char::is_whitespace)?;
+    let rest_trimmed = rest.trim();
+    if !rest_trimmed.is_empty() && BRANDS.contains(&first.to_ascii_lowercase().as_str()) {
+        Some(rest_trimmed.to_string())
+    } else {
+        None
+    }
 }
 
 /// `GET /api/chat/sessions` (AuthSession; strictly scoped to `auth.user.id`).
@@ -442,17 +588,65 @@ fn synthesize_grounded_answer(
         || lower.contains("gear")
         || lower.contains("equipment")
     {
-        let cam_str = if cameras.is_empty() {
+        let cam_str = if !summary.camera_counts.is_empty() {
+            summary
+                .camera_counts
+                .iter()
+                .take(8)
+                .map(|(name, cnt)| format!("{name} ({cnt})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else if cameras.is_empty() {
             "none detected".to_string()
         } else {
             cameras.join(", ")
         };
-        let lens_str = if lenses.is_empty() {
+        let lens_str = if !summary.lens_counts.is_empty() {
+            summary
+                .lens_counts
+                .iter()
+                .take(8)
+                .map(|(name, cnt)| format!("{name} ({cnt})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else if lenses.is_empty() {
             "none detected".to_string()
         } else {
             lenses.join(", ")
         };
         return format!("Your library uses camera(s): {cam_str}, with lens(es): {lens_str}.");
+    }
+
+    if lower.contains("month")
+        || lower.contains("year")
+        || lower.contains("when")
+        || lower.contains("date")
+    {
+        let mut parts = Vec::new();
+        if let Some((lo, hi)) = &summary.date_range {
+            parts.push(format!("Your library spans {lo} to {hi}."));
+        }
+        if !summary.top_months.is_empty() {
+            let months: Vec<String> = summary
+                .top_months
+                .iter()
+                .take(6)
+                .map(|(m, c)| format!("{m} ({c})"))
+                .collect();
+            parts.push(format!("Busiest months: {}.", months.join(", ")));
+        }
+        if !summary.year_counts.is_empty() {
+            let years: Vec<String> = summary
+                .year_counts
+                .iter()
+                .take(6)
+                .map(|(y, c)| format!("{y} ({c})"))
+                .collect();
+            parts.push(format!("By year: {}.", years.join(", ")));
+        }
+        if !parts.is_empty() {
+            return parts.join(" ");
+        }
     }
 
     if lower.contains("folder")
@@ -461,21 +655,45 @@ fn synthesize_grounded_answer(
         || lower.contains("where")
         || lower.contains("place")
     {
-        if folders_list.is_empty() {
+        let places_list: Vec<String> = summary
+            .top_places
+            .iter()
+            .take(8)
+            .map(|(name, cnt)| format!("{name} ({cnt})"))
+            .collect();
+        let mut parts = Vec::new();
+        if !folders_list.is_empty() {
+            parts.push(format!("Main collections: {}.", folders_list.join(", ")));
+        }
+        if !places_list.is_empty() {
+            parts.push(format!("Top GPS places: {}.", places_list.join(", ")));
+        }
+        if parts.is_empty() {
             return format!("Your library contains {} items.", summary.total_assets);
         }
         return format!(
-            "Your library has {} items across these collections: {}.",
+            "Your library has {} items. {}",
             summary.total_assets,
-            folders_list.join(", ")
+            parts.join(" ")
         );
     }
 
     let mut parts = vec![format!("Your library has {} items", summary.total_assets)];
+    if summary.favorite_count > 0 {
+        parts.push(format!("({} favorites)", summary.favorite_count));
+    }
     if let Some((lo, hi)) = &summary.date_range {
         parts.push(format!("spanning {lo} to {hi}"));
     }
     let mut sentence = format!("{}.", parts.join(" "));
+    if !summary.kind_counts.is_empty() {
+        let kinds: Vec<String> = summary
+            .kind_counts
+            .iter()
+            .map(|(k, c)| format!("{k}: {c}"))
+            .collect();
+        sentence.push_str(&format!(" Breakdown: {}.", kinds.join(", ")));
+    }
     if !folders_list.is_empty() {
         sentence.push_str(&format!(" Main collections: {}.", folders_list.join(", ")));
     }
@@ -523,8 +741,17 @@ fn describe_zero_hit_filters(
     if let Some(loc) = plan.location_query.as_deref() {
         parts.push(format!("location \"{loc}\""));
     }
+    if let Some(ex_loc) = plan.exclude_location_query.as_deref() {
+        parts.push(format!("excluding location \"{ex_loc}\""));
+    }
     if !plan.person_names.is_empty() {
         parts.push(format!("person {}", plan.person_names.join(" + ")));
+    }
+    if !plan.exclude_person_names.is_empty() {
+        parts.push(format!(
+            "excluding {}",
+            plan.exclude_person_names.join(", ")
+        ));
     }
     if let Some(hp) = plan.has_people {
         parts.push(if hp {
@@ -532,6 +759,17 @@ fn describe_zero_hit_filters(
         } else {
             "without people".to_string()
         });
+    }
+    if let (Some(lo), Some(hi)) = (plan.min_faces, plan.max_faces) {
+        parts.push(if lo == hi {
+            format!("{lo} face(s)")
+        } else {
+            format!("{lo}–{hi} faces")
+        });
+    } else if plan.max_faces == Some(1) {
+        parts.push("solo".to_string());
+    } else if let Some(lo) = plan.min_faces {
+        parts.push(format!("{lo}+ faces"));
     }
     if let Some(ocr) = plan.ocr_terms.as_deref() {
         parts.push(format!("text \"{ocr}\""));
@@ -702,6 +940,8 @@ pub async fn send_message(
 
     let library_context = LibraryChatContext {
         total_assets: library_summary.total_assets,
+        favorite_count: library_summary.favorite_count,
+        kind_counts: library_summary.kind_counts.clone(),
         date_range: library_summary.date_range.clone(),
         known_folders: library_summary
             .folders
@@ -710,6 +950,21 @@ pub async fn send_message(
             .collect(),
         top_tags: library_summary.top_tags.clone(),
         person_counts: library_summary.person_counts.clone(),
+        camera_counts: library_summary.camera_counts.clone(),
+        lens_counts: library_summary.lens_counts.clone(),
+        top_places: library_summary.top_places.clone(),
+        year_counts: library_summary.year_counts.clone(),
+        top_months: library_summary.top_months.clone(),
+    };
+
+    // Apply client's timezone offset (minutes east of UTC, clamped to valid ±14h) so relative date
+    // cues like "today", "yesterday", and "last weekend" match the user's local calendar date.
+    let local_now = match req.tz_offset_minutes {
+        Some(offset_min) => {
+            let clamped = offset_min.clamp(-14 * 60, 14 * 60);
+            Utc::now() + chrono::Duration::minutes(i64::from(clamped))
+        }
+        None => Utc::now(),
     };
 
     let turn_input = ChatTurnInput {
@@ -720,7 +975,7 @@ pub async fn send_message(
         known_cameras: known_cameras.clone(),
         known_lenses: known_lenses.clone(),
         library: library_context,
-        current_date_utc: Utc::now(),
+        current_date_utc: local_now,
     };
 
     let active_chat_tier = ai_state.active_chat_tier;
@@ -745,17 +1000,37 @@ pub async fn send_message(
     let unmatched_people = resolved_people.unmatched;
     let ambiguous_people = resolved_people.ambiguous;
     let person_ids = resolved_people.person_ids;
+    let exclude_person_ids = if is_answer_only || plan.exclude_person_names.is_empty() {
+        None
+    } else {
+        let excl = resolve_rbac_people(&plan.exclude_person_names, &visible_people);
+        let valid: Vec<String> = excl
+            .person_ids
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| id != UNMATCHED_PERSON_SENTINEL)
+            .collect();
+        if valid.is_empty() {
+            None
+        } else {
+            Some(valid)
+        }
+    };
     let search_limit = req
         .limit
         .unwrap_or(DEFAULT_CHAT_LIMIT)
         .clamp(1, MAX_CHAT_LIMIT) as u32;
-    let search_req = build_search_request_from_plan(&plan, person_ids, search_limit);
+    let search_req =
+        build_search_request_from_plan(&plan, person_ids, exclude_person_ids, search_limit);
 
     let has_any_search_criteria = !is_answer_only
         && (search_req.query.is_some()
             || search_req.ocr_query.is_some()
             || search_req.person_ids.is_some()
+            || search_req.exclude_person_ids.is_some()
             || search_req.has_people.is_some()
+            || search_req.min_faces.is_some()
+            || search_req.max_faces.is_some()
             || search_req.tags.is_some()
             || search_req.camera_model.is_some()
             || search_req.lens_model.is_some()
@@ -770,13 +1045,32 @@ pub async fn send_message(
             || search_req.orientation.is_some()
             || search_req.sort_by.is_some()
             || search_req.geo_query.is_some()
+            || search_req.exclude_geo_query.is_some()
             || search_req.kind.is_some()
+            || search_req.exclude_kind.is_some()
             || search_req.favorite.is_some()
             || search_req.date_from_ms.is_some()
             || search_req.date_to_ms.is_some());
 
     let mut search_resp = if has_any_search_criteria {
-        execute_hybrid_search(&state, &rbac, search_req).await?
+        let primary = execute_hybrid_search(&state, &rbac, search_req.clone()).await?;
+        // Zero-hit third-party lens brand-prefix fallback (e.g. user asks "Sigma 18-50mm" while
+        // EXIF lens_model stores "18-50mm F2.8 DC DN | Contemporary 021").
+        if primary.total_count == 0 {
+            if let Some(stripped_lens) = search_req
+                .lens_model
+                .as_deref()
+                .and_then(strip_third_party_lens_brand)
+            {
+                let mut retry_req = search_req;
+                retry_req.lens_model = Some(stripped_lens);
+                execute_hybrid_search(&state, &rbac, retry_req).await?
+            } else {
+                primary
+            }
+        } else {
+            primary
+        }
     } else {
         truongphoto_core::SearchResponse {
             items: Vec::new(),
@@ -789,8 +1083,8 @@ pub async fn send_message(
 
     if active_chat_tier == ChatTier::Tier3
         && ai_state.vlm_rerank_enabled
-        && plan.semantic_query.is_some()
-        && !search_resp.items.is_empty()
+        && search_resp.items.len() >= 2
+        && should_trigger_vlm_rerank(&content, &plan)
     {
         let thumbs_dir = PathBuf::from(&settings.thumbnails_dir);
         let candidate_meta: Vec<(String, f32, Option<String>, Option<String>)> = search_resp
@@ -929,6 +1223,25 @@ pub async fn send_message(
         } else {
             plan.follow_up_suggestions =
                 build_zero_hit_relaxation_suggestions(&plan, &library_summary);
+        }
+    } else if has_any_search_criteria && !search_resp.items.is_empty() {
+        // Ground exact count / existence questions ("how many photos of Sebastian", "do I have any ...")
+        // with the real SQL/hybrid total_count instead of leaving a generic or guessed reply.
+        let lp = content.to_ascii_lowercase();
+        if lp.contains("how many") || lp.starts_with("do i have") || lp.starts_with("are there any")
+        {
+            let count_str = search_resp.total_count.to_string();
+            if !plan.assistant_reply.contains(&count_str) {
+                plan.assistant_reply = format!(
+                    "Found {} matching {}.",
+                    search_resp.total_count,
+                    if search_resp.total_count == 1 {
+                        "item"
+                    } else {
+                        "items"
+                    }
+                );
+            }
         }
     }
 
