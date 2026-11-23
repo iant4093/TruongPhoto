@@ -447,13 +447,29 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         next.shutter_speed_max_sec,
     );
 
+    let mut merged_people = merge_string_lists(&prior.person_names, &next.person_names);
+    let mut merged_has_people = next.has_people.or(prior.has_people);
+    // Avoid contradictory SQL when switching between "photos of X" and "without people".
+    if next.has_people == Some(false) {
+        merged_people.clear();
+        merged_has_people = Some(false);
+    } else if (!next.person_names.is_empty() || next.has_people == Some(true))
+        && merged_has_people == Some(false)
+    {
+        merged_has_people = if next.has_people == Some(true) {
+            Some(true)
+        } else {
+            None
+        };
+    }
+
     RouterPlan {
         intent: next_intent,
         semantic_query: normalize_opt_string(next.semantic_query.clone())
             .or_else(|| normalize_opt_string(prior.semantic_query.clone())),
         ocr_terms: normalize_opt_string(next.ocr_terms.clone())
             .or_else(|| normalize_opt_string(prior.ocr_terms.clone())),
-        person_names: merge_string_lists(&prior.person_names, &next.person_names),
+        person_names: merged_people,
         location_query: normalize_opt_string(next.location_query.clone())
             .or_else(|| normalize_opt_string(prior.location_query.clone())),
         camera_model: normalize_opt_string(next.camera_model.clone())
@@ -470,7 +486,7 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         shutter_speed_max_sec,
         orientation: normalize_opt_string(next.orientation.clone())
             .or_else(|| normalize_opt_string(prior.orientation.clone())),
-        has_people: next.has_people.or(prior.has_people),
+        has_people: merged_has_people,
         sort_by: normalize_opt_string(next.sort_by.clone())
             .or_else(|| normalize_opt_string(prior.sort_by.clone())),
         tags: merge_string_lists(&prior.tags, &next.tags),

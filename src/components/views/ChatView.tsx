@@ -707,7 +707,7 @@ export const ChatView: React.FC = () => {
                   }
 
                   const filterChips = buildFilterChips(msg.plan);
-                  const allHitIds = msg.hits.map((h) => h.asset.id);
+                  const allHitIds = Array.from(new Set(msg.hits.map((h) => h.asset.id)));
                   const suggestions = msg.plan?.follow_up_suggestions ?? [];
                   const isLastMessage = msgIndex === chatMessages.length - 1;
 

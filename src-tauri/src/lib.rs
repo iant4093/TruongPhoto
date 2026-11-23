@@ -167,7 +167,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         desktop_bootstrap_token: token,
         port: bound_port,
         mdns_url,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: truongphoto_core::APP_VERSION.to_string(),
         platform: std::env::consts::OS.to_string(),
     };
 

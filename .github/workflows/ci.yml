@@ -108,6 +108,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           VERSION: ${{ steps.version.outputs.version }}
+          TP_BUILD_VERSION: ${{ steps.version.outputs.version }}
           BUNDLES: ${{ matrix.bundles }}
         run: |
           node scripts/fetch-llama-runtime.mjs
@@ -126,7 +127,7 @@ jobs:
             b=src-tauri/target/release/bundle
           fi
           if [ "$RUNNER_OS" = "macOS" ]; then
-            cp "$b"/dmg/*.dmg release-assets/TruongPhoto-macOS.dmg
+            cp "$b"/dmg/*.dmg release-assets/TruongPhoto-macOS-aarch64.dmg
             if [ -f "$b/macos/TruongPhoto.app.tar.gz.sig" ]; then
               cp "$b/macos/TruongPhoto.app.tar.gz" release-assets/TruongPhoto-macOS.app.tar.gz
               cp "$b/macos/TruongPhoto.app.tar.gz.sig" release-assets/TruongPhoto-macOS.app.tar.gz.sig

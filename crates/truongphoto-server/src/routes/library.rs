@@ -379,11 +379,12 @@ pub async fn purge_trash(
     Ok(Json(report))
 }
 
-/// `GET /api/trash` (Authenticated + RbacContext).
+/// `GET /api/trash` (Contributor or Admin + RbacContext).
 pub async fn list_trash(
     rbac: RbacContext,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<TrashListResponse>, AppError> {
+    ensure_contributor(&rbac)?;
     let scope = rbac.scope;
     let (items, total_count) = state
         .db

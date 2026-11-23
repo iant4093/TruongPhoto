@@ -108,13 +108,8 @@ export const App: React.FC = () => {
         lastNonChatNavRef.current = prevNavRef.current;
       }
       prevNavRef.current = activeNav;
-      if (searchActive) {
-        clearSearch();
-      } else if (searchQuery) {
-        setSearchQuery('');
-      }
     }
-  }, [activeNav, clearSearch, searchActive, searchQuery, setSearchQuery]);
+  }, [activeNav]);
 
   useEffect(() => {
     void bootstrap();
@@ -124,10 +119,18 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (!authenticated) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      const state = useAppStore.getState();
+      if (
+        state.lightboxAssetId !== null ||
+        state.uploadModalOpen ||
+        document.querySelector('[aria-modal="true"]') !== null
+      ) {
+        return;
+      }
       if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'k') {
         event.preventDefault();
-        const cur = useAppStore.getState().activeNav;
-        if (cur === 'chat') {
+        const cur = state.activeNav;
+        if (cur === 'chat' && !state.searchActive) {
           setActiveNav(lastNonChatNavRef.current || 'timeline');
         } else {
           setActiveNav('chat');
@@ -323,7 +326,7 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      <Sidebar />
+      <Sidebar showStatusBanner={!isMobileViewport && lightboxAssetId === null} />
 
       <div className="workspace">
         {!hideWorkspaceHeader && (

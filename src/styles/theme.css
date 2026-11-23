@@ -302,7 +302,7 @@ input[type='number'].text-input { width: 90px; }
     left: 0;
     right: 0;
     bottom: 0;
-    z-index: 40;
+    z-index: 910;
     display: grid;
     grid-template-columns: repeat(5, minmax(0, 1fr));
     height: calc(56px + env(safe-area-inset-bottom));
@@ -3189,6 +3189,10 @@ input[type="search"]::-webkit-search-decoration {
 }
 
 /* Windows frameless chrome parity: auth screens, workspace header, Ask AI topbar, Lightbox */
+.app-brand > * {
+  pointer-events: none;
+}
+
 .windows-auth-chrome {
   position: fixed;
   top: 0;

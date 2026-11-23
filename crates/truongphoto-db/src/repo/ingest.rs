@@ -155,23 +155,29 @@ pub fn mark_files_missing(conn: &Connection, file_ids: &[String], now_ms: i64) -
     Ok(affected)
 }
 
-/// Looks up a missing physical file matching `(partial_blake3, file_size)` for move/rename re-linking.
+/// Looks up a missing physical file matching `(partial_blake3, file_size)` within the same folder
+/// for move/rename re-linking (never relinking across folders or into hidden/trashed assets).
 pub fn find_missing_by_fingerprint(
     conn: &Connection,
+    folder_id: &str,
     partial_blake3: &str,
     file_size: u64,
 ) -> DbResult<Option<ExistingFileEntry>> {
     let size_i64 = i64::try_from(file_size).unwrap_or(i64::MAX);
     let entry = conn
         .query_row(
-            "SELECT id, asset_id, rel_path, file_size, mtime_ms, partial_blake3, is_missing
-             FROM asset_files
-             WHERE partial_blake3 = ?1
-               AND file_size = ?2
-               AND is_missing = 1
-             ORDER BY updated_at_ms DESC, id ASC
+            "SELECT af.id, af.asset_id, af.rel_path, af.file_size, af.mtime_ms, af.partial_blake3, af.is_missing
+             FROM asset_files af
+             JOIN assets a ON a.id = af.asset_id
+             WHERE af.folder_id = ?1
+               AND af.partial_blake3 = ?2
+               AND af.file_size = ?3
+               AND af.is_missing = 1
+               AND a.deleted_at_ms IS NULL
+               AND a.is_hidden = 0
+             ORDER BY af.updated_at_ms DESC, af.id ASC
              LIMIT 1",
-            params![partial_blake3, size_i64],
+            params![folder_id, partial_blake3, size_i64],
             |row| {
                 let sz: i64 = row.get(3)?;
                 Ok(ExistingFileEntry {
@@ -893,7 +899,7 @@ fn reconcile_ingested_file_inner(conn: &Connection, data: &IngestedFileData) -> 
             conn.execute(
                     "UPDATE assets
                      SET kind = COALESCE(?1, kind),
-                         capture_at_ms = ?2,
+                         capture_at_ms = COALESCE((SELECT o.capture_at_ms FROM user_overrides o WHERE o.asset_id = assets.id), ?2),
                          capture_tz_offset_m = COALESCE(?3, capture_tz_offset_m),
                          width = COALESCE(?4, width),
                          height = COALESCE(?5, height),

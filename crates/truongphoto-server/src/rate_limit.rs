@@ -78,12 +78,14 @@ impl PeerIdentity {
         }
 
         if let Some(xff_val) = headers.get("x-forwarded-for") {
+            // Use the rightmost entry appended by the local trusted reverse proxy so clients
+            // cannot spoof a fresh leftmost IP per attempt.
             let rate_key = xff_val
                 .to_str()
                 .ok()
-                .and_then(|raw| raw.split(',').next())
+                .and_then(|raw| raw.rsplit(',').next())
                 .map(str::trim)
-                .and_then(|first| first.parse::<IpAddr>().ok())
+                .and_then(|last| last.parse::<IpAddr>().ok())
                 .map(RateKey::ForwardedIp)
                 .unwrap_or(RateKey::DirectIp(peer_ip));
 
@@ -130,9 +132,15 @@ struct Bucket {
     locked_until: Option<Instant>,
 }
 
-/// Per-peer exponential backoff rate limiter for PIN authentication endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ScopedBucketKey {
+    scope: String,
+    key: RateKey,
+}
+
+/// Per-peer, per-stage exponential backoff rate limiter for PIN authentication endpoints.
 pub struct AuthRateLimiter {
-    buckets: Mutex<HashMap<RateKey, Bucket>>,
+    buckets: Mutex<HashMap<ScopedBucketKey, Bucket>>,
 }
 
 impl AuthRateLimiter {
@@ -142,25 +150,70 @@ impl AuthRateLimiter {
         }
     }
 
-    /// Checks whether `key` is currently locked out. Returns `Err(retry_after_secs)` if blocked.
+    /// Checks whether `key` is currently locked out in the default scope.
     pub fn check(&self, key: &RateKey) -> Result<(), u64> {
-        self.check_at(key, Instant::now())
+        self.check_scoped("default", key)
     }
 
-    /// Records a failed attempt for `key`.
+    /// Checks whether `(scope, key)` is currently locked out.
+    pub fn check_scoped(&self, scope: &str, key: &RateKey) -> Result<(), u64> {
+        let bucket_key = ScopedBucketKey {
+            scope: scope.to_string(),
+            key: key.clone(),
+        };
+        self.check_scoped_at(&bucket_key, Instant::now())
+    }
+
+    /// Records a failed attempt for `key` in the default scope.
+    pub fn record_failure(&self, key: &RateKey) -> Option<u64> {
+        self.record_failure_scoped("default", key)
+    }
+
+    /// Records a failed attempt for `(scope, key)`.
     ///
     /// The first 5 failures in a 15-minute window return `None` (0 lock delay).
     /// Failure #6+ sets an exponential backoff lock (`2^k` capped at 300s) and returns `Some(secs)`.
-    pub fn record_failure(&self, key: &RateKey) -> Option<u64> {
-        self.record_failure_at(key, Instant::now())
+    pub fn record_failure_scoped(&self, scope: &str, key: &RateKey) -> Option<u64> {
+        let bucket_key = ScopedBucketKey {
+            scope: scope.to_string(),
+            key: key.clone(),
+        };
+        self.record_failure_scoped_at(&bucket_key, Instant::now())
     }
 
-    /// Clears rate-limit state for `key` after successful verification.
+    /// Clears rate-limit state for `key` in the default scope after successful verification.
     pub fn record_success(&self, key: &RateKey) {
-        self.buckets.lock().remove(key);
+        self.record_success_scoped("default", key);
     }
 
+    /// Clears rate-limit state for `(scope, key)` after successful verification.
+    pub fn record_success_scoped(&self, scope: &str, key: &RateKey) {
+        let bucket_key = ScopedBucketKey {
+            scope: scope.to_string(),
+            key: key.clone(),
+        };
+        self.buckets.lock().remove(&bucket_key);
+    }
+
+    #[cfg(test)]
     fn check_at(&self, key: &RateKey, now: Instant) -> Result<(), u64> {
+        let bucket_key = ScopedBucketKey {
+            scope: "default".to_string(),
+            key: key.clone(),
+        };
+        self.check_scoped_at(&bucket_key, now)
+    }
+
+    #[cfg(test)]
+    fn record_failure_at(&self, key: &RateKey, now: Instant) -> Option<u64> {
+        let bucket_key = ScopedBucketKey {
+            scope: "default".to_string(),
+            key: key.clone(),
+        };
+        self.record_failure_scoped_at(&bucket_key, now)
+    }
+
+    fn check_scoped_at(&self, key: &ScopedBucketKey, now: Instant) -> Result<(), u64> {
         let mut buckets = self.buckets.lock();
         let Some(bucket) = buckets.get(key) else {
             return Ok(());
@@ -185,7 +238,7 @@ impl AuthRateLimiter {
         Ok(())
     }
 
-    fn record_failure_at(&self, key: &RateKey, now: Instant) -> Option<u64> {
+    fn record_failure_scoped_at(&self, key: &ScopedBucketKey, now: Instant) -> Option<u64> {
         let mut buckets = self.buckets.lock();
         buckets.retain(|_, b| now.duration_since(b.last_attempt) < STALE_BUCKET_AGE);
 

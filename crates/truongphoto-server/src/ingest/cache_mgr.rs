@@ -2,7 +2,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use truongphoto_core::LruCacheEntry;
 use truongphoto_db::{repo, DbHandle};
 
@@ -11,7 +11,7 @@ const TOUCH_THROTTLE_MS: i64 = 60_000;
 /// Manages singleflight generation locks and bounded LRU disk cache eviction for `cache_dir`.
 pub struct CacheManager {
     db: DbHandle,
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     last_touched: Mutex<HashMap<String, i64>>,
 }
 
@@ -28,9 +28,16 @@ impl CacheManager {
     pub async fn singleflight_lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let mutex = {
             let mut map = self.locks.lock();
-            map.entry(key.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+            if map.len() > 512 {
+                map.retain(|_, weak| weak.strong_count() > 0);
+            }
+            if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
+                existing
+            } else {
+                let created = Arc::new(tokio::sync::Mutex::new(()));
+                map.insert(key.to_string(), Arc::downgrade(&created));
+                created
+            }
         };
         mutex.lock_owned().await
     }
@@ -162,6 +169,34 @@ pub(crate) fn safe_join_relative(root: &Path, rel: &str) -> Option<PathBuf> {
         }
     }
     Some(out)
+}
+
+/// Joins `rel` onto `root` while rejecting any symlink traversal or escape outside `root`.
+pub(crate) fn safe_join_no_symlinks(root: &Path, rel: &str) -> Option<PathBuf> {
+    let joined = safe_join_relative(root, rel)?;
+    let canon_root = std::fs::canonicalize(root).ok()?;
+    let mut probe = root.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(seg) => {
+                probe.push(seg);
+                match std::fs::symlink_metadata(&probe) {
+                    Ok(meta) if meta.file_type().is_symlink() => return None,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(joined),
+                    Err(_) => return None,
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if let Ok(canon_target) = std::fs::canonicalize(&joined) {
+        if !canon_target.starts_with(&canon_root) {
+            return None;
+        }
+    }
+    Some(joined)
 }
 
 fn remove_cache_target(path: &Path) -> bool {

@@ -584,16 +584,24 @@ pub fn inspect_livp(path: &Path) -> Result<LivpEntries, MediaError> {
     })
 }
 
-/// Extracts a named entry from an Apple `.livp` ZIP archive into memory.
+const MAX_LIVP_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Extracts a named entry from an Apple `.livp` ZIP archive into memory (bounded to 64 MiB).
 pub fn extract_livp_entry_bytes(path: &Path, entry_name: &str) -> Result<Vec<u8>, MediaError> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))
         .map_err(|e| MediaError::Archive(format!("invalid .livp archive: {e}")))?;
-    let mut entry = archive
+    let entry = archive
         .by_name(entry_name)
         .map_err(|e| MediaError::Archive(format!("missing .livp entry '{entry_name}': {e}")))?;
-    let mut out = Vec::with_capacity(entry.size().min(64 * 1024 * 1024) as usize);
-    entry.read_to_end(&mut out)?;
+    let cap = entry.size().min(MAX_LIVP_ENTRY_BYTES) as usize;
+    let mut out = Vec::with_capacity(cap);
+    entry.take(MAX_LIVP_ENTRY_BYTES + 1).read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_LIVP_ENTRY_BYTES {
+        return Err(MediaError::Archive(format!(
+            ".livp entry '{entry_name}' exceeds maximum allowed size of 64 MiB"
+        )));
+    }
     Ok(out)
 }
 
@@ -694,6 +702,18 @@ fn parse_exif_timestamp(exif: &Exif) -> (Option<i64>, Option<i32>) {
                     );
                 }
                 if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S") {
+                    if let Some(offset_str) = entry_as_str(exif, ExifTag::OffsetTimeOriginal)
+                        .or_else(|| entry_as_str(exif, ExifTag::OffsetTime))
+                    {
+                        if let Ok(offset) = offset_str.parse::<FixedOffset>() {
+                            if let Some(dt) = naive.and_local_timezone(offset).single() {
+                                return (
+                                    Some(dt.timestamp_millis()),
+                                    Some(offset.local_minus_utc() / 60),
+                                );
+                            }
+                        }
+                    }
                     return (Some(naive.and_utc().timestamp_millis()), None);
                 }
             }
@@ -724,9 +744,23 @@ fn populate_from_exif(
 
     let (gps_lat, gps_lon, gps_alt_m, geo_city, geo_admin1, geo_country, geo_country_code) =
         if let Some(gps) = exif.gps_info() {
-            let lat = gps.latitude_decimal();
-            let lon = gps.longitude_decimal();
-            let alt = gps.altitude_meters();
+            let raw_lat = gps.latitude_decimal();
+            let raw_lon = gps.longitude_decimal();
+            // Reject zeroed Null Island (0.0, 0.0) GPS placeholders written by cameras without a fix.
+            let is_null_island = matches!(
+                (raw_lat, raw_lon),
+                (Some(la), Some(lo)) if la.abs() < 1e-6 && lo.abs() < 1e-6
+            );
+            let (lat, lon) = if is_null_island {
+                (None, None)
+            } else {
+                (raw_lat, raw_lon)
+            };
+            let alt = if is_null_island {
+                None
+            } else {
+                gps.altitude_meters()
+            };
             let geo = match (lat, lon) {
                 (Some(la), Some(lo)) => geocode::reverse_geocode(la, lo),
                 _ => None,
@@ -756,15 +790,17 @@ fn populate_from_exif(
         _ => None,
     };
 
+    let positive_f64 = |v: Option<f64>| v.filter(|x| x.is_finite() && *x > 0.0);
+    let positive_u32 = |v: Option<u32>| v.filter(|x| *x > 0);
     let view = PhotoMetaView {
         camera_make: entry_as_str(exif, ExifTag::Make),
         camera_model: entry_as_str(exif, ExifTag::Model),
         lens_model: entry_as_str(exif, ExifTag::LensModel),
-        focal_length_mm: entry_as_f64(exif, ExifTag::FocalLength),
-        focal_length_35mm: entry_as_u32(exif, ExifTag::FocalLengthIn35mmFilm),
-        aperture_f: entry_as_f64(exif, ExifTag::FNumber),
-        shutter_speed_sec: entry_as_f64(exif, ExifTag::ExposureTime),
-        iso: entry_as_u32(exif, ExifTag::ISOSpeedRatings),
+        focal_length_mm: positive_f64(entry_as_f64(exif, ExifTag::FocalLength)),
+        focal_length_35mm: positive_u32(entry_as_u32(exif, ExifTag::FocalLengthIn35mmFilm)),
+        aperture_f: positive_f64(entry_as_f64(exif, ExifTag::FNumber)),
+        shutter_speed_sec: positive_f64(entry_as_f64(exif, ExifTag::ExposureTime)),
+        iso: positive_u32(entry_as_u32(exif, ExifTag::ISOSpeedRatings)),
         orientation,
         color_space,
         gps_lat,

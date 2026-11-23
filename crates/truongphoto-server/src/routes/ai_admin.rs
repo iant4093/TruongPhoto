@@ -519,8 +519,12 @@ pub async fn update_ai_settings(
     State(state): State<Arc<AppState>>,
     ApiJson(req): ApiJson<UpdateAiSettingsRequest>,
 ) -> Result<Json<AiIndexStateView>, AppError> {
-    if req.video_max_frames == Some(0) {
-        return Err(AppError::validation("video_max_frames must be at least 1."));
+    if let Some(frames) = req.video_max_frames {
+        if !(1..=120).contains(&frames) {
+            return Err(AppError::validation(
+                "video_max_frames must be between 1 and 120.",
+            ));
+        }
     }
 
     let now_ms = Utc::now().timestamp_millis();

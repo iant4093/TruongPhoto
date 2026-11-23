@@ -80,6 +80,7 @@ impl TailscaleRunner for SystemTailscaleRunner {
     ) -> Pin<Box<dyn Future<Output = Result<TailscaleCmdOutput, String>> + Send + 'a>> {
         Box::pin(async move {
             let mut cmd = tokio::process::Command::new(cli);
+            cmd.kill_on_drop(true);
             #[cfg(windows)]
             {
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;

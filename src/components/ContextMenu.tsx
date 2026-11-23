@@ -142,6 +142,9 @@ export const ContextMenuHost: React.FC = () => {
     setCoords({ left, top });
   }, [open, x, y, items.length]);
 
+  const activeIdxRef = useRef(activeIdx);
+  activeIdxRef.current = activeIdx;
+
   useEffect(() => {
     if (!open) return;
     const layer = pushEscapeLayer();
@@ -169,17 +172,17 @@ export const ContextMenuHost: React.FC = () => {
 
       if (event.key === 'ArrowDown') {
         event.preventDefault();
-        const curPos = actionIndices.indexOf(activeIdx);
+        const curPos = actionIndices.indexOf(activeIdxRef.current);
         const nextPos = curPos < 0 ? 0 : (curPos + 1) % actionIndices.length;
         setActiveIdx(actionIndices[nextPos]);
       } else if (event.key === 'ArrowUp') {
         event.preventDefault();
-        const curPos = actionIndices.indexOf(activeIdx);
+        const curPos = actionIndices.indexOf(activeIdxRef.current);
         const nextPos =
           curPos < 0 ? actionIndices.length - 1 : (curPos - 1 + actionIndices.length) % actionIndices.length;
         setActiveIdx(actionIndices[nextPos]);
-      } else if (event.key === 'Enter' && activeIdx >= 0) {
-        const entry = items[activeIdx];
+      } else if (event.key === 'Enter' && activeIdxRef.current >= 0) {
+        const entry = items[activeIdxRef.current];
         if (entry && entry.type !== 'separator' && !entry.disabled) {
           event.preventDefault();
           close();
@@ -199,7 +202,7 @@ export const ContextMenuHost: React.FC = () => {
       window.removeEventListener('resize', onScrollOrResize);
       popEscapeLayer(layer);
     };
-  }, [activeIdx, close, items, open]);
+  }, [close, items, open]);
 
   if (!open || items.length === 0) return null;
 

@@ -476,8 +476,16 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
     }
 
     // "in YYYY" / "from YYYY" / "during YYYY" or standalone 4-digit year.
+    // Skip 4-digit numbers preceded by "iso" or "1/" (e.g. "ISO 2000", "1/2000").
     for (word, s, e) in &tokens {
         if let Some(y_num) = parse_year_token(word) {
+            let before = text[..*s].trim_end();
+            if before.ends_with('/')
+                || before.strip_suffix_ci_word("iso").is_some()
+                || before.ends_with("iso")
+            {
+                continue;
+            }
             let span_start = strip_optional_leading_prep(text, *s);
             let start = NaiveDate::from_ymd_opt(y_num, 1, 1).unwrap();
             let end = NaiveDate::from_ymd_opt(y_num, 12, 31).unwrap();
@@ -773,7 +781,7 @@ fn extract_tags(text: &str) -> (Vec<String>, String) {
 }
 
 fn extract_kind(text: &str) -> (Option<AssetKind>, String) {
-    let patterns: &[(&str, AssetKind)] = &[
+    let explicit_patterns: &[(&str, AssetKind)] = &[
         ("live photos", AssetKind::LivePhoto),
         ("live photo", AssetKind::LivePhoto),
         ("motion photos", AssetKind::MotionPhoto),
@@ -790,22 +798,29 @@ fn extract_kind(text: &str) -> (Option<AssetKind>, String) {
         ("movies", AssetKind::Video),
         ("clips", AssetKind::Video),
         ("only photos", AssetKind::Photo),
-        ("photos", AssetKind::Photo),
-        ("photo", AssetKind::Photo),
-        ("pictures", AssetKind::Photo),
-        ("picture", AssetKind::Photo),
-        ("pics", AssetKind::Photo),
-        ("images", AssetKind::Photo),
-        ("image", AssetKind::Photo),
+        ("photos only", AssetKind::Photo),
+        ("still photos", AssetKind::Photo),
     ];
 
-    for &(phrase, kind) in patterns {
+    for &(phrase, kind) in explicit_patterns {
         let (found, next) = strip_phrase_ci(text, phrase);
         if found {
             return (Some(kind), next);
         }
     }
-    (None, text.to_string())
+
+    // Strip generic media nouns ("photos", "pics", "pictures", "images") without locking
+    // `kind = Photo`, which would exclude Live Photos, Motion Photos, and RAW+JPG stacks.
+    let mut cleaned = text.to_string();
+    for generic in [
+        "photos", "photo", "pictures", "picture", "pics", "images", "image",
+    ] {
+        let (found, next) = strip_phrase_ci(&cleaned, generic);
+        if found {
+            cleaned = next;
+        }
+    }
+    (None, cleaned)
 }
 
 fn extract_favorite(text: &str) -> (Option<bool>, String) {

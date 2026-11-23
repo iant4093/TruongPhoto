@@ -1,6 +1,13 @@
 //! Shared domain contracts, configuration, RBAC primitives, errors,
 //! partial BLAKE3 fingerprinting, and WebSocket event schemas for TruongPhoto.
 
+/// Compile-time application version (honors `TP_BUILD_VERSION` set by release CI,
+/// falling back to `CARGO_PKG_VERSION`).
+pub const APP_VERSION: &str = match option_env!("TP_BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 pub mod config;
 pub mod error;
 pub mod fingerprint;

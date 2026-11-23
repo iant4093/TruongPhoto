@@ -211,7 +211,12 @@ impl HybridVectorIndex {
                 })?;
         }
 
-        let tmp_path = PathBuf::from(format!("{}.tmp", self.base_path.display()));
+        let unique_suffix = uuid::Uuid::new_v4().simple().to_string();
+        let tmp_path = PathBuf::from(format!(
+            "{}.{}.tmp",
+            self.base_path.display(),
+            &unique_suffix[..8]
+        ));
         let tmp_str = tmp_path
             .to_str()
             .ok_or_else(|| AiError::InvalidInput("non-UTF8 base index tmp path".to_string()))?;
@@ -222,15 +227,51 @@ impl HybridVectorIndex {
         let new_delta = create_rw_index(self.dim, 1024)?;
 
         // Hold base write lock while dropping old mmap view, atomically renaming, and re-viewing.
-        let mut base_guard = self.base.write();
-        *base_guard = None;
-        std::fs::rename(&tmp_path, &self.base_path)?;
-        *base_guard = Some(open_base_view(&self.base_path)?);
+        {
+            let mut base_guard = self.base.write();
+            *base_guard = None;
+            let mut rename_err = None;
+            let attempts = if cfg!(windows) { 5 } else { 1 };
+            for attempt in 0..attempts {
+                match std::fs::rename(&tmp_path, &self.base_path) {
+                    Ok(()) => {
+                        rename_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        rename_err = Some(e);
+                        if attempt + 1 < attempts {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                40 * (attempt as u64 + 1),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(e) = rename_err {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e.into());
+            }
+            *base_guard = Some(open_base_view(&self.base_path)?);
+        }
 
+        // Preserve any vectors added concurrently while the base index was rebuilding (id >= count).
         let mut delta_guard = self.delta.write();
         let mut delta_ids_guard = self.delta_ids.write();
+        let mut surviving_ids = RoaringBitmap::new();
+        for id in delta_ids_guard.iter() {
+            if u64::from(id) >= count {
+                if let Some(vec_f32) = self.flat.get_f32(id) {
+                    if new_delta.size() + 1 >= new_delta.capacity() {
+                        let _ = new_delta.reserve(new_delta.capacity().max(1024) * 2);
+                    }
+                    let _ = new_delta.add(u64::from(id), &vec_f32);
+                    surviving_ids.insert(id);
+                }
+            }
+        }
         *delta_guard = new_delta;
-        delta_ids_guard.clear();
+        *delta_ids_guard = surviving_ids;
 
         Ok(())
     }
@@ -330,7 +371,10 @@ impl HybridVectorIndex {
             return Ok((Vec::new(), PlannerMode::ExactSimd));
         }
 
-        if effective.len() <= EXACT_SCAN_THRESHOLD {
+        let hnsw_ready = self.base.read().as_ref().is_some_and(|b| b.size() > 0)
+            || self.delta_len() as u64 >= self.flat.count();
+
+        if effective.len() <= EXACT_SCAN_THRESHOLD || !hnsw_ready {
             let hits = self.flat.exact_top_k(query, &effective, k);
             Ok((hits, PlannerMode::ExactSimd))
         } else {

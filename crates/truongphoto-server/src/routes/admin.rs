@@ -223,6 +223,7 @@ pub async fn update_user(
                 }
             }
 
+            let pin_changed = pin_hash.is_some();
             let updated = repo::users::update_user(
                 &tx,
                 &target_id,
@@ -236,7 +237,7 @@ pub async fn update_user(
             )?
             .ok_or_else(|| DbError::NotFound("User not found.".to_string()))?;
 
-            if disabled_patch == Some(true) {
+            if disabled_patch == Some(true) || (pin_changed && target_id != actor_id) {
                 let now_ms = Utc::now().timestamp_millis();
                 repo::sessions::revoke_sessions_for_user(&tx, &target_id, now_ms)?;
             }
@@ -334,6 +335,13 @@ pub async fn update_server_pin(
     State(state): State<Arc<AppState>>,
     ApiJson(req): ApiJson<UpdateServerPinRequest>,
 ) -> Result<StatusCode, AppError> {
+    if let Err(retry_after_secs) = state
+        .rate_limiter
+        .check_scoped("admin_server_pin", &auth.peer.rate_key)
+    {
+        return Err(AppError::rate_limited(retry_after_secs));
+    }
+
     validate_server_pin(&req.new_server_pin)?;
 
     let stored_hash = state
@@ -343,8 +351,17 @@ pub async fn update_server_pin(
         .ok_or_else(|| AppError::not_initialized("Server PIN is not configured."))?;
 
     if !verify_pin(req.current_server_pin, stored_hash).await? {
+        if let Some(retry_after_secs) = state
+            .rate_limiter
+            .record_failure_scoped("admin_server_pin", &auth.peer.rate_key)
+        {
+            return Err(AppError::rate_limited(retry_after_secs));
+        }
         return Err(AppError::unauthorized("Current server PIN is incorrect."));
     }
+    state
+        .rate_limiter
+        .record_success_scoped("admin_server_pin", &auth.peer.rate_key);
 
     let new_hash = hash_pin(req.new_server_pin).await?;
     let actor_id = auth.user.id.clone();

@@ -1,6 +1,6 @@
 use crate::backup_scheduler::list_backup_snapshots;
 use crate::error::AppError;
-use crate::extractors::AuthSession;
+use crate::extractors::RbacContext;
 use crate::state::AppState;
 use axum::{extract::State, Json};
 use serde::Serialize;
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use sysinfo::System;
 use truongphoto_core::{
-    BackupSnapshotView, HardwareInfo, LibraryStats, PowerState, RbacScope, ThrottleStatus,
+    BackupSnapshotView, HardwareInfo, LibraryStats, PowerState, Role, ThrottleStatus, APP_VERSION,
 };
 use truongphoto_db::repo;
 
@@ -47,7 +47,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Result<Json<HealthRes
     let initialized = state.db.read(repo::settings::is_setup_completed).await?;
     Ok(Json(HealthResponse {
         status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
+        version: APP_VERSION,
         uptime_secs: state.started_at.elapsed().as_secs(),
         initialized,
     }))
@@ -55,25 +55,34 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Result<Json<HealthRes
 
 /// `GET /api/system/info` (Authenticated).
 pub async fn system_info(
-    _auth: AuthSession,
+    rbac: RbacContext,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SystemInfoResponse>, AppError> {
+    let is_admin = rbac.auth.user.role == Role::Admin;
+    let scope = rbac.scope;
     let default_paths = state.default_paths.clone();
     let (settings, asset_count, folder_count) = state
         .db
         .read(move |conn| {
             let settings = repo::settings::load_app_settings(conn, &default_paths)?;
-            let asset_count = repo::assets::count_active_assets(conn, &RbacScope::AdminAll)?;
-            let folder_count = repo::folders::count_folders(conn)?;
+            let asset_count = repo::assets::count_active_assets(conn, &scope)?;
+            let folder_count = if is_admin {
+                repo::folders::count_folders(conn)?
+            } else {
+                repo::folders::list_folders(conn, &scope)?.len() as u64
+            };
             Ok((settings, asset_count, folder_count))
         })
         .await?;
 
-    let backup_dir = PathBuf::from(&settings.backup_dir);
-    let last_backup =
+    let last_backup = if is_admin {
+        let backup_dir = PathBuf::from(&settings.backup_dir);
         tokio::task::spawn_blocking(move || list_backup_snapshots(&backup_dir).into_iter().next())
             .await
-            .map_err(|e| AppError::internal(format!("Failed to inspect backups: {e}")))?;
+            .map_err(|e| AppError::internal(format!("Failed to inspect backups: {e}")))?
+    } else {
+        None
+    };
 
     let (mdns_enabled, mdns_active, mdns_url) = {
         let mdns = state.mdns.lock();
@@ -91,7 +100,7 @@ pub async fn system_info(
         .https_url;
 
     Ok(Json(SystemInfoResponse {
-        version: env!("CARGO_PKG_VERSION"),
+        version: APP_VERSION,
         platform: std::env::consts::OS,
         arch: std::env::consts::ARCH,
         hostname,
@@ -105,7 +114,11 @@ pub async fn system_info(
         stats: LibraryStats {
             asset_count,
             folder_count,
-            db_size_bytes: state.db.db_size_bytes(),
+            db_size_bytes: if is_admin {
+                state.db.db_size_bytes()
+            } else {
+                0
+            },
         },
         power,
         last_backup,

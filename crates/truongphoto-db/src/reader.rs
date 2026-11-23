@@ -39,6 +39,14 @@ impl ReadPool {
         })
     }
 
+    /// Closes the read pool and drops all pooled SQLite read connections so WAL checkpoints
+    /// (`PRAGMA wal_checkpoint(TRUNCATE)`) are not blocked by lingering readers.
+    pub async fn close(&self) {
+        self.sem.close();
+        let conns = std::mem::take(&mut *self.conns.lock());
+        let _ = tokio::task::spawn_blocking(move || drop(conns)).await;
+    }
+
     /// Executes a blocking read closure against a pooled read-only connection.
     pub async fn read<T, F>(&self, f: F) -> DbResult<T>
     where

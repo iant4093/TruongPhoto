@@ -242,7 +242,19 @@ async fn process_debounced_paths(state: &Arc<AppState>, folder_id: &str, paths: 
 }
 
 fn should_ignore_watch_path(root: &Path, path: &Path) -> bool {
-    let rel = path.strip_prefix(root).unwrap_or(path);
+    let rel_owned: std::path::PathBuf;
+    let rel = if let Ok(r) = path.strip_prefix(root) {
+        r
+    } else if let (Ok(cr), Ok(cp)) = (std::fs::canonicalize(root), std::fs::canonicalize(path)) {
+        if let Ok(r) = cp.strip_prefix(&cr) {
+            rel_owned = r.to_path_buf();
+            rel_owned.as_path()
+        } else {
+            return false;
+        }
+    } else {
+        path
+    };
     for comp in rel.components() {
         if let std::path::Component::Normal(s) = comp {
             if let Some(name) = s.to_str() {

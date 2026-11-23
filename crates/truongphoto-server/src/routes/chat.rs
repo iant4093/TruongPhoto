@@ -24,7 +24,7 @@ use truongphoto_db::{repo, DbError};
 
 const DEFAULT_CHAT_LIMIT: usize = 60;
 const MAX_CHAT_LIMIT: usize = 500;
-const MAX_VLM_RERANK_CANDIDATES: usize = 12;
+const MAX_VLM_RERANK_CANDIDATES: usize = 8;
 const RECENT_TURNS_WINDOW: usize = 6;
 const UNMATCHED_PERSON_SENTINEL: &str = "__unmatched_person__";
 
@@ -789,6 +789,7 @@ pub async fn send_message(
                         .as_deref()
                         .and_then(|rel| safe_join_relative(&thumbs_dir, rel))
                         .and_then(|p| std::fs::read(p).ok())
+                        .and_then(|raw| transcode_thumb_to_jpeg_for_vlm(&raw))
                         .unwrap_or_default();
                     RerankCandidate {
                         asset_id,
@@ -998,13 +999,27 @@ pub async fn send_message(
     Ok(Json(SendChatMessageResponse {
         user_message,
         assistant_message,
-        active_filters: plan,
+        active_filters: persisted_filters,
         hits: search_resp.items,
         total_count: search_resp.total_count,
         planner_mode,
         reranked,
         elapsed_ms,
     }))
+}
+
+/// Converts WebP/PNG thumbnails into JPEG bytes so `llama-server`'s `stb_image` multimodal decoder
+/// can reliably parse every Tier 3 VLM rerank candidate.
+fn transcode_thumb_to_jpeg_for_vlm(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(raw.to_vec());
+    }
+    let img = image::load_from_memory(raw).ok()?;
+    let rgb = img.to_rgb8();
+    let mut out = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80);
+    enc.encode_image(&rgb).ok()?;
+    Some(out)
 }
 
 #[derive(Debug, Serialize)]

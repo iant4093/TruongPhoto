@@ -478,7 +478,8 @@ impl ModelDownloader {
             )));
         }
 
-        let content_len = resp.content_length().unwrap_or(approx_bytes);
+        let exact_content_len = resp.content_length();
+        let content_len = exact_content_len.unwrap_or(approx_bytes);
         let effective_total = total_hint.max(prior_bytes.saturating_add(content_len));
 
         let mut file = tokio::fs::File::create(&part_path).await?;
@@ -530,6 +531,15 @@ impl ModelDownloader {
             return Err(AiError::Io(e));
         }
         drop(file);
+
+        if let Some(expected_len) = exact_content_len {
+            if downloaded_this_file != expected_len {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Err(AiError::ModelDownload(format!(
+                    "truncated download for {url}: expected {expected_len} bytes, got {downloaded_this_file}"
+                )));
+            }
+        }
 
         let actual_sha256 = hex::encode(hasher.finalize());
         if let Some(expected) = expected_sha256 {

@@ -20,6 +20,8 @@ struct LibRawProcessedImage {
 
 type FnLibrawInit = unsafe extern "C" fn(flags: c_uint) -> *mut c_void;
 type FnLibrawOpenFile = unsafe extern "C" fn(lr: *mut c_void, file: *const c_char) -> c_int;
+#[cfg(target_os = "windows")]
+type FnLibrawOpenWFile = unsafe extern "C" fn(lr: *mut c_void, file: *const u16) -> c_int;
 type FnLibrawUnpack = unsafe extern "C" fn(lr: *mut c_void) -> c_int;
 type FnLibrawDcrawProcess = unsafe extern "C" fn(lr: *mut c_void) -> c_int;
 type FnLibrawMakeMemImage =
@@ -71,6 +73,16 @@ fn libraw_candidate_paths() -> Vec<String> {
     }
     #[cfg(target_os = "windows")]
     {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for rel in ["libraw.dll", "raw.dll", "resources\\libraw.dll"] {
+                    let p = dir.join(rel);
+                    if p.is_file() {
+                        candidates.push(p.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
         candidates.extend(["libraw.dll".to_string(), "raw.dll".to_string()]);
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -96,12 +108,9 @@ fn load_libraw_library() -> Option<libloading::Library> {
 /// Attempts runtime dynamic loading and full demosaic via `libraw` (`libloading`), returning `None` if unavailable.
 pub fn try_libraw_demosaic_jpeg(path: &Path) -> Option<Vec<u8>> {
     let lib = load_libraw_library()?;
-    let c_path = CString::new(path.to_str()?).ok()?;
 
     unsafe {
         let init: libloading::Symbol<'_, FnLibrawInit> = lib.get(b"libraw_init\0").ok()?;
-        let open_file: libloading::Symbol<'_, FnLibrawOpenFile> =
-            lib.get(b"libraw_open_file\0").ok()?;
         let unpack: libloading::Symbol<'_, FnLibrawUnpack> = lib.get(b"libraw_unpack\0").ok()?;
         let process: libloading::Symbol<'_, FnLibrawDcrawProcess> =
             lib.get(b"libraw_dcraw_process\0").ok()?;
@@ -120,7 +129,33 @@ pub fn try_libraw_demosaic_jpeg(path: &Path) -> Option<Vec<u8>> {
             close_fn: *close,
         };
 
-        if open_file(handle.ptr, c_path.as_ptr()) != 0 {
+        let open_rc = {
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                if let Ok(open_wfile) = lib.get::<FnLibrawOpenWFile>(b"libraw_open_wfile\0") {
+                    let wide: Vec<u16> = path
+                        .as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    open_wfile(handle.ptr, wide.as_ptr())
+                } else {
+                    let open_file: libloading::Symbol<'_, FnLibrawOpenFile> =
+                        lib.get(b"libraw_open_file\0").ok()?;
+                    let c_path = CString::new(path.to_str()?).ok()?;
+                    open_file(handle.ptr, c_path.as_ptr())
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let open_file: libloading::Symbol<'_, FnLibrawOpenFile> =
+                    lib.get(b"libraw_open_file\0").ok()?;
+                let c_path = CString::new(path.to_str()?).ok()?;
+                open_file(handle.ptr, c_path.as_ptr())
+            }
+        };
+        if open_rc != 0 {
             return None;
         }
         if unpack(handle.ptr) != 0 {
@@ -271,6 +306,75 @@ fn collect_tiff_ifd_jpegs<'a>(
     }
 }
 
+/// Walks a JPEG bitstream starting at `start` (`FF D8 FF`) by skipping segment lengths
+/// (so embedded EXIF APP1 thumbnails' `FF D9` markers do not prematurely truncate the stream)
+/// and scanning entropy-coded data after `FF DA` (SOS) until the true `FF D9` (EOI).
+fn find_jpeg_end_offset(data: &[u8], start: usize) -> Option<usize> {
+    if start + 4 > data.len() || data[start] != 0xFF || data[start + 1] != 0xD8 {
+        return None;
+    }
+    let mut i = start + 2;
+    while i + 1 < data.len() {
+        // Advance to next marker prefix 0xFF (skip padding 0xFF bytes).
+        if data[i] != 0xFF {
+            return None;
+        }
+        while i < data.len() && data[i] == 0xFF {
+            i += 1;
+        }
+        if i >= data.len() {
+            return None;
+        }
+        let marker = data[i];
+        i += 1;
+        match marker {
+            0xD9 => return Some(i),         // EOI
+            0x01 | 0xD0..=0xD8 => continue, // Standalone markers (TEM, RST0..7, SOI)
+            0xDA => {
+                // SOS header length + entropy-coded scan until unstuffed non-RST marker.
+                if i + 2 > data.len() {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+                if seg_len < 2 || i + seg_len > data.len() {
+                    return None;
+                }
+                i += seg_len;
+                while i + 1 < data.len() {
+                    if data[i] == 0xFF {
+                        let next = data[i + 1];
+                        if next == 0x00 || (0xD0..=0xD7).contains(&next) {
+                            i += 2;
+                            continue;
+                        }
+                        if next == 0xFF {
+                            i += 1;
+                            continue;
+                        }
+                        if next == 0xD9 {
+                            return Some(i + 2);
+                        }
+                        // Another marker (e.g., progressive JPEG DHT/SOS/DRI): resume outer marker loop.
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if i + 2 > data.len() {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+                if seg_len < 2 || i + seg_len > data.len() {
+                    return None;
+                }
+                i += seg_len;
+            }
+        }
+    }
+    None
+}
+
 fn scan_largest_jpeg_stream(data: &[u8]) -> Option<&[u8]> {
     let mut best: Option<&[u8]> = None;
     let mut pos = 0usize;
@@ -279,8 +383,13 @@ fn scan_largest_jpeg_stream(data: &[u8]) -> Option<&[u8]> {
             break;
         };
         let start = pos + rel_start;
-        // Walk JPEG markers properly when possible, or search for FF D9 after start
-        if let Some(end_rel) = data[start + 3..].windows(2).position(|w| w == [0xFF, 0xD9]) {
+        if let Some(end) = find_jpeg_end_offset(data, start) {
+            let candidate = &data[start..end];
+            if best.is_none_or(|cur| candidate.len() > cur.len()) {
+                best = Some(candidate);
+            }
+            pos = end;
+        } else if let Some(end_rel) = data[start + 3..].windows(2).position(|w| w == [0xFF, 0xD9]) {
             let end = start + 3 + end_rel + 2;
             let candidate = &data[start..end];
             if best.is_none_or(|cur| candidate.len() > cur.len()) {

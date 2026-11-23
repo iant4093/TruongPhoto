@@ -9,7 +9,7 @@ fn asset_visible_in_scope(conn: &Connection, scope: &RbacScope, asset_id: &str) 
     let mut params: Vec<Value> = vec![Value::Text(asset_id.to_string())];
     let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
     let sql = format!(
-        "SELECT 1 FROM assets a WHERE a.id = ?1 AND a.is_hidden = 0 AND {rbac_clause} LIMIT 1"
+        "SELECT 1 FROM assets a WHERE a.id = ?1 AND a.is_hidden = 0 AND a.deleted_at_ms IS NULL AND {rbac_clause} LIMIT 1"
     );
     let exists: Option<i64> = conn
         .query_row(&sql, params_from_iter(params), |row| row.get(0))

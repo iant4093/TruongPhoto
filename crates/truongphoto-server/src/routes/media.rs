@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::extractors::RbacContext;
-use crate::ingest::cache_mgr::safe_join_relative;
+use crate::ingest::cache_mgr::{safe_join_no_symlinks, safe_join_relative};
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -66,7 +66,7 @@ fn resolve_asset_file_path(
         ));
     }
     let root = Path::new(&folder.root_path);
-    let full = safe_join_relative(root, &file.rel_path)
+    let full = safe_join_no_symlinks(root, &file.rel_path)
         .ok_or_else(|| AppError::not_found("Invalid media file path."))?;
     if !full.is_file() {
         return Err(AppError::not_found("Media file does not exist on disk."));
@@ -286,6 +286,7 @@ pub async fn get_thumb(
     AxumPath(asset_id): AxumPath<String>,
     req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let include_trashed = rbac.auth.user.role.can_contribute();
     let scope = rbac.scope.clone();
     let aid_lookup = asset_id.clone();
     let default_paths = state.default_paths.clone();
@@ -293,7 +294,12 @@ pub async fn get_thumb(
     let (asset_opt, settings) = state
         .db
         .read(move |conn| {
-            let asset = repo::assets::get_asset_with_files(conn, &scope, &aid_lookup)?;
+            let asset = repo::assets::get_asset_with_files_filtered(
+                conn,
+                &scope,
+                &aid_lookup,
+                include_trashed,
+            )?;
             let settings = repo::settings::load_app_settings(conn, &default_paths)?;
             Ok((asset, settings))
         })
@@ -319,7 +325,9 @@ pub async fn get_thumb(
         let aid2 = asset_id.clone();
         let refreshed = state
             .db
-            .read(move |conn| repo::assets::get_asset_with_files(conn, &scope2, &aid2))
+            .read(move |conn| {
+                repo::assets::get_asset_with_files_filtered(conn, &scope2, &aid2, include_trashed)
+            })
             .await?
             .ok_or_else(|| AppError::not_found("Asset not found."))?;
 

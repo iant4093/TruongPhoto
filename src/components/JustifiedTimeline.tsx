@@ -192,6 +192,10 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
       if (useAppStore.getState().lightboxAssetId) return;
       event.preventDefault();
       event.stopPropagation();
+      if (albumPickerOpen) {
+        setAlbumPickerOpen(false);
+        return;
+      }
       clearSelection();
     };
     document.addEventListener('keydown', onKeyDown);
@@ -199,7 +203,7 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
       document.removeEventListener('keydown', onKeyDown);
       popEscapeLayer(layer);
     };
-  }, [clearSelection, selectedIds.size]);
+  }, [albumPickerOpen, clearSelection, selectedIds.size]);
 
   const toggleSelect = useCallback(
     (assetId: string, shiftKey: boolean) => {
@@ -242,15 +246,35 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
     if (!canMutate || selectedIds.size === 0) return;
     setBulkBusy(true);
     const ids = Array.from(selectedIds);
+    const succeeded: string[] = [];
+    let firstErr: unknown = null;
     try {
-      await Promise.all(ids.map((id) => setAssetFavorite(id, true)));
-      for (const id of ids) {
+      const BATCH_SIZE = 6;
+      for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+        const chunk = ids.slice(i, i + BATCH_SIZE);
+        const results = await Promise.allSettled(chunk.map((id) => setAssetFavorite(id, true)));
+        results.forEach((res, idx) => {
+          if (res.status === 'fulfilled') {
+            succeeded.push(chunk[idx]);
+          } else if (firstErr === null) {
+            firstErr = res.reason;
+          }
+        });
+      }
+      for (const id of succeeded) {
         onAssetUpdated?.(id, { is_favorite: true });
       }
-      notifySuccess(`Favorited ${ids.length} item${ids.length === 1 ? '' : 's'}`);
-      clearSelection();
-    } catch (err) {
-      notifyError(err, 'Failed to favorite selected items');
+      if (firstErr !== null) {
+        notifyError(
+          firstErr,
+          succeeded.length > 0
+            ? `Favorited ${succeeded.length} of ${ids.length} items`
+            : 'Failed to favorite selected items',
+        );
+      } else {
+        notifySuccess(`Favorited ${succeeded.length} item${succeeded.length === 1 ? '' : 's'}`);
+        clearSelection();
+      }
     } finally {
       setBulkBusy(false);
     }
@@ -421,18 +445,20 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                 draggable={false}
               />
 
-              <button
-                type="button"
-                className={`tile-select-btn${isSelected ? ' is-selected' : ''}`}
-                aria-label={isSelected ? 'Deselect item' : 'Select item'}
-                aria-pressed={isSelected}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  toggleSelect(asset.id, e.shiftKey);
-                }}
-              >
-                {isSelected && <Check size={12} strokeWidth={2.5} />}
-              </button>
+              {(canMutate || Boolean(extraBulkActions)) && (
+                <button
+                  type="button"
+                  className={`tile-select-btn${isSelected ? ' is-selected' : ''}`}
+                  aria-label={isSelected ? 'Deselect item' : 'Select item'}
+                  aria-pressed={isSelected}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleSelect(asset.id, e.shiftKey);
+                  }}
+                >
+                  {isSelected && <Check size={12} strokeWidth={2.5} />}
+                </button>
+              )}
 
               {(canMutate || asset.is_favorite) && (
                 <button

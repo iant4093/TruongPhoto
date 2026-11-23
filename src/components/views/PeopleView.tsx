@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Check,
@@ -73,6 +73,9 @@ const PersonDetail: React.FC<PersonDetailProps> = ({
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadMoreError, setLoadMoreError] = useState(false);
+  const seqRef = useRef(0);
+  const loadedPersonIdRef = useRef<string | null>(null);
 
   const [nameInput, setNameInput] = useState(person.name ?? '');
   const [savingMeta, setSavingMeta] = useState(false);
@@ -82,17 +85,26 @@ const PersonDetail: React.FC<PersonDetailProps> = ({
   }, [person.id, person.name]);
 
   const loadAssets = useCallback(async () => {
-    setLoading(true);
+    const seq = ++seqRef.current;
+    if (loadedPersonIdRef.current !== person.id) {
+      setLoading(true);
+    }
     setError(null);
+    setLoadMoreError(false);
     try {
       const assetsRes = await listPersonAssets(person.id, { limit: 120 });
+      if (seq !== seqRef.current) return;
+      loadedPersonIdRef.current = person.id;
       setAssets(assetsRes.items);
       setNextCursor(assetsRes.next_cursor);
       setTotalCount(assetsRes.total_count);
     } catch (err) {
+      if (seq !== seqRef.current) return;
       setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (seq === seqRef.current) {
+        setLoading(false);
+      }
     }
   }, [person.id]);
 
@@ -100,11 +112,14 @@ const PersonDetail: React.FC<PersonDetailProps> = ({
     void loadAssets();
   }, [loadAssets, libraryRevision]);
 
-  const handleLoadMore = async () => {
+  const handleLoadMore = useCallback(async () => {
     if (!nextCursor || loadingMore) return;
+    const seq = seqRef.current;
     setLoadingMore(true);
+    setLoadMoreError(false);
     try {
       const res = await listPersonAssets(person.id, { cursor: nextCursor, limit: 120 });
+      if (seq !== seqRef.current) return;
       setAssets((prev) => {
         const seen = new Set(prev.map((a) => a.id));
         return [...prev, ...res.items.filter((a) => !seen.has(a.id))];
@@ -112,11 +127,15 @@ const PersonDetail: React.FC<PersonDetailProps> = ({
       setNextCursor(res.next_cursor);
       setTotalCount(res.total_count);
     } catch (err) {
+      if (seq !== seqRef.current) return;
+      setLoadMoreError(true);
       notifyError(err, 'Could not load more photos');
     } finally {
-      setLoadingMore(false);
+      if (seq === seqRef.current) {
+        setLoadingMore(false);
+      }
     }
-  };
+  }, [loadingMore, nextCursor, person.id]);
 
   const handleSaveName = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -235,9 +254,9 @@ const PersonDetail: React.FC<PersonDetailProps> = ({
       ) : assets.length > 0 ? (
         <JustifiedTimeline
           assets={assets}
-          hasMore={nextCursor !== null}
+          hasMore={nextCursor !== null && !loadMoreError}
           loadingMore={loadingMore}
-          onLoadMore={() => void handleLoadMore()}
+          onLoadMore={handleLoadMore}
           onAssetUpdated={(assetId, patch) =>
             setAssets((prev) => prev.map((a) => (a.id === assetId ? { ...a, ...patch } : a)))
           }

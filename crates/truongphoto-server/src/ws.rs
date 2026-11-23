@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
-use truongphoto_core::{WsClientMessage, WsServerEvent};
+use truongphoto_core::{Role, WsClientMessage, WsServerEvent, APP_VERSION};
 use truongphoto_db::repo;
 
 /// Authenticated WebSocket upgrade endpoint (`GET /api/ws`).
@@ -23,11 +23,40 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state, auth))
 }
 
+async fn should_deliver_ws_event(
+    state: &AppState,
+    auth: &AuthSession,
+    event: &WsServerEvent,
+) -> bool {
+    if auth.user.role == Role::Admin {
+        return true;
+    }
+    match event {
+        WsServerEvent::SettingsChanged { .. }
+        | WsServerEvent::TailscaleStatusChanged { .. }
+        | WsServerEvent::AiStateChanged { .. }
+        | WsServerEvent::JobProgress { .. } => false,
+        WsServerEvent::FolderChanged { folder_id, .. } => {
+            let uid = auth.user.id.clone();
+            let fid = folder_id.clone();
+            state
+                .db
+                .read(move |conn| {
+                    let allowed = repo::users::get_allowed_folder_ids(conn, &uid)?;
+                    Ok(allowed.iter().any(|id| id == &fid))
+                })
+                .await
+                .unwrap_or(false)
+        }
+        _ => true,
+    }
+}
+
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, auth: AuthSession) {
     let (mut sender, mut receiver) = socket.split();
 
     let connected = WsServerEvent::Connected {
-        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        server_version: APP_VERSION.to_string(),
         user_id: auth.user.id.clone(),
         role: auth.user.role,
     };
@@ -64,6 +93,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, auth: AuthSessio
             evt = rx.recv() => {
                 match evt {
                     Ok(event) => {
+                        if !should_deliver_ws_event(&state, &auth, &event).await {
+                            continue;
+                        }
                         if let Ok(json) = serde_json::to_string(&event) {
                             if sender.send(Message::text(json)).await.is_err() {
                                 break;

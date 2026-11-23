@@ -467,7 +467,14 @@ pub(crate) async fn execute_hybrid_search(
         .ai
         .vision_index(active_tier)
         .map_err(|e| AppError::internal(format!("Failed to open vision vector index: {e}")))?;
-    let fetch_k = overfetch_k(limit.saturating_add(offset));
+    let has_explicit_sort = req.sort_by.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let fetch_k = if has_explicit_sort {
+        overfetch_k(limit.saturating_add(offset))
+            .saturating_mul(4)
+            .max(1000)
+    } else {
+        overfetch_k(limit.saturating_add(offset))
+    };
     let allowed_vids = candidates.vector_ids;
 
     let (raw_vec_hits, planner_mode) = tokio::task::spawn_blocking(move || {

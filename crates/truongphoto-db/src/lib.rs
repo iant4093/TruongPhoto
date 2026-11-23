@@ -129,8 +129,9 @@ impl DbHandle {
         .await
     }
 
-    /// Checkpoints WAL (`TRUNCATE`) and cleanly shuts down the writer thread.
+    /// Drains read connections, checkpoints WAL (`TRUNCATE`), and cleanly shuts down the writer thread.
     pub async fn shutdown(&self) -> DbResult<()> {
+        self.reader.close().await;
         self.writer.shutdown().await
     }
 }

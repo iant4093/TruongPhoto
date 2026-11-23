@@ -93,6 +93,28 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       }
       hls.loadSource(hlsUrl);
       hls.attachMedia(video);
+      let recoveryAttempts = 0;
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal) return;
+        if (recoveryAttempts < 2) {
+          recoveryAttempts += 1;
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            hls.startLoad();
+            return;
+          }
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+            return;
+          }
+        }
+        hls.destroy();
+        if (playback.direct_url) {
+          video.src = playback.direct_url;
+          if (autoPlay) {
+            void video.play().catch(() => {});
+          }
+        }
+      });
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (targetTimestampSec !== null && video.readyState >= 1) {
           seekToInitial();

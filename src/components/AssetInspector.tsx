@@ -139,9 +139,13 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     return detail.tags.filter((t) => t.state === 'active');
   }, [detail]);
 
+  const activeAssetIdRef = React.useRef(assetId);
+  activeAssetIdRef.current = assetId;
+
   const handleSaveOverrides = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!canEdit || !detail) return;
+    const targetAssetId = assetId;
 
     let captureAtMs: number | null | undefined = undefined;
     if (captureInput.trim()) {
@@ -157,7 +161,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
 
     setSavingOverrides(true);
     try {
-      const updated = await updateAssetOverrides(assetId, {
+      const updated = await updateAssetOverrides(targetAssetId, {
         title: title.trim() || null,
         description: description.trim() || null,
         capture_at_ms: captureAtMs,
@@ -165,15 +169,19 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
         geo_city: geoCity.trim() || null,
         geo_country: geoCountry.trim() || null,
       });
-      setDetail(updated);
-      syncFormFromDetail(updated);
-      onAssetUpdated?.(updated);
+      if (activeAssetIdRef.current === targetAssetId) {
+        setDetail(updated);
+        syncFormFromDetail(updated);
+        onAssetUpdated?.(updated);
+      }
       bumpLibraryRevision();
       notifySuccess('Saved metadata overrides');
     } catch (err) {
       notifyError(err, 'Could not save overrides');
     } finally {
-      setSavingOverrides(false);
+      if (activeAssetIdRef.current === targetAssetId) {
+        setSavingOverrides(false);
+      }
     }
   };
 
@@ -181,34 +189,46 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     event.preventDefault();
     const cleaned = tagInput.trim();
     if (!canEdit || !cleaned || !detail) return;
+    const targetAssetId = assetId;
+    const snapshotDetail = detail;
     setTagBusy(true);
     try {
-      const nextTags = await addAssetTag(assetId, cleaned);
-      const updated = { ...detail, tags: nextTags };
-      setDetail(updated);
-      setTagInput('');
-      onAssetUpdated?.(updated);
+      const nextTags = await addAssetTag(targetAssetId, cleaned);
+      if (activeAssetIdRef.current === targetAssetId) {
+        const updated = { ...snapshotDetail, tags: nextTags };
+        setDetail(updated);
+        setTagInput('');
+        onAssetUpdated?.(updated);
+      }
       notifySuccess(`Added tag "${cleaned}"`);
     } catch (err) {
       notifyError(err, 'Could not add tag');
     } finally {
-      setTagBusy(false);
+      if (activeAssetIdRef.current === targetAssetId) {
+        setTagBusy(false);
+      }
     }
   };
 
   const handleRemoveTag = async (tag: string) => {
     if (!canEdit || !detail) return;
+    const targetAssetId = assetId;
+    const snapshotDetail = detail;
     setTagBusy(true);
     try {
-      const nextTags = await removeAssetTag(assetId, tag);
-      const updated = { ...detail, tags: nextTags };
-      setDetail(updated);
-      onAssetUpdated?.(updated);
+      const nextTags = await removeAssetTag(targetAssetId, tag);
+      if (activeAssetIdRef.current === targetAssetId) {
+        const updated = { ...snapshotDetail, tags: nextTags };
+        setDetail(updated);
+        onAssetUpdated?.(updated);
+      }
       notifySuccess(`Removed tag "${tag}"`);
     } catch (err) {
       notifyError(err, 'Could not remove tag');
     } finally {
-      setTagBusy(false);
+      if (activeAssetIdRef.current === targetAssetId) {
+        setTagBusy(false);
+      }
     }
   };
 

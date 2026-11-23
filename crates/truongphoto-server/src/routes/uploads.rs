@@ -94,6 +94,7 @@ pub async fn upload_files(
             .map_err(|e| AppError::internal(format!("Failed to create upload staging dir: {e}")))?;
 
         let staging_path = staging_dir.join(format!("{}.part", Uuid::new_v4()));
+        let mut staging_guard = StagingFileGuard::new(staging_path.clone());
         let mut out_file = tokio::fs::File::create(&staging_path)
             .await
             .map_err(|e| AppError::internal(format!("Failed to create staging file: {e}")))?;
@@ -120,7 +121,7 @@ pub async fn upload_files(
 
         if let Some(msg) = stream_err {
             drop(out_file);
-            let _ = tokio::fs::remove_file(&staging_path).await;
+            drop(staging_guard);
             errors.push(UploadItemError {
                 filename: raw_filename,
                 message: msg,
@@ -130,7 +131,7 @@ pub async fn upload_files(
 
         if let Err(e) = out_file.flush().await {
             drop(out_file);
-            let _ = tokio::fs::remove_file(&staging_path).await;
+            drop(staging_guard);
             errors.push(UploadItemError {
                 filename: raw_filename,
                 message: format!("Failed flushing upload file: {e}"),
@@ -140,7 +141,7 @@ pub async fn upload_files(
         drop(out_file);
 
         if total_bytes == 0 {
-            let _ = tokio::fs::remove_file(&staging_path).await;
+            drop(staging_guard);
             errors.push(UploadItemError {
                 filename: raw_filename,
                 message: "Uploaded file is empty (0 bytes).".to_string(),
@@ -156,15 +157,39 @@ pub async fn upload_files(
             .await
             .map_err(|e| AppError::internal(format!("Failed to create upload month dir: {e}")))?;
 
-        let dest_path = unique_dest_path(&month_dir, &sanitized);
-        if let Err(e) = tokio::fs::rename(&staging_path, &dest_path).await {
-            let _ = tokio::fs::remove_file(&staging_path).await;
-            errors.push(UploadItemError {
-                filename: raw_filename,
-                message: format!("Failed to finalize upload file: {e}"),
-            });
-            continue;
-        }
+        let staging_for_move = staging_path.clone();
+        let month_for_move = month_dir.clone();
+        let sanitized_for_move = sanitized.clone();
+        let dest_path = match tokio::task::spawn_blocking(move || {
+            finalize_staging_file_no_overwrite(
+                &staging_for_move,
+                &month_for_move,
+                &sanitized_for_move,
+            )
+        })
+        .await
+        {
+            Ok(Ok(dest)) => {
+                staging_guard.disarm();
+                dest
+            }
+            Ok(Err(e)) => {
+                drop(staging_guard);
+                errors.push(UploadItemError {
+                    filename: raw_filename,
+                    message: format!("Failed to finalize upload file: {e}"),
+                });
+                continue;
+            }
+            Err(e) => {
+                drop(staging_guard);
+                errors.push(UploadItemError {
+                    filename: raw_filename,
+                    message: format!("Failed to finalize upload file: {e}"),
+                });
+                continue;
+            }
+        };
 
         match ingest_single_file(&state, &target_folder, &dest_path).await {
             Ok(Some(asset_id)) => {
@@ -181,12 +206,14 @@ pub async fn upload_files(
                 }
             }
             Ok(None) => {
+                let _ = tokio::fs::remove_file(&dest_path).await;
                 errors.push(UploadItemError {
                     filename: raw_filename,
                     message: "Uploaded file was skipped by media classifier.".to_string(),
                 });
             }
             Err(e) => {
+                let _ = tokio::fs::remove_file(&dest_path).await;
                 errors.push(UploadItemError {
                     filename: raw_filename,
                     message: format!("Failed to ingest uploaded file: {e}"),
@@ -257,22 +284,41 @@ async fn resolve_upload_target_folder(
     let folder = state
         .db
         .write(move |conn| {
-            let folder = repo::folders::find_or_create_managed_uploads_folder(
+            let (folder, newly_created) = repo::folders::find_or_create_managed_uploads_folder(
                 conn,
                 &root_str,
                 vol.volume_uuid.as_deref(),
                 vol.volume_label.as_deref(),
             )?;
             if !role.is_admin() {
-                conn.execute(
-                    "INSERT OR IGNORE INTO user_folder_acls (user_id, folder_id, granted_at_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![uid, folder.id, now_ms],
-                )?;
+                if newly_created {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO user_folder_acls (user_id, folder_id, granted_at_ms)
+                         VALUES (?1, ?2, ?3)",
+                        params![uid, folder.id, now_ms],
+                    )?;
+                } else {
+                    let allowed = repo::users::get_allowed_folder_ids(conn, &uid)?
+                        .iter()
+                        .any(|id| id == &folder.id);
+                    if !allowed {
+                        return Err(truongphoto_db::DbError::InvalidArgument(
+                            "__FORBIDDEN__".to_string(),
+                        ));
+                    }
+                }
             }
             Ok(folder)
         })
-        .await?;
+        .await
+        .map_err(|e| match e {
+            truongphoto_db::DbError::InvalidArgument(ref m) if m == "__FORBIDDEN__" => {
+                AppError::forbidden(
+                    "You do not have permission to upload into the managed uploads folder.",
+                )
+            }
+            other => AppError::from(other),
+        })?;
 
     state
         .watcher
@@ -307,12 +353,33 @@ fn sanitize_upload_filename(raw: &str) -> String {
     }
 }
 
-fn unique_dest_path(dir: &Path, filename: &str) -> PathBuf {
-    let candidate = dir.join(filename);
-    if !candidate.exists() {
-        return candidate;
+struct StagingFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl StagingFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
     }
 
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for StagingFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn finalize_staging_file_no_overwrite(
+    staging_path: &Path,
+    dir: &Path,
+    filename: &str,
+) -> std::io::Result<PathBuf> {
     let p = Path::new(filename);
     let stem = p
         .file_stem()
@@ -320,11 +387,37 @@ fn unique_dest_path(dir: &Path, filename: &str) -> PathBuf {
         .filter(|s| !s.is_empty())
         .unwrap_or("upload");
     let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-    let short_id = &Uuid::new_v4().to_string()[..8];
-    let unique_name = if ext.is_empty() {
-        format!("{stem}_{short_id}")
-    } else {
-        format!("{stem}_{short_id}.{ext}")
-    };
-    dir.join(unique_name)
+
+    for attempt in 0..16 {
+        let candidate = if attempt == 0 {
+            dir.join(filename)
+        } else {
+            let short_id = &Uuid::new_v4().to_string()[..8];
+            let unique_name = if ext.is_empty() {
+                format!("{stem}_{short_id}")
+            } else {
+                format!("{stem}_{short_id}.{ext}")
+            };
+            dir.join(unique_name)
+        };
+
+        match std::fs::hard_link(staging_path, &candidate) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(staging_path);
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                // Fallback for filesystems where hard links are unsupported (e.g., exFAT/SMB).
+                if !candidate.exists() {
+                    std::fs::rename(staging_path, &candidate)?;
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "Could not allocate unique destination filename",
+    ))
 }

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { FolderPlus, Images, Upload } from 'lucide-react';
 import { listAssets } from '../../lib/api';
 import { plural } from '../../lib/format';
@@ -21,20 +21,32 @@ export const TimelineView: React.FC = () => {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const seqRef = useRef(0);
+  const hasLoadedOnceRef = useRef(false);
 
   const loadInitial = useCallback(async () => {
-    setLoading(true);
+    const seq = ++seqRef.current;
+    if (!hasLoadedOnceRef.current) {
+      setLoading(true);
+    }
     setError(null);
+    setLoadMoreError(false);
     try {
       const assetsRes = await listAssets({ limit: 120 });
+      if (seq !== seqRef.current) return;
+      hasLoadedOnceRef.current = true;
       setItems(assetsRes.items);
       setNextCursor(assetsRes.next_cursor);
       setTotalCount(assetsRes.total_count);
     } catch (err) {
+      if (seq !== seqRef.current) return;
       setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (seq === seqRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -44,12 +56,15 @@ export const TimelineView: React.FC = () => {
 
   const handleLoadMore = useCallback(async () => {
     if (!nextCursor || loadingMore) return;
+    const seq = seqRef.current;
     setLoadingMore(true);
+    setLoadMoreError(false);
     try {
       const res = await listAssets({
         limit: 120,
         cursor: nextCursor,
       });
+      if (seq !== seqRef.current) return;
       setItems((prev) => {
         const seen = new Set(prev.map((a) => a.id));
         const appended = res.items.filter((a) => !seen.has(a.id));
@@ -58,9 +73,13 @@ export const TimelineView: React.FC = () => {
       setNextCursor(res.next_cursor);
       setTotalCount(res.total_count);
     } catch (err) {
+      if (seq !== seqRef.current) return;
+      setLoadMoreError(true);
       setError(errorMessage(err));
     } finally {
-      setLoadingMore(false);
+      if (seq === seqRef.current) {
+        setLoadingMore(false);
+      }
     }
   }, [loadingMore, nextCursor]);
 
@@ -101,9 +120,9 @@ export const TimelineView: React.FC = () => {
       ) : items.length > 0 ? (
         <JustifiedTimeline
           assets={items}
-          hasMore={nextCursor !== null}
+          hasMore={nextCursor !== null && !loadMoreError}
           loadingMore={loadingMore}
-          onLoadMore={() => void handleLoadMore()}
+          onLoadMore={handleLoadMore}
           onAssetUpdated={handleAssetUpdated}
           onAssetsTrashed={handleAssetsTrashed}
         />

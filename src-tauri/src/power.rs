@@ -53,6 +53,7 @@ impl PowerMonitorHandle {
     /// Signals background polling threads to exit cleanly.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+        platform::stop();
     }
 }
 
@@ -207,28 +208,31 @@ mod platform {
                 }
             });
     }
+
+    pub fn stop() {}
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
     use super::{PowerEvent, PowerSink};
     use parking_lot::Mutex;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::Arc;
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Power::{
-        GetSystemPowerStatus, RegisterPowerSettingNotification, POWERBROADCAST_SETTING,
-        SYSTEM_POWER_STATUS,
+        GetSystemPowerStatus, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
+        POWERBROADCAST_SETTING, SYSTEM_POWER_STATUS,
     };
     use windows::Win32::System::RemoteDesktop::{
-        WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+        WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
     };
     use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     static WINDOWS_SINK: Mutex<Option<Arc<PowerSink>>> = Mutex::new(None);
+    static WATCHER_HWND: AtomicIsize = AtomicIsize::new(0);
 
     fn emit(event: PowerEvent) {
         if let Some(sink) = WINDOWS_SINK.lock().as_ref().cloned() {
@@ -251,6 +255,14 @@ mod platform {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
+                return LRESULT(0);
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                return LRESULT(0);
+            }
             WM_WTSSESSION_CHANGE => match wparam.0 as u32 {
                 WTS_SESSION_LOCK | WTS_CONSOLE_DISCONNECT => emit(PowerEvent::SessionLock),
                 WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT => emit(PowerEvent::SessionUnlock),
@@ -278,13 +290,26 @@ mod platform {
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 
-    pub fn start(sink: Arc<PowerSink>, _stop: Arc<AtomicBool>) {
+    pub fn stop() {
+        *WINDOWS_SINK.lock() = None;
+        let raw = WATCHER_HWND.swap(0, Ordering::AcqRel);
+        if raw != 0 {
+            let hwnd = HWND(raw as *mut core::ffi::c_void);
+            // SAFETY: Posting WM_CLOSE to our hidden watcher window is thread-safe and triggers
+            // DestroyWindow -> PostQuitMessage(0) on the watcher thread.
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    pub fn start(sink: Arc<PowerSink>, stop: Arc<AtomicBool>) {
         *WINDOWS_SINK.lock() = Some(sink);
         query_and_emit_battery();
 
         let _ = std::thread::Builder::new()
             .name("tp-power-watcher".into())
-            .spawn(|| unsafe {
+            .spawn(move || unsafe {
                 let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
                 let class_name = w!("TruongPhotoPowerWatcher");
                 let wc = WNDCLASSEXW {
@@ -309,28 +334,51 @@ mod platform {
                     Some(hinstance.into()),
                     None,
                 ) {
+                    WATCHER_HWND.store(hwnd.0 as isize, Ordering::Release);
+                    let mut wts_registered = false;
                     let mut delay = std::time::Duration::from_millis(500);
                     let mut waited = std::time::Duration::ZERO;
-                    while let Err(err) =
-                        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
-                    {
-                        if waited >= std::time::Duration::from_secs(60) {
-                            tracing::warn!("lock/unlock detection unavailable: {err}");
-                            break;
+                    while !stop.load(Ordering::Acquire) {
+                        match WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+                            Ok(()) => {
+                                wts_registered = true;
+                                break;
+                            }
+                            Err(err) => {
+                                if waited >= std::time::Duration::from_secs(60) {
+                                    tracing::warn!("lock/unlock detection unavailable: {err}");
+                                    break;
+                                }
+                                std::thread::sleep(delay);
+                                waited += delay;
+                                delay = (delay * 2).min(std::time::Duration::from_secs(8));
+                            }
                         }
-                        std::thread::sleep(delay);
-                        waited += delay;
-                        delay = (delay * 2).min(std::time::Duration::from_secs(8));
                     }
-                    let _ = RegisterPowerSettingNotification(
-                        HANDLE(hwnd.0),
-                        &GUID_CONSOLE_DISPLAY_STATE,
-                        REGISTER_NOTIFICATION_FLAGS(0),
-                    );
-                    let mut msg = MSG::default();
-                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                        let _ = DispatchMessageW(&msg);
+                    let power_notify = if !stop.load(Ordering::Acquire) {
+                        RegisterPowerSettingNotification(
+                            HANDLE(hwnd.0),
+                            &GUID_CONSOLE_DISPLAY_STATE,
+                            REGISTER_NOTIFICATION_FLAGS(0),
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
+                    if !stop.load(Ordering::Acquire) {
+                        let mut msg = MSG::default();
+                        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                            let _ = DispatchMessageW(&msg);
+                        }
                     }
+                    WATCHER_HWND.store(0, Ordering::Release);
+                    if let Some(handle) = power_notify {
+                        let _ = UnregisterPowerSettingNotification(handle);
+                    }
+                    if wts_registered {
+                        let _ = WTSUnRegisterSessionNotification(hwnd);
+                    }
+                    let _ = DestroyWindow(hwnd);
                 }
             });
     }
@@ -343,6 +391,7 @@ mod platform {
     use std::sync::Arc;
 
     pub fn start(_sink: Arc<PowerSink>, _stop: Arc<AtomicBool>) {}
+    pub fn stop() {}
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use truongphoto_core::{ChatRole, ChatTier, RouterPlan};
@@ -32,6 +33,14 @@ impl Drop for SidecarProcess {
     }
 }
 
+struct InFlightGuard<'a>(&'a AtomicUsize);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Zero-`cmake` Tier 1–3 conversational router & VLM reranker backed by a managed local
 /// `llama-server` HTTP sidecar process, falling back cleanly to [`ClassicChatRouter`]
 /// on Tier 0 or when the sidecar binary / GGUF model files are not yet installed.
@@ -39,6 +48,8 @@ pub struct SidecarLlamaRouter {
     models_dir: PathBuf,
     classic: ClassicChatRouter,
     process: Mutex<Option<SidecarProcess>>,
+    in_flight: AtomicUsize,
+    shutting_down: AtomicBool,
 }
 
 impl std::fmt::Debug for SidecarLlamaRouter {
@@ -56,6 +67,8 @@ impl SidecarLlamaRouter {
             models_dir: models_dir.into(),
             classic: ClassicChatRouter::new(),
             process: Mutex::new(None),
+            in_flight: AtomicUsize::new(0),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -80,7 +93,7 @@ impl SidecarLlamaRouter {
     }
 
     fn ensure_server_port(&self, tier: ChatTier) -> Result<Option<u16>, AiError> {
-        if tier == ChatTier::Tier0 {
+        if tier == ChatTier::Tier0 || self.shutting_down.load(Ordering::Acquire) {
             return Ok(None);
         }
         let Some(bin_path) = discover_llama_server_bin_with_models_dir(&self.models_dir) else {
@@ -97,6 +110,9 @@ impl SidecarLlamaRouter {
         }
 
         let mut guard = self.process.lock();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         if let Some(existing) = guard.as_mut() {
             let alive = matches!(existing.child.try_wait(), Ok(None));
             if alive && existing.tier == tier {
@@ -108,7 +124,9 @@ impl SidecarLlamaRouter {
         }
 
         let port = pick_ephemeral_port()?;
-        let ctx_size = if mmproj_path.is_some() {
+        let ctx_size = if tier == ChatTier::Tier3 && mmproj_path.is_some() {
+            "16384"
+        } else if mmproj_path.is_some() {
             "8192"
         } else {
             "4096"
@@ -153,7 +171,12 @@ impl SidecarLlamaRouter {
             .spawn()
             .map_err(|e| AiError::ExternalTool(format!("spawn {}: {e}", bin_path.display())))?;
 
-        if let Err(e) = wait_for_server_health(port, &mut child, Duration::from_secs(30)) {
+        let health_timeout = if tier == ChatTier::Tier3 {
+            Duration::from_secs(120)
+        } else {
+            Duration::from_secs(45)
+        };
+        if let Err(e) = wait_for_server_health(port, &mut child, health_timeout) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(e);
@@ -168,6 +191,15 @@ impl SidecarLlamaRouter {
         Ok(Some(port))
     }
 
+    fn clear_if_dead(&self) {
+        let mut guard = self.process.lock();
+        if let Some(existing) = guard.as_mut() {
+            if !matches!(existing.child.try_wait(), Ok(None)) {
+                *guard = None;
+            }
+        }
+    }
+
     fn touch_last_used(&self) {
         if let Some(proc) = self.process.lock().as_mut() {
             proc.last_used = Instant::now();
@@ -177,6 +209,8 @@ impl SidecarLlamaRouter {
 
 impl ChatRouterBackend for SidecarLlamaRouter {
     fn route_turn(&self, tier: ChatTier, input: &ChatTurnInput) -> Result<RouterPlan, AiError> {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let _in_flight_guard = InFlightGuard(&self.in_flight);
         let port = match self.ensure_server_port(tier) {
             Ok(Some(port)) => port,
             Ok(None) => return self.classic.route_turn(tier, input),
@@ -230,6 +264,7 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         let content = match post_chat_completion(port, &payload) {
             Ok(c) => c,
             Err(err) => {
+                self.clear_if_dead();
                 tracing::warn!(tier = %tier, error = %err, "llama-server completion failed; falling back to ClassicChatRouter");
                 return self.classic.route_turn(tier, input);
             }
@@ -269,6 +304,8 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         if mmproj.is_none() {
             return Ok(None);
         }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let _in_flight_guard = InFlightGuard(&self.in_flight);
         let Some(port) = self.ensure_server_port(tier)? else {
             return Ok(None);
         };
@@ -295,11 +332,18 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         })];
 
         for c in &valid_candidates {
+            let mime = if c.thumb_bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                "image/jpeg"
+            } else if c.thumb_bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                "image/png"
+            } else {
+                "image/webp"
+            };
             let encoded = encode_base64(&c.thumb_bytes);
             user_parts.push(json!({
                 "type": "image_url",
                 "image_url": {
-                    "url": format!("data:image/webp;base64,{encoded}")
+                    "url": format!("data:{mime};base64,{encoded}")
                 }
             }));
         }
@@ -328,6 +372,8 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         let payload = json!({
             "model": tier.chat_model_id().unwrap_or("gemma4-26b-a4b"),
             "temperature": 0.0,
+            "max_tokens": 512,
+            "cache_prompt": false,
             "messages": [
                 {
                     "role": "system",
@@ -348,7 +394,13 @@ impl ChatRouterBackend for SidecarLlamaRouter {
             }
         });
 
-        let content = post_chat_completion(port, &payload)?;
+        let content = match post_chat_completion(port, &payload) {
+            Ok(c) => c,
+            Err(e) => {
+                self.clear_if_dead();
+                return Err(e);
+            }
+        };
         self.touch_last_used();
 
         let parsed: SidecarRerankPayload = serde_json::from_str(content.trim()).map_err(|e| {
@@ -380,6 +432,9 @@ impl ChatRouterBackend for SidecarLlamaRouter {
     }
 
     fn evict_idle(&self, max_idle: Duration) -> usize {
+        if !max_idle.is_zero() && self.in_flight.load(Ordering::Acquire) > 0 {
+            return 0;
+        }
         let mut guard = self.process.lock();
         let Some(proc) = guard.as_ref() else {
             return 0;
@@ -849,6 +904,10 @@ fn try_apply_filter_removal(lower: &str, prior: &RouterPlan, plan: &mut RouterPl
         return false;
     }
 
+    // Extract the filter target label (before any `:` value like `"remove the Location: Mountain Resort filter"`)
+    // so filter values such as "Resort" or "Vintage" cannot accidentally trigger unrelated removals.
+    let target_clause = lower.split_once(':').map(|(lhs, _)| lhs).unwrap_or(lower);
+
     let mut updated = prior.clone();
     updated.intent = Some("search".to_string());
     updated.clear_prior_filters = true;
@@ -856,69 +915,95 @@ fn try_apply_filter_removal(lower: &str, prior: &RouterPlan, plan: &mut RouterPl
     updated.follow_up_suggestions = plan.follow_up_suggestions.clone();
 
     let mut removed_any = false;
-    if lower.contains("location") || lower.contains("place") || lower.contains("folder") {
+    if has_word(target_clause, "search")
+        || has_word(target_clause, "query")
+        || has_word(target_clause, "subject")
+        || has_word(target_clause, "scene")
+    {
+        updated.semantic_query = None;
+        removed_any = true;
+    }
+    if has_word(target_clause, "location")
+        || has_word(target_clause, "place")
+        || has_word(target_clause, "folder")
+    {
         updated.location_query = None;
         removed_any = true;
     }
-    if lower.contains("person") || lower.contains("people") {
+    if has_word(target_clause, "person") || has_word(target_clause, "people") {
         updated.person_names.clear();
         updated.has_people = None;
         removed_any = true;
     }
-    if lower.contains("date") || lower.contains("month") || lower.contains("year") {
+    if has_word(target_clause, "date")
+        || has_word(target_clause, "month")
+        || has_word(target_clause, "year")
+        || has_word(target_clause, "from")
+        || has_word(target_clause, "until")
+    {
         updated.date_from_ms = None;
         updated.date_to_ms = None;
         removed_any = true;
     }
-    if lower.contains("camera") {
+    if has_word(target_clause, "camera") {
         updated.camera_model = None;
         removed_any = true;
     }
-    if lower.contains("lens") {
+    if has_word(target_clause, "lens") {
         updated.lens_model = None;
         removed_any = true;
     }
-    if lower.contains("focal") || has_word(lower, "mm") {
+    if has_word(target_clause, "focal") || has_word(target_clause, "mm") {
         updated.focal_length_min_mm = None;
         updated.focal_length_max_mm = None;
         removed_any = true;
     }
-    if lower.contains("aperture") || lower.contains("f/") {
+    if has_word(target_clause, "aperture") || target_clause.contains("f/") {
         updated.aperture_min_f = None;
         updated.aperture_max_f = None;
         removed_any = true;
     }
-    if has_word(lower, "iso") {
+    if has_word(target_clause, "iso") {
         updated.iso_min = None;
         updated.iso_max = None;
         removed_any = true;
     }
-    if lower.contains("shutter") || lower.contains("exposure") {
+    if has_word(target_clause, "shutter") || has_word(target_clause, "exposure") {
         updated.shutter_speed_min_sec = None;
         updated.shutter_speed_max_sec = None;
         removed_any = true;
     }
-    if lower.contains("orientation") || lower.contains("portrait") || lower.contains("landscape") {
+    if has_word(target_clause, "orientation")
+        || has_word(target_clause, "portrait")
+        || has_word(target_clause, "landscape")
+    {
         updated.orientation = None;
         removed_any = true;
     }
-    if lower.contains("sort") {
+    if has_word(target_clause, "sort") {
         updated.sort_by = None;
         removed_any = true;
     }
-    if lower.contains("tag") {
+    if has_word(target_clause, "tag") || has_word(target_clause, "tags") {
         updated.tags.clear();
         removed_any = true;
     }
-    if lower.contains("kind") || lower.contains("video") {
+    if has_word(target_clause, "kind")
+        || has_word(target_clause, "video")
+        || has_word(target_clause, "videos")
+    {
         updated.kind = None;
         removed_any = true;
     }
-    if lower.contains("favorite") || lower.contains("favourite") {
+    if has_word(target_clause, "favorite")
+        || has_word(target_clause, "favorites")
+        || has_word(target_clause, "favourite")
+        || has_word(target_clause, "favourites")
+    {
         updated.favorite = None;
         removed_any = true;
     }
-    if lower.contains("ocr") || lower.contains("text") {
+    if has_word(target_clause, "ocr") || has_word(target_clause, "text") {
         updated.ocr_terms = None;
         removed_any = true;
     }
@@ -943,26 +1028,71 @@ fn season_date_range_ms(lower: &str, now_utc: DateTime<Utc>) -> Option<(i64, i64
     let today = now_utc.date_naive();
     let y = today.year();
     let m = today.month();
+    let wants_last = lower.contains("last summer")
+        || lower.contains("last spring")
+        || lower.contains("last fall")
+        || lower.contains("last autumn")
+        || lower.contains("last winter");
     let (start, end) = if has_word(lower, "summer") {
-        let sy = if m >= 6 { y } else { y - 1 };
+        let sy = if wants_last {
+            if m > 8 {
+                y
+            } else {
+                y - 1
+            }
+        } else if m >= 6 {
+            y
+        } else {
+            y - 1
+        };
         (
             NaiveDate::from_ymd_opt(sy, 6, 1)?,
             NaiveDate::from_ymd_opt(sy, 8, 31)?,
         )
     } else if has_word(lower, "spring") {
-        let sy = if m >= 3 { y } else { y - 1 };
+        let sy = if wants_last {
+            if m > 5 {
+                y
+            } else {
+                y - 1
+            }
+        } else if m >= 3 {
+            y
+        } else {
+            y - 1
+        };
         (
             NaiveDate::from_ymd_opt(sy, 3, 1)?,
             NaiveDate::from_ymd_opt(sy, 5, 31)?,
         )
     } else if has_word(lower, "fall") || has_word(lower, "autumn") {
-        let sy = if m >= 9 { y } else { y - 1 };
+        let sy = if wants_last {
+            if m > 11 {
+                y
+            } else {
+                y - 1
+            }
+        } else if m >= 9 {
+            y
+        } else {
+            y - 1
+        };
         (
             NaiveDate::from_ymd_opt(sy, 9, 1)?,
             NaiveDate::from_ymd_opt(sy, 11, 30)?,
         )
     } else if has_word(lower, "winter") {
-        let end_y = if m >= 3 { y } else { y - 1 };
+        let end_y = if wants_last {
+            if m >= 3 {
+                y
+            } else {
+                y - 1
+            }
+        } else if m >= 3 {
+            y
+        } else {
+            y - 1
+        };
         let feb_last = NaiveDate::from_ymd_opt(end_y, 3, 1)?.pred_opt()?;
         (NaiveDate::from_ymd_opt(end_y - 1, 12, 1)?, feb_last)
     } else {
@@ -1075,8 +1205,22 @@ fn sanitize_sidecar_plan(
             .iter()
             .any(|kw| lower.contains(kw)));
 
-    if is_meta_info_question
-        || (plan.intent.as_deref() == Some("answer") && !is_explicit_show_search)
+    let has_specific_count_filter = (!plan.person_names.is_empty()
+        || plan.date_from_ms.is_some()
+        || plan.date_to_ms.is_some()
+        || plan.location_query.is_some()
+        || plan.kind.is_some()
+        || plan.favorite.is_some()
+        || lower.contains("how many video")
+        || lower.contains("how many favorite")
+        || lower.contains("how many favourite")
+        || lower.contains(" of "))
+        && (lower.contains("how many") || lower.contains("total "));
+
+    if (is_meta_info_question && !has_specific_count_filter)
+        || (plan.intent.as_deref() == Some("answer")
+            && !is_explicit_show_search
+            && !has_specific_count_filter)
     {
         plan.intent = Some("answer".to_string());
         clear_all_search_filters(plan);
@@ -1163,15 +1307,25 @@ fn sanitize_sidecar_plan(
         || lower
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
             .any(|tok| {
-                tok.starts_with('f')
-                    && tok.len() >= 2
-                    && tok[1..].chars().all(|c| c.is_ascii_digit() || c == '.')
-                    && tok[1..].chars().any(|c| c.is_ascii_digit())
+                if !tok.starts_with('f') || tok.len() < 2 {
+                    return false;
+                }
+                let num_part = &tok[1..];
+                if let Ok(v) = num_part.parse::<f64>() {
+                    // Require realistic f-stop range; exclude bare "f1" (Formula 1) / "f150" (truck).
+                    (num_part.contains('.') && (0.7..=64.0).contains(&v))
+                        || (!num_part.contains('.')
+                            && (2.0..=32.0).contains(&v)
+                            && num_part != "16")
+                } else {
+                    false
+                }
             });
     let has_wide_open_phrase = lower.contains("wide open")
         || lower.contains("wide-open")
         || lower.contains("bokeh")
-        || lower.contains("shallow");
+        || lower.contains("shallow depth")
+        || lower.contains("shallow dof");
     let has_aperture_cue = has_explicit_fstop
         || has_wide_open_phrase
         || lower.contains("aperture")
@@ -1203,7 +1357,8 @@ fn sanitize_sidecar_plan(
 
     let has_iso_cue = has_word(&lower, "iso")
         || has_numeric_unit(&lower, "iso")
-        || lower.contains("grain")
+        || lower.contains("film grain")
+        || has_word(&lower, "grainy")
         || has_word(&lower, "noisy")
         || has_word(&lower, "noise");
     let prior_had_iso = prior.iso_min.is_some() || prior.iso_max.is_some();
@@ -1259,14 +1414,41 @@ fn sanitize_sidecar_plan(
         || lower.contains("slow shutter")
         || lower.contains("silky")
         || lower.contains("motion blur");
-    let has_explicit_shutter_frac = lower.contains("1/");
+    let has_explicit_shutter_frac = lower.split_whitespace().any(|tok| {
+        let cleaned = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/');
+        if let Some(denom) = cleaned.strip_prefix("1/") {
+            let denom = denom.trim_end_matches('s');
+            !denom.contains('/') && !denom.is_empty() && denom.chars().all(|c| c.is_ascii_digit())
+        } else {
+            false
+        }
+    });
+    let has_seconds_unit = lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+        .any(|tok| {
+            let Some(num) = tok.strip_suffix('s') else {
+                return false;
+            };
+            if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                return false;
+            }
+            // Exclude decades like "90s", "80s", "1990s", "2000s".
+            if !num.contains('.') {
+                if let Ok(v) = num.parse::<u32>() {
+                    if matches!(v, 20 | 30 | 40 | 50 | 60 | 70 | 80 | 90 | 1900..=2099) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
     let has_shutter_cue = lower.contains("shutter")
         || lower.contains("exposure")
         || has_long_exp_phrase
         || lower.contains("freeze")
         || has_explicit_shutter_frac
         || has_numeric_unit(&lower, "sec")
-        || has_numeric_unit(&lower, "s")
+        || has_seconds_unit
         || has_word(&lower, "sec")
         || has_word(&lower, "secs")
         || has_word(&lower, "seconds");
@@ -1427,6 +1609,51 @@ fn sanitize_sidecar_plan(
         "fall",
         "autumn",
     ];
+    // Season date rescue: run BEFORE moving season words from location_query to semantic_query,
+    // and allow combining with person/camera filters (e.g. "summer photos of Sebastian").
+    if plan.date_from_ms.is_none() && plan.date_to_ms.is_none() {
+        if let Some((from_ms, to_ms)) = season_date_range_ms(&lower, now_utc) {
+            plan.date_from_ms = Some(from_ms);
+            plan.date_to_ms = Some(to_ms);
+            if plan.location_query.as_deref().is_some_and(|l| {
+                matches!(
+                    l.trim().to_ascii_lowercase().as_str(),
+                    "summer" | "spring" | "fall" | "autumn" | "winter"
+                )
+            }) {
+                plan.location_query = None;
+            }
+            if plan.semantic_query.as_deref().is_some_and(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "summer" | "spring" | "fall" | "autumn" | "winter"
+                )
+            }) {
+                plan.semantic_query = None;
+            }
+            if !plan_has_any_criteria(prior) {
+                plan.clear_prior_filters = true;
+            }
+            if plan.assistant_reply.trim().is_empty()
+                || plan
+                    .assistant_reply
+                    .to_ascii_lowercase()
+                    .contains("didn't find")
+            {
+                let season_name = if has_word(&lower, "summer") {
+                    "summer"
+                } else if has_word(&lower, "spring") {
+                    "spring"
+                } else if has_word(&lower, "fall") || has_word(&lower, "autumn") {
+                    "fall"
+                } else {
+                    "winter"
+                };
+                plan.assistant_reply = format!("Here are your {season_name} photos.");
+            }
+        }
+    }
+
     if let Some(loc) = plan.location_query.as_deref() {
         let loc_low = loc.trim().to_ascii_lowercase();
         if GENERIC_SCENE_LOCATIONS.contains(&loc_low.as_str()) {
@@ -1438,26 +1665,6 @@ fn sanitize_sidecar_plan(
                     _ => moved,
                 };
             }
-        }
-    }
-
-    // Season date rescue: if the user asked for "summer/spring/fall/winter photos" and the LLM
-    // left dates and semantic_query empty, map cleanly to the most recent matching season range.
-    if plan.date_from_ms.is_none() && plan.date_to_ms.is_none() && !plan_has_any_criteria(plan) {
-        if let Some((from_ms, to_ms)) = season_date_range_ms(&lower, now_utc) {
-            plan.date_from_ms = Some(from_ms);
-            plan.date_to_ms = Some(to_ms);
-            plan.clear_prior_filters = true;
-            let season_name = if has_word(&lower, "summer") {
-                "summer"
-            } else if has_word(&lower, "spring") {
-                "spring"
-            } else if has_word(&lower, "fall") || has_word(&lower, "autumn") {
-                "fall"
-            } else {
-                "winter"
-            };
-            plan.assistant_reply = format!("Here are your {season_name} photos.");
         }
     }
 

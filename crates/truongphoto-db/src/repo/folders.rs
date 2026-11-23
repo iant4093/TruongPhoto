@@ -275,13 +275,14 @@ pub fn set_folder_last_scanned(
     Ok(affected > 0)
 }
 
-/// Returns the existing managed-uploads folder or registers one at `root_path` if missing.
+/// Returns the existing managed-uploads folder or registers one at `root_path` if missing,
+/// along with `true` if a new folder record was created.
 pub fn find_or_create_managed_uploads_folder(
     conn: &Connection,
     root_path: &str,
     volume_uuid: Option<&str>,
     volume_label: Option<&str>,
-) -> DbResult<FolderRecord> {
+) -> DbResult<(FolderRecord, bool)> {
     let managed_sql = format!(
         "SELECT {FOLDER_COLUMNS}
          FROM folders
@@ -293,7 +294,7 @@ pub fn find_or_create_managed_uploads_folder(
         .query_row(&managed_sql, [], row_to_folder_record)
         .optional()?
     {
-        return Ok(existing);
+        return Ok((existing, false));
     }
 
     let by_path_sql = format!(
@@ -316,10 +317,10 @@ pub fn find_or_create_managed_uploads_folder(
                 ..Default::default()
             },
         )?;
-        return Ok(updated.unwrap_or(existing));
+        return Ok((updated.unwrap_or(existing), false));
     }
 
-    create_folder(
+    let created = create_folder(
         conn,
         &CreateFolder {
             id: uuid::Uuid::new_v4().to_string(),
@@ -330,5 +331,6 @@ pub fn find_or_create_managed_uploads_folder(
             is_managed_uploads: true,
             allow_disk_delete: true,
         },
-    )
+    )?;
+    Ok((created, true))
 }

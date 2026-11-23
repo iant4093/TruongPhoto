@@ -121,7 +121,7 @@ impl MdnsHandle {
         };
 
         let host_fqdn = ensure_trailing_dot(&self.hostname);
-        let properties = [("path", "/"), ("version", env!("CARGO_PKG_VERSION"))];
+        let properties = [("path", "/"), ("version", truongphoto_core::APP_VERSION)];
         let info = match ServiceInfo::new(
             SERVICE_TYPE,
             INSTANCE_NAME,

@@ -169,17 +169,43 @@ export const SettingsView: React.FC = () => {
   const [savingMapMode, setSavingMapMode] = useState(false);
   const [downloadingBasemap, setDownloadingBasemap] = useState(false);
 
+  const srvUploadsDir = adminSettings?.managed_uploads_dir;
+  const srvThumbsDir = adminSettings?.thumbnails_dir;
+  const srvCacheDir = adminSettings?.cache_dir;
+  const srvCacheLimitGb = adminSettings?.cache_limit_gb;
+  const srvBackupDir = adminSettings?.backup_dir;
+  const srvBackupKeepCount = adminSettings?.backup_keep_count;
+  const srvBackupIntervalHours = adminSettings?.backup_interval_hours;
+  const srvCpuThrottlePercent = adminSettings?.cpu_throttle_percent;
+
   useEffect(() => {
-    if (!adminSettings) return;
-    setUploadsDir(adminSettings.managed_uploads_dir);
-    setThumbsDir(adminSettings.thumbnails_dir);
-    setCacheDir(adminSettings.cache_dir);
-    setCacheLimitGb(String(adminSettings.cache_limit_gb));
-    setBackupDir(adminSettings.backup_dir);
-    setBackupKeepCount(String(adminSettings.backup_keep_count));
-    setBackupIntervalHours(String(adminSettings.backup_interval_hours ?? 24));
-    setCpuThrottlePercent(String(adminSettings.cpu_throttle_percent ?? 80));
-  }, [adminSettings]);
+    if (srvUploadsDir !== undefined) setUploadsDir(srvUploadsDir);
+  }, [srvUploadsDir]);
+  useEffect(() => {
+    if (srvThumbsDir !== undefined) setThumbsDir(srvThumbsDir);
+  }, [srvThumbsDir]);
+  useEffect(() => {
+    if (srvCacheDir !== undefined) setCacheDir(srvCacheDir);
+  }, [srvCacheDir]);
+  useEffect(() => {
+    if (srvCacheLimitGb !== undefined) setCacheLimitGb(String(srvCacheLimitGb));
+  }, [srvCacheLimitGb]);
+  useEffect(() => {
+    if (srvBackupDir !== undefined) setBackupDir(srvBackupDir);
+  }, [srvBackupDir]);
+  useEffect(() => {
+    if (srvBackupKeepCount !== undefined) setBackupKeepCount(String(srvBackupKeepCount));
+  }, [srvBackupKeepCount]);
+  useEffect(() => {
+    if (srvBackupIntervalHours !== undefined) {
+      setBackupIntervalHours(String(srvBackupIntervalHours ?? 24));
+    }
+  }, [srvBackupIntervalHours]);
+  useEffect(() => {
+    if (srvCpuThrottlePercent !== undefined) {
+      setCpuThrottlePercent(String(srvCpuThrottlePercent ?? 80));
+    }
+  }, [srvCpuThrottlePercent]);
 
   useEffect(() => {
     if (storeTailscaleStatus) {

@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Image as ImageIcon, Play, Search } from 'lucide-react';
 import { mediaThumbUrl } from '../lib/api';
 import { formatDateTime } from '../lib/format';
+import { notifyError } from '../store/feedback';
 import { useAppStore } from '../store/useAppStore';
 import type { PlannerMode, SearchHit } from '../types/api';
 import { SearchFilterBar } from './SearchFilterBar';
@@ -114,7 +115,10 @@ export const SearchResultsView: React.FC = () => {
   const hits = searchResponse?.items ?? [];
   const totalCount = searchResponse?.total_count ?? 0;
   const hasMore = hits.length < totalCount;
-  const allHitIds = useMemo(() => hits.map((h) => h.asset.id), [hits]);
+  const allHitIds = useMemo(
+    () => Array.from(new Set(hits.map((h) => h.asset.id))),
+    [hits],
+  );
 
   const telemetryText = searchResponse
     ? `${searchResponse.total_count} results · ${formatPlannerMode(searchResponse.planner_mode)} · ${searchResponse.elapsed_ms} ms`
@@ -168,7 +172,11 @@ export const SearchResultsView: React.FC = () => {
                 type="button"
                 className="button"
                 disabled={searchLoading}
-                onClick={() => void loadMoreSearch()}
+                onClick={() =>
+                  void loadMoreSearch().catch((err) =>
+                    notifyError(err, 'Could not load more search results'),
+                  )
+                }
               >
                 {searchLoading
                   ? 'Loading more…'

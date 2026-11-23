@@ -112,7 +112,7 @@ fn pick_platform_asset<'a>(assets: &'a [GithubAsset], os: &str) -> Option<&'a Gi
 pub async fn check_for_updates(
     RequireAdmin(_admin): RequireAdmin,
 ) -> Result<Json<UpdateCheckResponse>, AppError> {
-    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let current_version = truongphoto_core::APP_VERSION.to_string();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .user_agent(format!("TruongPhoto/{current_version}"))

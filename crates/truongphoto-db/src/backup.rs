@@ -34,8 +34,9 @@ fn backup_blocking(db_path: &Path, backup_dir: &Path, keep_count: usize) -> DbRe
     let (now, final_path, tmp_path) = loop {
         let now = Utc::now();
         let stamp = now.format("%Y%m%d-%H%M%S-%3f").to_string();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
         let final_name = format!("library-{stamp}.db");
-        let tmp_name = format!(".library-{stamp}.db.tmp");
+        let tmp_name = format!(".library-{stamp}-{}.db.tmp", &unique[..8]);
         let final_path = backup_dir.join(final_name);
         let tmp_path = backup_dir.join(tmp_name);
         if !final_path.exists() && !tmp_path.exists() {
@@ -102,8 +103,11 @@ fn prune_old_backups(backup_dir: &Path, keep_count: usize) -> DbResult<usize> {
 
     let mut pruned = 0usize;
     for (_, path) in entries.into_iter().skip(keep_count) {
-        std::fs::remove_file(path)?;
-        pruned += 1;
+        match std::fs::remove_file(&path) {
+            Ok(()) => pruned += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(DbError::Io(e)),
+        }
     }
 
     Ok(pruned)

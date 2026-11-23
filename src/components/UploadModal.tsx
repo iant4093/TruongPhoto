@@ -156,6 +156,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           }}
           onDragLeave={(e) => {
             e.stopPropagation();
+            if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) {
+              return;
+            }
             setDragOver(false);
           }}
           onDrop={(e) => {

@@ -257,12 +257,16 @@ fn append_deterministic_filters(
         if let Some(lo) = fl_min {
             let idx = params.len() + 1;
             params.push(Value::Real(lo));
-            exif_checks.push(format!("dpm_e.focal_length_mm >= ?{idx}"));
+            exif_checks.push(format!(
+                "((dpm_e.focal_length_mm > 0 AND dpm_e.focal_length_mm >= ?{idx}) OR (dpm_e.focal_length_35mm > 0 AND dpm_e.focal_length_35mm >= ?{idx}))"
+            ));
         }
         if let Some(hi) = fl_max {
             let idx = params.len() + 1;
             params.push(Value::Real(hi));
-            exif_checks.push(format!("dpm_e.focal_length_mm <= ?{idx}"));
+            exif_checks.push(format!(
+                "COALESCE(NULLIF(dpm_e.focal_length_35mm, 0), NULLIF(dpm_e.focal_length_mm, 0)) <= ?{idx}"
+            ));
         }
 
         let (ap_min, ap_max) = match (req.aperture_min_f, req.aperture_max_f) {
@@ -354,6 +358,9 @@ fn append_deterministic_filters(
                     format!("LOWER(COALESCE(v.effective_description, '')) LIKE ?{idx} ESCAPE '\\'"),
                     format!(
                         "EXISTS (SELECT 1 FROM asset_files af_g WHERE af_g.asset_id = v.id AND LOWER(af_g.rel_path) LIKE ?{idx} ESCAPE '\\')"
+                    ),
+                    format!(
+                        "EXISTS (SELECT 1 FROM folders f_g WHERE f_g.id = v.folder_id AND LOWER(f_g.name) LIKE ?{idx} ESCAPE '\\')"
                     ),
                 ];
                 if let Some(alt) = geo_synonym_variant(&tok) {
@@ -638,6 +645,9 @@ fn append_free_text_metadata_clauses(
         ));
         ors.push(format!(
             "EXISTS (SELECT 1 FROM asset_files afq WHERE afq.asset_id = v.id AND LOWER(afq.rel_path) LIKE ?{idx} ESCAPE '\\')"
+        ));
+        ors.push(format!(
+            "EXISTS (SELECT 1 FROM folders fq_dir WHERE fq_dir.id = v.folder_id AND LOWER(fq_dir.name) LIKE ?{idx} ESCAPE '\\')"
         ));
         if let Some(alt) = geo_synonym_variant(&tok) {
             let alt_idx = params.len() + 1;

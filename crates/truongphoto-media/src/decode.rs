@@ -122,13 +122,56 @@ fn decode_via_ffmpeg_png(path: &Path) -> Result<RgbImage, MediaError> {
     Ok(composite_to_rgb(dyn_img))
 }
 
+fn decode_jpeg_bytes_with_exif_and_icc(
+    jpeg_bytes: &[u8],
+    fallback_orientation: Option<image::metadata::Orientation>,
+) -> Result<RgbImage, MediaError> {
+    let cursor_reader = ImageReader::new(std::io::Cursor::new(jpeg_bytes))
+        .with_guessed_format()
+        .map_err(|e| MediaError::Decode(format!("JPEG reader init failed: {e}")))?;
+    let mut decoder = cursor_reader
+        .into_decoder()
+        .map_err(|e| MediaError::Decode(format!("JPEG decoder init failed: {e}")))?;
+    let embedded_orient = decoder.orientation().ok();
+    let icc = decoder.icc_profile().ok().flatten();
+    let mut dyn_img = DynamicImage::from_decoder(decoder)
+        .map_err(|e| MediaError::Decode(format!("JPEG pixel decode failed: {e}")))?;
+    let effective_orient = match embedded_orient {
+        Some(o) if o != image::metadata::Orientation::NoTransforms => Some(o),
+        _ => fallback_orientation.or(embedded_orient),
+    };
+    if let Some(orient) = effective_orient {
+        dyn_img.apply_orientation(orient);
+    }
+    let mut rgb = composite_to_rgb(dyn_img);
+    if let Some(icc_bytes) = icc.as_deref() {
+        let _ = bake_icc_to_srgb(rgb.as_mut(), icc_bytes);
+    }
+    Ok(rgb)
+}
+
+fn exif_orientation_from_file(path: &Path) -> Option<image::metadata::Orientation> {
+    let mut parser = nom_exif::MediaParser::new();
+    let ms = nom_exif::MediaSource::open(path).ok()?;
+    let iter = parser.parse_exif(ms).ok()?;
+    let exif: nom_exif::Exif = iter.into();
+    let raw_val = match exif.get(nom_exif::ExifTag::Orientation)? {
+        nom_exif::EntryValue::U16(v) => *v as u8,
+        nom_exif::EntryValue::U8(v) => *v,
+        nom_exif::EntryValue::U32(v) => u8::try_from(*v).ok()?,
+        _ => return None,
+    };
+    image::metadata::Orientation::from_exif(raw_val)
+}
+
 fn decode_heic_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
     #[cfg(target_os = "macos")]
     {
         if let Ok(jpeg_bytes) = raw::sips_convert_to_jpeg(path, 92) {
-            let dyn_img = image::load_from_memory(&jpeg_bytes)
-                .map_err(|e| MediaError::Decode(format!("sips HEIC JPEG decode failed: {e}")))?;
-            return Ok(composite_to_rgb(dyn_img));
+            let fallback = exif_orientation_from_file(path);
+            if let Ok(rgb) = decode_jpeg_bytes_with_exif_and_icc(&jpeg_bytes, fallback) {
+                return Ok(rgb);
+            }
         }
     }
 
@@ -136,34 +179,25 @@ fn decode_heic_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
 }
 
 fn decode_raw_preview_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
+    let outer_orient = exif_orientation_from_file(path);
     if let Some(jpeg_bytes) = raw::extract_embedded_raw_jpeg(path) {
-        if let Ok(mut cursor_reader) =
-            ImageReader::new(std::io::Cursor::new(&jpeg_bytes)).with_guessed_format()
-        {
-            let _ = &mut cursor_reader;
-            if let Ok(mut decoder) = cursor_reader.into_decoder() {
-                let orientation = decoder.orientation().ok();
-                let icc = decoder.icc_profile().ok().flatten();
-                if let Ok(mut dyn_img) = DynamicImage::from_decoder(decoder) {
-                    if let Some(orient) = orientation {
-                        dyn_img.apply_orientation(orient);
-                    }
-                    let mut rgb = composite_to_rgb(dyn_img);
-                    if let Some(icc_bytes) = icc.as_deref() {
-                        let _ = bake_icc_to_srgb(rgb.as_mut(), icc_bytes);
-                    }
-                    return Ok(rgb);
-                }
-            }
+        if let Ok(rgb) = decode_jpeg_bytes_with_exif_and_icc(&jpeg_bytes, outer_orient) {
+            return Ok(rgb);
         }
     }
 
     #[cfg(target_os = "macos")]
     {
         if let Ok(jpeg_bytes) = raw::sips_convert_to_jpeg(path, 92) {
-            let dyn_img = image::load_from_memory(&jpeg_bytes)
-                .map_err(|e| MediaError::Decode(format!("sips RAW JPEG decode failed: {e}")))?;
-            return Ok(composite_to_rgb(dyn_img));
+            if let Ok(rgb) = decode_jpeg_bytes_with_exif_and_icc(&jpeg_bytes, outer_orient) {
+                return Ok(rgb);
+            }
+        }
+    }
+
+    if let Some(jpeg_bytes) = raw::try_libraw_demosaic_jpeg(path) {
+        if let Ok(rgb) = decode_jpeg_bytes_with_exif_and_icc(&jpeg_bytes, outer_orient) {
+            return Ok(rgb);
         }
     }
 

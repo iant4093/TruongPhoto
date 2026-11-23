@@ -552,7 +552,7 @@ async fn move_rename_relinking_preserves_asset_id_and_user_data() {
         )?;
 
         let missing =
-            repo::ingest::find_missing_by_fingerprint(conn, "deadbeef-partial-hash", 98_765)?
+            repo::ingest::find_missing_by_fingerprint(conn, "f1", "deadbeef-partial-hash", 98_765)?
                 .expect("find missing by partial_blake3 + size");
         let relinked_asset_id = repo::ingest::relink_moved_file(
             conn,

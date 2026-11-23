@@ -260,11 +260,26 @@ export const useAppStore = create<AppState>((set, get) => {
     ...initialDataState,
 
     setActiveNav: (nav) =>
-      set(() => ({
-        activeNav: nav,
-        selectedAssetId: null,
-        ...(nav === 'chat' ? { chatDrawerOpen: false } : {}),
-      })),
+      set((s) => {
+        const shouldClearSearch = s.searchActive || s.searchQuery.length > 0;
+        if (shouldClearSearch) {
+          searchSeq += 1;
+        }
+        return {
+          activeNav: nav,
+          selectedAssetId: null,
+          ...(nav === 'chat' ? { chatDrawerOpen: false } : {}),
+          ...(shouldClearSearch
+            ? {
+                searchActive: false,
+                searchQuery: '',
+                searchRequest: initialDataState.searchRequest,
+                searchResponse: null,
+                searchLoading: false,
+              }
+            : {}),
+        };
+      }),
     toggleInspector: () =>
       set((s) => ({
         inspectorOpen: !s.inspectorOpen,
@@ -767,6 +782,10 @@ export const useAppStore = create<AppState>((set, get) => {
               active_jobs: event.active_jobs,
               updated_at_ms: Date.now(),
             },
+            activeJobs:
+              event.active_jobs === 0 && Object.keys(state.activeJobs).length > 0
+                ? {}
+                : state.activeJobs,
             systemInfo:
               state.systemInfo && state.systemInfo.stats.db_size_bytes !== event.db_size_bytes
                 ? {

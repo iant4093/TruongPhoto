@@ -41,6 +41,7 @@ pub struct PurgeCandidate {
     pub asset_id: String,
     pub folder_id: String,
     pub folder_root_path: String,
+    pub folder_volume_uuid: Option<String>,
     pub allow_disk_delete: bool,
     pub is_offline: bool,
     pub thumb_rel_path: Option<String>,
@@ -639,11 +640,17 @@ pub fn get_asset_detail_for_user(
 ) -> DbResult<Option<AssetDetail>> {
     let mut params: Vec<Value> = vec![Value::Text(asset_id.to_string())];
     let rbac_clause = rbac_sql::folder_clause("v", scope, &mut params);
+    let trash_clause = if matches!(caller, Some((_, truongphoto_core::Role::Viewer))) {
+        "AND v.deleted_at_ms IS NULL"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT {ASSET_SUMMARY_COLUMNS}
          FROM v_assets_effective v
          WHERE v.id = ?1
            AND v.is_hidden = 0
+           {trash_clause}
            AND {rbac_clause}
          LIMIT 1"
     );
@@ -721,18 +728,36 @@ pub type AssetWithFiles = (
 );
 
 /// Fast projection for media streaming handlers (`/api/media/{id}/*`) scoped by `scope`.
+///
+/// Excludes soft-deleted (trashed) assets by default.
 pub fn get_asset_with_files(
     conn: &Connection,
     scope: &RbacScope,
     asset_id: &str,
 ) -> DbResult<Option<AssetWithFiles>> {
+    get_asset_with_files_filtered(conn, scope, asset_id, false)
+}
+
+/// Fast projection for media streaming handlers (`/api/media/{id}/*`) with explicit trash visibility.
+pub fn get_asset_with_files_filtered(
+    conn: &Connection,
+    scope: &RbacScope,
+    asset_id: &str,
+    include_trashed: bool,
+) -> DbResult<Option<AssetWithFiles>> {
     let mut params: Vec<Value> = vec![Value::Text(asset_id.to_string())];
     let rbac_clause = rbac_sql::folder_clause("v", scope, &mut params);
+    let trash_clause = if include_trashed {
+        ""
+    } else {
+        "AND v.deleted_at_ms IS NULL"
+    };
     let sql = format!(
         "SELECT {ASSET_SUMMARY_COLUMNS}
          FROM v_assets_effective v
          WHERE v.id = ?1
            AND v.is_hidden = 0
+           {trash_clause}
            AND {rbac_clause}
          LIMIT 1"
     );
@@ -770,7 +795,7 @@ pub fn set_asset_favorite(
     let sql = format!(
         "UPDATE assets
          SET is_favorite = ?1, updated_at_ms = ?2
-         WHERE id = ?3 AND is_hidden = 0 AND {rbac_clause}"
+         WHERE id = ?3 AND is_hidden = 0 AND deleted_at_ms IS NULL AND {rbac_clause}"
     );
     let affected = conn.execute(&sql, params_from_iter(params))?;
     if affected == 0 {
@@ -801,7 +826,7 @@ pub fn upsert_user_overrides(
     let mut check_params: Vec<Value> = vec![Value::Text(asset_id.to_string())];
     let rbac_clause = rbac_sql::folder_clause("a", scope, &mut check_params);
     let check_sql = format!(
-        "SELECT 1 FROM assets a WHERE a.id = ?1 AND a.is_hidden = 0 AND {rbac_clause} LIMIT 1"
+        "SELECT 1 FROM assets a WHERE a.id = ?1 AND a.is_hidden = 0 AND a.deleted_at_ms IS NULL AND {rbac_clause} LIMIT 1"
     );
     let exists: Option<i64> = conn
         .query_row(&check_sql, params_from_iter(check_params), |row| row.get(0))
@@ -1040,6 +1065,7 @@ pub fn get_assets_for_purge(
             a.id,
             a.folder_id,
             f.root_path,
+            f.volume_uuid,
             f.allow_disk_delete,
             f.is_offline,
             a.thumb_rel_path
@@ -1057,9 +1083,10 @@ pub fn get_assets_for_purge(
                 asset_id: row.get(0)?,
                 folder_id: row.get(1)?,
                 folder_root_path: row.get(2)?,
-                allow_disk_delete: row.get::<_, i64>(3)? != 0,
-                is_offline: row.get::<_, i64>(4)? != 0,
-                thumb_rel_path: row.get(5)?,
+                folder_volume_uuid: row.get(3)?,
+                allow_disk_delete: row.get::<_, i64>(4)? != 0,
+                is_offline: row.get::<_, i64>(5)? != 0,
+                thumb_rel_path: row.get(6)?,
                 files: Vec::new(),
             })
         })?
@@ -1104,30 +1131,46 @@ pub fn get_assets_for_purge(
     Ok(candidates)
 }
 
+/// Returns `true` if `asset_id` currently remains soft-deleted in Trash.
+pub fn is_asset_trashed(conn: &Connection, asset_id: &str) -> DbResult<bool> {
+    let trashed: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM assets WHERE id = ?1 AND deleted_at_ms IS NOT NULL LIMIT 1",
+            params![asset_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(trashed.is_some())
+}
+
 /// Finalizes DB removal or hiding after a permanent purge.
 ///
-/// When `hide_only` is true (e.g. `allow_disk_delete = false`), sets `is_hidden = 1` and clears
-/// `deleted_at_ms` so the asset disappears from both Timeline and Trash while keeping `asset_files`
-/// intact so subsequent scans do not re-ingest the untouched disk file.
-/// When `hide_only` is false, deletes the asset row (cascading to child tables).
+/// Only mutates rows that are still soft-deleted (`deleted_at_ms IS NOT NULL`) so a concurrent
+/// restore cannot be overwritten. Returns `true` if the row was purged.
 pub fn delete_purged_asset_records(
     conn: &Connection,
     asset_id: &str,
     hide_only: bool,
-) -> DbResult<()> {
+) -> DbResult<bool> {
     if hide_only {
-        with_savepoint(conn, "delete_purged_asset_records", || {
-            conn.execute(
+        let affected = with_savepoint(conn, "delete_purged_asset_records", || {
+            let affected = conn.execute(
                 "UPDATE assets
                  SET is_hidden = 1, deleted_at_ms = NULL, deleted_by = NULL, updated_at_ms = ?1
-                 WHERE id = ?2",
+                 WHERE id = ?2 AND deleted_at_ms IS NOT NULL",
                 params![now_ms(), asset_id],
             )?;
-            crate::repo::map::sync_asset_geo(conn, asset_id)?;
-            Ok(())
+            if affected > 0 {
+                crate::repo::map::sync_asset_geo(conn, asset_id)?;
+            }
+            Ok(affected)
         })?;
+        Ok(affected > 0)
     } else {
-        conn.execute("DELETE FROM assets WHERE id = ?1", params![asset_id])?;
+        let affected = conn.execute(
+            "DELETE FROM assets WHERE id = ?1 AND deleted_at_ms IS NOT NULL",
+            params![asset_id],
+        )?;
+        Ok(affected > 0)
     }
-    Ok(())
 }

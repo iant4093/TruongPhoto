@@ -316,6 +316,7 @@ pub async fn cluster_people(
     RequireAdmin(_auth): RequireAdmin,
     State(state): State<Arc<AppState>>,
 ) -> Result<(StatusCode, Json<ClusterFacesResponse>), AppError> {
+    let _worker_guard = state.ai.worker_lock.lock().await;
     let res = run_face_clustering(&state).await?;
     Ok((StatusCode::ACCEPTED, Json(res)))
 }

@@ -312,9 +312,9 @@ export const Lightbox: React.FC = () => {
             if (videoEl.paused) void videoEl.play().catch(() => {});
             else videoEl.pause();
           } else if (
-            detail?.playback.live_video_url ||
-            detail?.summary.kind === 'live_photo' ||
-            detail?.summary.kind === 'motion_photo'
+            activeDetail?.playback.live_video_url ||
+            activeDetail?.summary.kind === 'live_photo' ||
+            activeDetail?.summary.kind === 'motion_photo'
           ) {
             event.preventDefault();
             setLivePlaying((prev) => !prev);
@@ -330,8 +330,8 @@ export const Lightbox: React.FC = () => {
       popEscapeLayer(layer);
     };
   }, [
+    activeDetail,
     closeLightbox,
-    detail,
     goNext,
     goPrev,
     handleToggleFavorite,
@@ -388,7 +388,6 @@ export const Lightbox: React.FC = () => {
     setHiResLoading(true);
     const loader = new Image();
     loader.decoding = 'async';
-    loader.src = fullResUrl;
 
     const finalize = () => {
       if (cancelled) return;
@@ -400,21 +399,25 @@ export const Lightbox: React.FC = () => {
       setHiResLoading(false);
     };
 
+    loader.onload = finalize;
+    loader.onerror = fail;
+    loader.src = fullResUrl;
+
     if (typeof loader.decode === 'function') {
       loader
         .decode()
         .then(finalize)
         .catch(() => {
-          loader.onload = finalize;
-          loader.onerror = fail;
+          if (loader.complete && loader.naturalWidth === 0) {
+            fail();
+          }
         });
-    } else {
-      loader.onload = finalize;
-      loader.onerror = fail;
     }
 
     return () => {
       cancelled = true;
+      loader.onload = null;
+      loader.onerror = null;
     };
   }, [fullResUrl, hiResLoadedUrl, isVideo, lightboxAssetId, rawDemosaic, zoom]);
 

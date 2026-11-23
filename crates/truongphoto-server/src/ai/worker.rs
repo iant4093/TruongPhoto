@@ -371,6 +371,11 @@ async fn process_staging_tier_batch(
             let pipe = Arc::clone(&pipeline);
             let kind = summary.kind;
             let preview_path = cached_preview_path(cache_dir, &asset_id);
+            enum StagingInferOutcome {
+                Ready(Vec<(i64, Vec<f32>)>),
+                DecodeSkipped,
+                EngineUnavailable,
+            }
             let inferred = tokio::task::spawn_blocking(move || {
                 let frames = match decode_frames_for_asset(
                     kind,
@@ -381,24 +386,34 @@ async fn process_staging_tier_batch(
                     Ok(f) => f,
                     Err(err) => {
                         tracing::debug!(path = %src_path.display(), error = %err, "stage2 staging decode skipped");
-                        return Ok::<_, AiError>(None);
+                        return Ok::<_, AiError>(StagingInferOutcome::DecodeSkipped);
                     }
                 };
                 let mut vecs = Vec::with_capacity(frames.len());
+                let mut seen_ts = std::collections::HashSet::with_capacity(frames.len());
                 for kf in frames {
+                    if !seen_ts.insert(kf.timestamp_ms) {
+                        continue;
+                    }
                     match pipe.vision.embed_image(staging_tier, &kf.image) {
                         Ok(v) => vecs.push((kf.timestamp_ms, v)),
-                        Err(e) if is_unavailable_engine_err(&e) => return Ok(None),
+                        Err(e) if is_unavailable_engine_err(&e) => {
+                            return Ok(StagingInferOutcome::EngineUnavailable);
+                        }
                         Err(e) => return Err(e),
                     }
                 }
-                Ok(Some(vecs))
+                Ok(StagingInferOutcome::Ready(vecs))
             })
             .await??;
 
-            let Some(vision_vecs) = inferred else {
-                // Vision model not installed or ORT unavailable; do not cut over prematurely.
-                break;
+            let vision_vecs = match inferred {
+                StagingInferOutcome::Ready(v) => v,
+                StagingInferOutcome::DecodeSkipped => continue,
+                StagingInferOutcome::EngineUnavailable => {
+                    // Vision model not installed or ORT unavailable; do not cut over prematurely.
+                    break;
+                }
             };
 
             let idx_clone = Arc::clone(&staging_idx);
@@ -667,7 +682,12 @@ async fn process_active_stage2_batch(
                         let _ = vision_idx_clone.mark_deleted(old_id);
                     }
                     let mut next_vid = repo::ai::allocate_next_vision_vector_id(tx, active_tier)?;
+                    let mut seen_ts =
+                        std::collections::HashSet::with_capacity(data.vision_vecs.len());
                     for (ts_ms, vec) in data.vision_vecs {
+                        if !seen_ts.insert(ts_ms) {
+                            continue;
+                        }
                         vision_idx_clone
                             .add(next_vid, &vec)
                             .map_err(|e| DbError::InvalidArgument(e.to_string()))?;
@@ -704,16 +724,31 @@ async fn process_active_stage2_batch(
                         );
 
                         let (person_id, assigned_by) = if let Some((pid, _sim)) = matched {
-                            if let Some((_, count, vec)) =
-                                cent_guard.iter_mut().find(|(id, _, _)| id == &pid)
-                            {
-                                let updated = update_running_centroid(vec, *count, &face.embedding);
-                                *count += 1;
-                                *vec = updated.clone();
-                                let blob = encode_centroid_le(&updated);
-                                repo::ai::upsert_person_centroid(tx, &pid, *count, &blob, now_ms)?;
+                            let person_still_exists = tx
+                                .query_row(
+                                    "SELECT 1 FROM people WHERE id = ?1 LIMIT 1",
+                                    [&pid],
+                                    |row| row.get::<_, i64>(0),
+                                )
+                                .is_ok();
+                            if person_still_exists {
+                                if let Some((_, count, vec)) =
+                                    cent_guard.iter_mut().find(|(id, _, _)| id == &pid)
+                                {
+                                    let updated =
+                                        update_running_centroid(vec, *count, &face.embedding);
+                                    *count += 1;
+                                    *vec = updated.clone();
+                                    let blob = encode_centroid_le(&updated);
+                                    repo::ai::upsert_person_centroid(
+                                        tx, &pid, *count, &blob, now_ms,
+                                    )?;
+                                }
+                                (Some(pid), "auto")
+                            } else {
+                                cent_guard.retain(|(id, _, _)| id != &pid);
+                                (None, "unassigned")
                             }
-                            (Some(pid), "auto")
                         } else {
                             (None, "unassigned")
                         };
@@ -775,6 +810,25 @@ async fn process_active_stage2_batch(
                 message: None,
             });
         }
+    }
+
+    if vision_idx.needs_compaction() {
+        let idx = Arc::clone(&vision_idx);
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(err) = idx.compact_and_swap() {
+                tracing::warn!(error = %err, "vision vector index compaction failed");
+            }
+        })
+        .await;
+    }
+    if faces_idx.needs_compaction() {
+        let idx = Arc::clone(&faces_idx);
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(err) = idx.compact_and_swap() {
+                tracing::warn!(error = %err, "faces vector index compaction failed");
+            }
+        })
+        .await;
     }
 
     Ok(processed)

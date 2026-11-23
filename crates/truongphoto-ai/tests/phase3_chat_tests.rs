@@ -41,7 +41,7 @@ fn classic_router_multi_turn_refinement_and_clear() {
         .unwrap();
     assert_eq!(t1.semantic_query.as_deref(), Some("beach"));
     assert_eq!(t1.location_query.as_deref(), Some("Tokyo"));
-    assert_eq!(t1.kind, Some(AssetKind::Photo));
+    assert_eq!(t1.kind, None);
     assert_eq!(t1.favorite, None);
     assert!(!t1.clear_prior_filters);
 
@@ -325,7 +325,7 @@ fn classic_router_dates_cameras_tags_ocr_and_media_kinds() {
         .unwrap();
     assert_eq!(text_saying.ocr_terms.as_deref(), Some("Coffee House"));
     assert_eq!(text_saying.location_query.as_deref(), Some("Tokyo"));
-    assert_eq!(text_saying.kind, Some(AssetKind::Photo));
+    assert_eq!(text_saying.kind, None);
 }
 
 #[test]

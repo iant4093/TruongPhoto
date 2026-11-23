@@ -50,7 +50,7 @@ function formatThrottlePillLabel(throttle: ThrottleStatus): string {
   }
 }
 
-export const Sidebar: React.FC = () => {
+export const Sidebar: React.FC<{ showStatusBanner?: boolean }> = ({ showStatusBanner = true }) => {
   const activeNav = useAppStore((s) => s.activeNav);
   const setActiveNav = useAppStore((s) => s.setActiveNav);
   const assetCount = useAppStore((s) => s.systemInfo?.stats.asset_count ?? 0);
@@ -95,7 +95,7 @@ export const Sidebar: React.FC = () => {
       <nav aria-label="Library navigation" className="sidebar-nav">
         {PRIMARY_NAV_ITEMS.map(renderNavButton)}
         <div className="sidebar-spacer" />
-        <StatusBanner />
+        {showStatusBanner && <StatusBanner />}
         <button
           type="button"
           className={`sidebar-resources sidebar-status-trigger${inspectorOpen ? ' is-active' : ''}`}

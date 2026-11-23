@@ -133,7 +133,10 @@ pub async fn server_pin(
     jar: CookieJar,
     ApiJson(req): ApiJson<ServerPinRequest>,
 ) -> Result<(CookieJar, Json<ServerPinResponse>), AppError> {
-    if let Err(retry_after_secs) = state.rate_limiter.check(&peer.rate_key) {
+    if let Err(retry_after_secs) = state
+        .rate_limiter
+        .check_scoped("server_pin", &peer.rate_key)
+    {
         return Err(AppError::rate_limited(retry_after_secs));
     }
 
@@ -158,13 +161,18 @@ pub async fn server_pin(
 
     let valid = verify_pin(req.server_pin, stored_hash).await?;
     if !valid {
-        if let Some(retry_after_secs) = state.rate_limiter.record_failure(&peer.rate_key) {
+        if let Some(retry_after_secs) = state
+            .rate_limiter
+            .record_failure_scoped("server_pin", &peer.rate_key)
+        {
             return Err(AppError::rate_limited(retry_after_secs));
         }
         return Err(AppError::unauthorized("Invalid server PIN."));
     }
 
-    state.rate_limiter.record_success(&peer.rate_key);
+    state
+        .rate_limiter
+        .record_success_scoped("server_pin", &peer.rate_key);
     let profiles = state.db.read(repo::users::list_active_profiles).await?;
     let gate_cookie = issue_gate_cookie(&state.gate_key, &peer.rate_key, peer.is_https);
 
@@ -179,7 +187,12 @@ pub async fn login(
     jar: CookieJar,
     ApiJson(req): ApiJson<LoginRequest>,
 ) -> Result<(CookieJar, Json<AuthLoginResponse>), AppError> {
-    if let Err(retry_after_secs) = state.rate_limiter.check(&peer.rate_key) {
+    let target_user_id = req.user_id.trim().to_string();
+    let user_scope = format!("login_user:{target_user_id}");
+    if let Err(retry_after_secs) = state.rate_limiter.check_scoped("login", &peer.rate_key) {
+        return Err(AppError::rate_limited(retry_after_secs));
+    }
+    if let Err(retry_after_secs) = state.rate_limiter.check_scoped(&user_scope, &peer.rate_key) {
         return Err(AppError::rate_limited(retry_after_secs));
     }
 
@@ -188,13 +201,13 @@ pub async fn login(
         .map(|c| verify_gate_cookie(&state.gate_key, &peer.rate_key, c.value()))
         .unwrap_or(false);
 
-    let target_user_id = req.user_id.trim().to_string();
+    let target_user_id_db = target_user_id.clone();
     let (initialized, server_pin_hash, user_opt) = state
         .db
         .read(move |conn| {
             let initialized = repo::settings::is_setup_completed(conn)?;
             let server_hash = repo::settings::get_server_pin_hash(conn)?;
-            let user = repo::users::get_user_by_id(conn, &target_user_id)?;
+            let user = repo::users::get_user_by_id(conn, &target_user_id_db)?;
             Ok((initialized, server_hash, user))
         })
         .await?;
@@ -206,6 +219,12 @@ pub async fn login(
     }
 
     if !has_valid_gate {
+        if let Err(retry_after_secs) = state
+            .rate_limiter
+            .check_scoped("server_pin", &peer.rate_key)
+        {
+            return Err(AppError::rate_limited(retry_after_secs));
+        }
         let Some(inline_server_pin) = req.server_pin else {
             return Err(AppError::unauthorized(
                 "Server PIN verification is required before profile login.",
@@ -215,7 +234,10 @@ pub async fn login(
             return Err(AppError::internal("Server PIN hash is missing."));
         };
         if !verify_pin(inline_server_pin, stored_server_hash).await? {
-            if let Some(retry_after_secs) = state.rate_limiter.record_failure(&peer.rate_key) {
+            if let Some(retry_after_secs) = state
+                .rate_limiter
+                .record_failure_scoped("server_pin", &peer.rate_key)
+            {
                 return Err(AppError::rate_limited(retry_after_secs));
             }
             return Err(AppError::unauthorized("Invalid server PIN."));
@@ -223,20 +245,37 @@ pub async fn login(
     }
 
     let Some(user) = user_opt.filter(|u| u.disabled_at_ms.is_none()) else {
-        if let Some(retry_after_secs) = state.rate_limiter.record_failure(&peer.rate_key) {
+        let r1 = state
+            .rate_limiter
+            .record_failure_scoped("login", &peer.rate_key);
+        let r2 = state
+            .rate_limiter
+            .record_failure_scoped(&user_scope, &peer.rate_key);
+        if let Some(retry_after_secs) = r1.max(r2) {
             return Err(AppError::rate_limited(retry_after_secs));
         }
         return Err(AppError::unauthorized("Invalid profile or PIN."));
     };
 
     if !verify_pin(req.profile_pin, user.pin_hash.clone()).await? {
-        if let Some(retry_after_secs) = state.rate_limiter.record_failure(&peer.rate_key) {
+        let r1 = state
+            .rate_limiter
+            .record_failure_scoped("login", &peer.rate_key);
+        let r2 = state
+            .rate_limiter
+            .record_failure_scoped(&user_scope, &peer.rate_key);
+        if let Some(retry_after_secs) = r1.max(r2) {
             return Err(AppError::rate_limited(retry_after_secs));
         }
         return Err(AppError::unauthorized("Invalid profile or PIN."));
     }
 
-    state.rate_limiter.record_success(&peer.rate_key);
+    state
+        .rate_limiter
+        .record_success_scoped("login", &peer.rate_key);
+    state
+        .rate_limiter
+        .record_success_scoped(&user_scope, &peer.rate_key);
 
     let raw_token = generate_random_token()?;
     let token_hash = hash_session_token(&raw_token);

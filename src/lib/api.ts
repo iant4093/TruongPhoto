@@ -901,9 +901,10 @@ export class WsClient {
     };
 
     ws.onclose = () => {
-      if (this.socket === ws) {
-        this.socket = null;
+      if (this.socket !== ws) {
+        return;
       }
+      this.socket = null;
       this.stopPing();
       this.onConnectionChange?.(false);
       if (!this.closedManually) {
@@ -919,6 +920,10 @@ export class WsClient {
     const ws = this.socket;
     this.socket = null;
     if (ws) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
       try {
         ws.close();
       } catch {

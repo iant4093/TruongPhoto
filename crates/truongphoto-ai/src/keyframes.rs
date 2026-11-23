@@ -102,8 +102,9 @@ fn parse_showinfo_pts_ms(stderr: &str) -> Vec<i64> {
                 .unwrap_or_default()
                 .trim_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-');
             if let Ok(secs) = token.parse::<f64>() {
-                if secs.is_finite() && secs >= 0.0 {
-                    timestamps.push((secs * 1000.0).round() as i64);
+                if secs.is_finite() {
+                    let clamped_ms = (secs.max(0.0) * 1000.0).round() as i64;
+                    timestamps.push(clamped_ms);
                 }
             }
         }

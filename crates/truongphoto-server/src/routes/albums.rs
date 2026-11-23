@@ -148,13 +148,18 @@ pub async fn get_album(
     Ok(Json(detail))
 }
 
-/// `PATCH /api/albums/{id}` (Album Owner or Admin).
+/// `PATCH /api/albums/{id}` (Album Owner or Admin, Contributor+ role required).
 pub async fn update_album(
     rbac: RbacContext,
     State(state): State<Arc<AppState>>,
     AxumPath(album_id): AxumPath<String>,
     ApiJson(req): ApiJson<UpdateAlbumRequest>,
 ) -> Result<Json<AlbumResponse>, AppError> {
+    if !rbac.auth.user.role.can_contribute() {
+        return Err(AppError::forbidden(
+            "Contributor or Administrator privileges are required to edit albums.",
+        ));
+    }
     let user_id = rbac.auth.user.id;
     let role = rbac.auth.user.role;
     let scope = rbac.scope;
@@ -189,12 +194,17 @@ pub async fn update_album(
     Ok(Json(AlbumResponse { album }))
 }
 
-/// `DELETE /api/albums/{id}` (Album Owner or Admin).
+/// `DELETE /api/albums/{id}` (Album Owner or Admin, Contributor+ role required).
 pub async fn delete_album(
     auth: AuthSession,
     State(state): State<Arc<AppState>>,
     AxumPath(album_id): AxumPath<String>,
 ) -> Result<StatusCode, AppError> {
+    if !auth.user.role.can_contribute() {
+        return Err(AppError::forbidden(
+            "Contributor or Administrator privileges are required to delete albums.",
+        ));
+    }
     let user_id = auth.user.id;
     let role = auth.user.role;
     state
@@ -286,13 +296,18 @@ pub async fn remove_album_assets(
     Ok(Json(RemovedCountResponse { removed_count }))
 }
 
-/// `PUT /api/albums/{id}/shares` (Album Owner or Admin).
+/// `PUT /api/albums/{id}/shares` (Album Owner or Admin, Contributor+ role required).
 pub async fn replace_album_shares(
     auth: AuthSession,
     State(state): State<Arc<AppState>>,
     AxumPath(album_id): AxumPath<String>,
     ApiJson(req): ApiJson<ReplaceSharesRequest>,
 ) -> Result<Json<SharesResponse>, AppError> {
+    if !auth.user.role.can_contribute() {
+        return Err(AppError::forbidden(
+            "Contributor or Administrator privileges are required to manage album shares.",
+        ));
+    }
     let user_id = auth.user.id;
     let role = auth.user.role;
     let pairs: Vec<(String, AlbumSharePermission)> = req

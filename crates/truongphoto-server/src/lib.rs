@@ -138,6 +138,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             HeaderName::from_static("referrer-policy"),
             HeaderValue::from_static("no-referrer"),
         ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "default-src 'self' ipc: http://ipc.localhost https://ipc.localhost; \
+                 img-src 'self' https://tiles.openfreemap.org data: blob:; \
+                 style-src 'self' 'unsafe-inline'; \
+                 font-src 'self' https://tiles.openfreemap.org data:; \
+                 connect-src 'self' ws: wss: ipc: http://ipc.localhost https://ipc.localhost https://tiles.openfreemap.org; \
+                 media-src 'self' blob:; \
+                 worker-src 'self' blob:; \
+                 child-src 'self' blob:; \
+                 frame-ancestors 'none';",
+            ),
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

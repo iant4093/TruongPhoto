@@ -247,10 +247,30 @@ fn toggle_tray_popover(app: &AppHandle, tray_rect: Rect) {
         tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
         tauri::Size::Logical(l) => (l.width * fallback_scale, l.height * fallback_scale),
     };
+    let center_x = icon_x + icon_w / 2.0;
+    let center_y = icon_y + icon_h / 2.0;
+    // Match against `available_monitors()` using physical coordinates directly so macOS Retina
+    // displays (where `monitor_from_point` uses logical points) still find the exact monitor.
     let monitor = app
-        .monitor_from_point(icon_x + icon_w / 2.0, icon_y + icon_h / 2.0)
+        .available_monitors()
         .ok()
-        .flatten()
+        .and_then(|monitors| {
+            monitors.into_iter().find(|m| {
+                let mp = m.position();
+                let ms = m.size();
+                let mx = mp.x as f64;
+                let my = mp.y as f64;
+                center_x >= mx
+                    && center_x < mx + ms.width as f64
+                    && center_y >= my
+                    && center_y < my + ms.height as f64
+            })
+        })
+        .or_else(|| {
+            app.monitor_from_point(center_x / fallback_scale, center_y / fallback_scale)
+                .ok()
+                .flatten()
+        })
         .or_else(|| popover.current_monitor().ok().flatten());
     let scale = monitor
         .as_ref()
@@ -260,7 +280,6 @@ fn toggle_tray_popover(app: &AppHandle, tray_rect: Rect) {
         (POPOVER_WIDTH * scale).round() as u32,
         (POPOVER_HEIGHT * scale).round() as u32,
     );
-    let _ = popover.set_size(tauri::Size::Physical(popover_size));
     let (target_x, target_y) = match &monitor {
         Some(m) => {
             let (mp, ms) = (m.position(), m.size());
@@ -279,11 +298,17 @@ fn toggle_tray_popover(app: &AppHandle, tray_rect: Rect) {
             )
         }
         None => (
-            (icon_x + icon_w / 2.0 - popover_size.width as f64 / 2.0).round() as i32,
+            (center_x - popover_size.width as f64 / 2.0).round() as i32,
             (icon_y - popover_size.height as f64).round() as i32,
         ),
     };
 
+    // Move to target monitor BEFORE resizing so Windows mixed-DPI `WM_DPICHANGED` does not
+    // double-scale the popover, then re-apply the exact clamped position.
+    let _ = popover.set_position(Position::Physical(PhysicalPosition::new(
+        target_x, target_y,
+    )));
+    let _ = popover.set_size(tauri::Size::Physical(popover_size));
     let _ = popover.set_position(Position::Physical(PhysicalPosition::new(
         target_x, target_y,
     )));

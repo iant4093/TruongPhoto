@@ -518,21 +518,33 @@ pub async fn ingest_single_file(
     folder: &FolderRecord,
     abs_path: &Path,
 ) -> Result<Option<String>, anyhow::Error> {
-    if !abs_path.is_file() {
+    let sym_meta = match tokio::fs::symlink_metadata(abs_path).await {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
         return Ok(None);
     }
     if classify_path(abs_path).is_none() {
         return Ok(None);
     }
 
-    let meta = tokio::fs::metadata(abs_path).await?;
-    let file_size = meta.len();
+    let root_path = Path::new(&folder.root_path);
+    if let (Ok(canon_root), Ok(canon_file)) = (
+        std::fs::canonicalize(root_path),
+        std::fs::canonicalize(abs_path),
+    ) {
+        if !canon_file.starts_with(&canon_root) {
+            return Ok(None);
+        }
+    }
+
+    let file_size = sym_meta.len();
     if file_size == 0 {
         return Ok(None);
     }
-    let mtime_ms = system_time_to_ms(meta.modified().ok());
+    let mtime_ms = system_time_to_ms(sym_meta.modified().ok());
 
-    let root_path = Path::new(&folder.root_path);
     let Some(rel_path) = compute_rel_path(root_path, abs_path) else {
         anyhow::bail!(
             "file {} is outside folder root {}",
@@ -589,12 +601,15 @@ async fn process_candidate_file(
     let partial_blake3 =
         tokio::task::spawn_blocking(move || partial_blake3_path(&abs_for_hash)).await??;
 
-    // Move/rename re-linking check against missing asset_files.
+    // Move/rename re-linking check against missing asset_files within the same folder.
     let blake_lookup = partial_blake3.clone();
+    let folder_lookup = folder.id.clone();
     let fsize = cand.file_size;
     let missing_match = state
         .db
-        .read(move |conn| repo::ingest::find_missing_by_fingerprint(conn, &blake_lookup, fsize))
+        .read(move |conn| {
+            repo::ingest::find_missing_by_fingerprint(conn, &folder_lookup, &blake_lookup, fsize)
+        })
         .await?;
 
     if let Some(missing) = missing_match {
