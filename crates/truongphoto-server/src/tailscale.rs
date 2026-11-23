@@ -77,7 +77,7 @@ impl TailscaleRunner for SystemTailscaleRunner {
             if let Some(found) = find_in_path("tailscale.exe") {
                 return Some(found);
             }
-            return None;
+            None
         }
 
         #[cfg(not(target_os = "windows"))]
