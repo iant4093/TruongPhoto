@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   FolderHeart,
@@ -85,30 +85,45 @@ export const AlbumsView: React.FC = () => {
   const [shareLoading, setShareLoading] = useState(false);
   const [shareMap, setShareMap] = useState<Record<string, AlbumSharePermission | 'none'>>({});
   const [savingShares, setSavingShares] = useState(false);
+  const [failedCovers, setFailedCovers] = useState<Set<string>>(() => new Set());
+
+  const listSeqRef = useRef(0);
+  const detailSeqRef = useRef(0);
+  const shareSeqRef = useRef(0);
 
   const loadList = useCallback(async () => {
+    const seq = ++listSeqRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await listAlbums();
+      if (seq !== listSeqRef.current) return;
       setItems(res.items);
     } catch (err) {
+      if (seq !== listSeqRef.current) return;
       setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (seq === listSeqRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
   const loadDetail = useCallback(async (albumId: string) => {
+    const seq = ++detailSeqRef.current;
     setDetailLoading(true);
     setDetailError(null);
     try {
       const res = await getAlbumDetail(albumId);
+      if (seq !== detailSeqRef.current) return;
       setDetail(res);
     } catch (err) {
+      if (seq !== detailSeqRef.current) return;
       setDetailError(errorMessage(err));
     } finally {
-      setDetailLoading(false);
+      if (seq === detailSeqRef.current) {
+        setDetailLoading(false);
+      }
     }
   }, []);
 
@@ -120,7 +135,10 @@ export const AlbumsView: React.FC = () => {
     if (selectedAlbumId) {
       void loadDetail(selectedAlbumId);
     } else {
+      detailSeqRef.current += 1;
       setDetail(null);
+      setDetailError(null);
+      setDetailLoading(false);
     }
   }, [selectedAlbumId, loadDetail, libraryRevision]);
 
@@ -223,22 +241,28 @@ export const AlbumsView: React.FC = () => {
 
   const handleOpenShareModal = async () => {
     if (!detail) return;
+    const targetDetail = detail;
+    const seq = ++shareSeqRef.current;
     setShareOpen(true);
     setShareLoading(true);
     try {
       const users = await listShareableUsers();
-      const filtered = users.filter((u) => u.id !== detail.album.owner_user_id);
+      if (seq !== shareSeqRef.current) return;
+      const filtered = users.filter((u) => u.id !== targetDetail.album.owner_user_id);
       setShareableUsers(filtered);
       const nextMap: Record<string, AlbumSharePermission | 'none'> = {};
       for (const u of filtered) {
-        const existing = detail.shares.find((s) => s.user_id === u.id);
+        const existing = targetDetail.shares.find((s) => s.user_id === u.id);
         nextMap[u.id] = existing ? existing.permission : 'none';
       }
       setShareMap(nextMap);
     } catch (err) {
+      if (seq !== shareSeqRef.current) return;
       notifyError(err, 'Could not load shareable users');
     } finally {
-      setShareLoading(false);
+      if (seq === shareSeqRef.current) {
+        setShareLoading(false);
+      }
     }
   };
 
@@ -663,12 +687,21 @@ export const AlbumsView: React.FC = () => {
               }}
             >
               <div className="album-cover">
-                {album.cover_asset_id ? (
+                {album.cover_asset_id && !failedCovers.has(album.cover_asset_id) ? (
                   <img
                     src={mediaThumbUrl(album.cover_asset_id)}
                     alt={album.title}
                     loading="lazy"
                     decoding="async"
+                    onError={() => {
+                      const cid = album.cover_asset_id!;
+                      setFailedCovers((prev) => {
+                        if (prev.has(cid)) return prev;
+                        const next = new Set(prev);
+                        next.add(cid);
+                        return next;
+                      });
+                    }}
                   />
                 ) : (
                   <FolderHeart size={32} strokeWidth={1.2} />
@@ -691,6 +724,12 @@ export const AlbumsView: React.FC = () => {
             </button>
           ))}
         </div>
+      ) : items.length > 0 && searchQuery.trim() ? (
+        <EmptyState
+          icon={<FolderHeart size={28} strokeWidth={1.3} />}
+          title={`No albums match "${searchQuery.trim()}"`}
+          description="Try a different search term or clear the search box to see all albums."
+        />
       ) : (
         <EmptyState
           icon={<FolderHeart size={28} strokeWidth={1.3} />}

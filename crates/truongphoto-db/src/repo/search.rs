@@ -200,7 +200,7 @@ fn append_deterministic_filters(
             let idx = params.len() + 1;
             params.push(Value::Text(trimmed.to_string()));
             where_clauses.push(format!(
-                "EXISTS (SELECT 1 FROM media_tags mt WHERE mt.asset_id = v.id AND mt.state = 'active' AND LOWER(mt.tag) = LOWER(?{idx}))"
+                "EXISTS (SELECT 1 FROM media_tags mt WHERE mt.asset_id = v.id AND mt.state = 'active' AND mt.tag = ?{idx})"
             ));
         }
     }
@@ -265,7 +265,7 @@ fn append_deterministic_filters(
             let idx = params.len() + 1;
             params.push(Value::Real(hi));
             exif_checks.push(format!(
-                "COALESCE(NULLIF(dpm_e.focal_length_35mm, 0), NULLIF(dpm_e.focal_length_mm, 0)) <= ?{idx}"
+                "CASE WHEN dpm_e.focal_length_35mm > 0 THEN dpm_e.focal_length_35mm WHEN dpm_e.focal_length_mm > 0 THEN dpm_e.focal_length_mm END <= ?{idx}"
             ));
         }
 
@@ -281,7 +281,9 @@ fn append_deterministic_filters(
         if let Some(hi) = ap_max {
             let idx = params.len() + 1;
             params.push(Value::Real(hi));
-            exif_checks.push(format!("dpm_e.aperture_f <= ?{idx}"));
+            exif_checks.push(format!(
+                "(dpm_e.aperture_f > 0 AND dpm_e.aperture_f <= ?{idx})"
+            ));
         }
 
         if let Some(lo) = req.iso_min {
@@ -292,7 +294,7 @@ fn append_deterministic_filters(
         if let Some(hi) = req.iso_max {
             let idx = params.len() + 1;
             params.push(Value::Integer(i64::from(hi)));
-            exif_checks.push(format!("dpm_e.iso <= ?{idx}"));
+            exif_checks.push(format!("(dpm_e.iso > 0 AND dpm_e.iso <= ?{idx})"));
         }
 
         let (sh_min, sh_max) = match (req.shutter_speed_min_sec, req.shutter_speed_max_sec) {
@@ -311,7 +313,9 @@ fn append_deterministic_filters(
         if let Some(hi) = sh_max {
             let idx = params.len() + 1;
             params.push(Value::Real(hi));
-            exif_checks.push(format!("dpm_e.shutter_speed_sec <= ?{idx}"));
+            exif_checks.push(format!(
+                "(dpm_e.shutter_speed_sec > 0 AND dpm_e.shutter_speed_sec <= ?{idx})"
+            ));
         }
 
         if !exif_checks.is_empty() {
@@ -455,11 +459,21 @@ pub fn build_filtered_candidates(
     Ok(candidates)
 }
 
+fn contains_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        ('\u{3040}'..='\u{30FF}').contains(&c)
+            || ('\u{3400}'..='\u{4DBF}').contains(&c)
+            || ('\u{4E00}'..='\u{9FFF}').contains(&c)
+            || ('\u{AC00}'..='\u{D7AF}').contains(&c)
+    })
+}
+
 /// Sanitizes arbitrary user text into a safe FTS5 `MATCH` query expression.
 ///
 /// Each whitespace-separated token containing at least one alphanumeric character is quoted
 /// as an FTS5 string literal (`"..."` with internal `"` escaped as `""`), preventing FTS5
-/// operator/punctuation syntax errors.
+/// operator/punctuation syntax errors. Pure alphanumeric tokens of length >= 2 use FTS5
+/// prefix matching (`"..."*`) so partial words like `starb` match `Starbucks`.
 fn sanitize_fts5_query(raw_query: &str) -> Option<String> {
     let mut terms = Vec::new();
     for token in raw_query.split_whitespace() {
@@ -468,7 +482,11 @@ fn sanitize_fts5_query(raw_query: &str) -> Option<String> {
             continue;
         }
         let escaped = cleaned.replace('"', "\"\"");
-        terms.push(format!("\"{escaped}\""));
+        if cleaned.chars().count() >= 2 && cleaned.chars().all(char::is_alphanumeric) {
+            terms.push(format!("\"{escaped}\"*"));
+        } else {
+            terms.push(format!("\"{escaped}\""));
+        }
     }
 
     if terms.is_empty() {
@@ -540,7 +558,78 @@ pub fn search_ocr_fts(
         }
     }
 
+    // FTS5 unicode61 does not segment CJK characters without spaces; fall back to LIKE substring match.
+    if results.is_empty() && contains_cjk(raw_query) {
+        let trimmed = raw_query.trim();
+        if !trimmed.is_empty() {
+            let mut like_params: Vec<Value> =
+                vec![Value::Text(format!("%{}%", escape_like_lower(trimmed)))];
+            let like_rbac = rbac_sql::folder_clause("a", scope, &mut like_params);
+            let like_sql = format!(
+                "SELECT d.asset_id, substr(d.full_text, 1, 160)
+                 FROM ocr_documents d
+                 JOIN assets a ON a.id = d.asset_id
+                 WHERE LOWER(d.full_text) LIKE ?1 ESCAPE '\\'
+                   AND a.deleted_at_ms IS NULL
+                   AND a.is_hidden = 0
+                   AND {like_rbac}
+                 ORDER BY d.asset_id ASC"
+            );
+            let mut like_stmt = conn.prepare(&like_sql)?;
+            let mut like_rows = like_stmt.query(params_from_iter(like_params))?;
+            while let Some(row) = like_rows.next()? {
+                let asset_id: String = row.get(0)?;
+                if let Some(allowed) = allowed_asset_ids {
+                    if !allowed.contains(&asset_id) {
+                        continue;
+                    }
+                }
+                let snippet: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                results.push((asset_id, 0.72, snippet));
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
     Ok(results)
+}
+
+fn is_metadata_stop_word(tok: &str) -> bool {
+    matches!(
+        tok,
+        "a" | "an"
+            | "the"
+            | "in"
+            | "on"
+            | "at"
+            | "of"
+            | "to"
+            | "for"
+            | "with"
+            | "by"
+            | "or"
+            | "and"
+            | "from"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "it"
+            | "my"
+            | "me"
+            | "we"
+            | "our"
+            | "as"
+            | "if"
+            | "so"
+            | "do"
+            | "no"
+            | "up"
+            | "go"
+    )
 }
 
 fn append_free_text_metadata_clauses(
@@ -570,10 +659,23 @@ fn append_free_text_metadata_clauses(
         i += 1;
     }
 
-    // Ignore overly long queries or pure punctuation so metadata matching stays precise.
+    // Strip English stop words and single-character noise so phrases like "a cat in the sun"
+    // don't match every filename containing "a" or "in" while preserving EXIF codes, "R7", "AJ", etc.
     let meaningful: Vec<String> = tokens
         .into_iter()
-        .filter(|t| t.chars().any(|c| c.is_alphanumeric()))
+        .filter(|t| {
+            let is_exif = parse_focal_mm_token(t).is_some()
+                || parse_aperture_f_token(t).is_some()
+                || parse_iso_token(t).is_some()
+                || parse_shutter_speed_token(t).is_some();
+            if is_exif {
+                return true;
+            }
+            if is_metadata_stop_word(t) {
+                return false;
+            }
+            t.chars().count() >= 2 && t.chars().any(|c| c.is_alphanumeric())
+        })
         .take(6)
         .collect();
     if meaningful.is_empty() {
@@ -588,7 +690,7 @@ fn append_free_text_metadata_clauses(
             let hi_idx = params.len() + 1;
             params.push(Value::Real(fl + 0.6));
             ors.push(format!(
-                "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_q WHERE dpm_q.asset_id = v.id AND dpm_q.focal_length_mm BETWEEN ?{lo_idx} AND ?{hi_idx})"
+                "EXISTS (SELECT 1 FROM deterministic_photo_meta dpm_q WHERE dpm_q.asset_id = v.id AND ((dpm_q.focal_length_mm > 0 AND dpm_q.focal_length_mm BETWEEN ?{lo_idx} AND ?{hi_idx}) OR (dpm_q.focal_length_35mm > 0 AND dpm_q.focal_length_35mm BETWEEN ?{lo_idx} AND ?{hi_idx})))"
             ));
         }
         if let Some(ap) = parse_aperture_f_token(&tok) {
@@ -939,22 +1041,22 @@ pub fn list_sql_filtered_assets(
     {
         Some("capture_asc") => "v.effective_capture_at_ms ASC, v.id ASC",
         Some("focal_asc") => {
-            "CASE WHEN dpm_s.focal_length_mm IS NULL THEN 1 ELSE 0 END ASC, dpm_s.focal_length_mm ASC, v.effective_capture_at_ms DESC"
+            "CASE WHEN COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) IS NULL OR COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) <= 0 THEN 1 ELSE 0 END ASC, COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) ASC, v.effective_capture_at_ms DESC"
         }
         Some("focal_desc") => {
-            "CASE WHEN dpm_s.focal_length_mm IS NULL THEN 1 ELSE 0 END ASC, dpm_s.focal_length_mm DESC, v.effective_capture_at_ms DESC"
+            "CASE WHEN COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) IS NULL OR COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) <= 0 THEN 1 ELSE 0 END ASC, COALESCE(NULLIF(dpm_s.focal_length_mm, 0), NULLIF(dpm_s.focal_length_35mm, 0)) DESC, v.effective_capture_at_ms DESC"
         }
         Some("iso_desc") => {
-            "CASE WHEN dpm_s.iso IS NULL THEN 1 ELSE 0 END ASC, dpm_s.iso DESC, v.effective_capture_at_ms DESC"
+            "CASE WHEN dpm_s.iso IS NULL OR dpm_s.iso <= 0 THEN 1 ELSE 0 END ASC, dpm_s.iso DESC, v.effective_capture_at_ms DESC"
         }
         Some("aperture_asc") => {
-            "CASE WHEN dpm_s.aperture_f IS NULL THEN 1 ELSE 0 END ASC, dpm_s.aperture_f ASC, v.effective_capture_at_ms DESC"
+            "CASE WHEN dpm_s.aperture_f IS NULL OR dpm_s.aperture_f <= 0 THEN 1 ELSE 0 END ASC, dpm_s.aperture_f ASC, v.effective_capture_at_ms DESC"
         }
         Some("shutter_asc") => {
-            "CASE WHEN dpm_s.shutter_speed_sec IS NULL THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec ASC, v.effective_capture_at_ms DESC"
+            "CASE WHEN dpm_s.shutter_speed_sec IS NULL OR dpm_s.shutter_speed_sec <= 0 THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec ASC, v.effective_capture_at_ms DESC"
         }
         Some("shutter_desc") => {
-            "CASE WHEN dpm_s.shutter_speed_sec IS NULL THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec DESC, v.effective_capture_at_ms DESC"
+            "CASE WHEN dpm_s.shutter_speed_sec IS NULL OR dpm_s.shutter_speed_sec <= 0 THEN 1 ELSE 0 END ASC, dpm_s.shutter_speed_sec DESC, v.effective_capture_at_ms DESC"
         }
         _ => "v.effective_capture_at_ms DESC, v.id DESC",
     };
@@ -1064,7 +1166,9 @@ pub fn load_asset_sort_keys(
         }
         let rbac_clause = rbac_sql::folder_clause("v", scope, &mut params);
         let sql = format!(
-            "SELECT v.id, v.effective_capture_at_ms, dpm.focal_length_mm, dpm.aperture_f, dpm.iso, dpm.shutter_speed_sec
+            "SELECT v.id, v.effective_capture_at_ms,
+                    COALESCE(NULLIF(dpm.focal_length_mm, 0), NULLIF(dpm.focal_length_35mm, 0)),
+                    dpm.aperture_f, dpm.iso, dpm.shutter_speed_sec
              FROM v_assets_effective v
              LEFT JOIN deterministic_photo_meta dpm ON dpm.asset_id = v.id
              WHERE v.id IN ({})
@@ -1080,10 +1184,10 @@ pub fn load_asset_sort_keys(
                 row.get::<_, String>(0)?,
                 AssetSortKey {
                     capture_at_ms: row.get::<_, i64>(1)?,
-                    focal_length_mm: row.get::<_, Option<f64>>(2)?,
-                    aperture_f: row.get::<_, Option<f64>>(3)?,
-                    iso: row.get::<_, Option<i64>>(4)?,
-                    shutter_speed_sec: row.get::<_, Option<f64>>(5)?,
+                    focal_length_mm: row.get::<_, Option<f64>>(2)?.filter(|v| *v > 0.0),
+                    aperture_f: row.get::<_, Option<f64>>(3)?.filter(|v| *v > 0.0),
+                    iso: row.get::<_, Option<i64>>(4)?.filter(|v| *v > 0),
+                    shutter_speed_sec: row.get::<_, Option<f64>>(5)?.filter(|v| *v > 0.0),
                 },
             ))
         })?;

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, RotateCcw, Trash2 } from 'lucide-react';
 import {
   listTrash,
@@ -36,19 +36,29 @@ export const TrashView: React.FC = () => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const seqRef = useRef(0);
+  const loadedOnceRef = useRef(false);
 
   const load = useCallback(async () => {
-    setLoading(true);
+    const seq = ++seqRef.current;
+    if (!loadedOnceRef.current) {
+      setLoading(true);
+    }
     setError(null);
     try {
       const res = await listTrash();
+      if (seq !== seqRef.current) return;
+      loadedOnceRef.current = true;
       setItems(res.items);
       setTotalCount(res.total_count);
       setSelectedIds(new Set());
     } catch (err) {
+      if (seq !== seqRef.current) return;
       setError(errorMessage(err));
     } finally {
-      setLoading(false);
+      if (seq === seqRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -120,7 +130,6 @@ export const TrashView: React.FC = () => {
         `Restored ${res.restored_count} item${res.restored_count === 1 ? '' : 's'}`,
       );
       bumpLibraryRevision();
-      await load();
     } catch (err) {
       notifyError(err, 'Could not restore items');
     } finally {
@@ -146,7 +155,6 @@ export const TrashView: React.FC = () => {
         `Purged ${report.purged_count} item(s) (${report.disk_deleted_files} disk file(s), ${report.db_only_assets} DB-only)`,
       );
       bumpLibraryRevision();
-      await load();
     } catch (err) {
       notifyError(err, 'Could not purge selected items');
     } finally {
@@ -170,7 +178,6 @@ export const TrashView: React.FC = () => {
         `Emptied Trash: ${report.purged_count} purged (${report.disk_deleted_files} disk file(s), ${report.db_only_assets} DB-only)`,
       );
       bumpLibraryRevision();
-      await load();
     } catch (err) {
       notifyError(err, 'Could not empty Trash');
     } finally {
@@ -275,7 +282,6 @@ export const TrashView: React.FC = () => {
                           await restoreTrashAssets([asset.id]);
                           notifySuccess('Restored item to library');
                           bumpLibraryRevision();
-                          await load();
                         } catch (err) {
                           notifyError(err, 'Could not restore item');
                         } finally {
@@ -305,7 +311,6 @@ export const TrashView: React.FC = () => {
                           await purgeTrashAssets({ asset_ids: [asset.id] });
                           notifySuccess('Permanently deleted item');
                           bumpLibraryRevision();
-                          await load();
                         } catch (err) {
                           notifyError(err, 'Could not purge item');
                         } finally {

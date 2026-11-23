@@ -78,8 +78,13 @@ pub fn ctc_greedy_decode_with_confidence(
                 false
             };
             if matched {
-                // PP-OCRv6 rec outputs probabilities in [0, 1] (post-softmax); fall back to softmax if logits > 1.
-                let prob = if (0.0..=1.0001).contains(&best_val) {
+                // Detect whether the row is already post-softmax probabilities (all in [0, 1] and summing to ~1)
+                // rather than raw logits that happen to have a small max value <= 1.0.
+                let row_sum: f32 = row.iter().copied().sum();
+                let is_prob = (0.0..=1.0001).contains(&best_val)
+                    && (0.98..=1.02).contains(&row_sum)
+                    && row.iter().all(|&v| v >= -1e-4);
+                let prob = if is_prob {
                     best_val.clamp(0.0, 1.0)
                 } else {
                     let denom: f32 = row.iter().map(|&v| (v - best_val).exp()).sum();
@@ -210,9 +215,12 @@ struct TextBox {
     y1: u32,
 }
 
+const OCR_BOX_MEAN_THRESHOLD: f32 = 0.55;
+const MAX_OCR_BOXES: usize = 64;
+
 fn extract_db_boxes(prob_map: &[f32], side: usize, max_w: u32, max_h: u32) -> Vec<TextBox> {
     let mut visited = vec![false; side * side];
-    let mut boxes = Vec::new();
+    let mut scored_boxes: Vec<(f32, TextBox)> = Vec::new();
     let mut queue = VecDeque::new();
 
     for sy in 0..side {
@@ -229,9 +237,11 @@ fn extract_db_boxes(prob_map: &[f32], side: usize, max_w: u32, max_h: u32) -> Ve
             let mut min_y = sy;
             let mut max_y = sy;
             let mut area = 0usize;
+            let mut prob_sum = 0.0f32;
 
             while let Some((cx, cy)) = queue.pop_front() {
                 area += 1;
+                prob_sum += prob_map[cy * side + cx];
                 min_x = min_x.min(cx);
                 max_x = max_x.max(cx);
                 min_y = min_y.min(cy);
@@ -253,6 +263,10 @@ fn extract_db_boxes(prob_map: &[f32], side: usize, max_w: u32, max_h: u32) -> Ve
             if area < 12 {
                 continue;
             }
+            let mean_prob = prob_sum / (area as f32);
+            if mean_prob < OCR_BOX_MEAN_THRESHOLD {
+                continue;
+            }
 
             let bw = (max_x - min_x + 1) as f32;
             let bh = (max_y - min_y + 1) as f32;
@@ -260,20 +274,28 @@ fn extract_db_boxes(prob_map: &[f32], side: usize, max_w: u32, max_h: u32) -> Ve
                 continue;
             }
 
-            // Slight 1.5x DBNet unclip expansion
-            let pad_x = (0.25 * bw).max(2.0);
-            let pad_y = (0.25 * bh).max(2.0);
-            let x0 = ((min_x as f32 - pad_x).floor().max(0.0) as u32).min(max_w.saturating_sub(1));
-            let y0 = ((min_y as f32 - pad_y).floor().max(0.0) as u32).min(max_h.saturating_sub(1));
-            let x1 = ((max_x as f32 + 1.0 + pad_x).ceil() as u32).min(max_w);
-            let y1 = ((max_y as f32 + 1.0 + pad_y).ceil() as u32).min(max_h);
+            // DBNet unclip distance scales with the short side so wide text lines do not
+            // over-expand horizontally and swallow adjacent columns.
+            let pad = ((bw * bh * 1.5) / (2.0 * (bw + bh))).clamp(2.0, bw.min(bh) * 0.75);
+            let x0 = ((min_x as f32 - pad).floor().max(0.0) as u32).min(max_w.saturating_sub(1));
+            let y0 = ((min_y as f32 - pad).floor().max(0.0) as u32).min(max_h.saturating_sub(1));
+            let x1 = ((max_x as f32 + 1.0 + pad).ceil() as u32).min(max_w);
+            let y1 = ((max_y as f32 + 1.0 + pad).ceil() as u32).min(max_h);
 
             if x1 > x0 + 2 && y1 > y0 + 2 {
-                boxes.push(TextBox { x0, y0, x1, y1 });
+                scored_boxes.push((mean_prob * (area as f32), TextBox { x0, y0, x1, y1 }));
             }
         }
     }
 
+    // Keep at most MAX_OCR_BOXES strongest text regions so noisy textures cannot trigger
+    // hundreds of sequential ONNX recognizer runs.
+    if scored_boxes.len() > MAX_OCR_BOXES {
+        scored_boxes.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scored_boxes.truncate(MAX_OCR_BOXES);
+    }
+
+    let mut boxes: Vec<TextBox> = scored_boxes.into_iter().map(|(_, b)| b).collect();
     // Sort in reading order (top-to-bottom row bands, left-to-right).
     boxes.sort_unstable_by(|a, b| {
         let band_a = a.y0 / 16;
@@ -410,7 +432,7 @@ impl OrtOcrBackend {
         let shape = [1usize, 3, h, w];
 
         self.ort
-            .with_session(SessionKey::OcrRec, &rec_path, |session| {
+            .with_session(SessionKey::OcrRec(bucket_w), &rec_path, |session| {
                 let tensor = TensorRef::from_array_view((&shape[..], chw.as_slice()))
                     .map_err(|e| AiError::Ort(e.to_string()))?;
                 let outputs = session
@@ -456,7 +478,14 @@ impl OcrBackend for OrtOcrBackend {
             if cw < 4 || ch < 4 {
                 continue;
             }
-            let crop = image::imageops::crop_imm(img, ox0, oy0, cw, ch).to_image();
+            let raw_crop = image::imageops::crop_imm(img, ox0, oy0, cw, ch).to_image();
+            // Rotate tall vertical text regions (street signs, book spines, vertical CJK)
+            // so resizing to height 48 preserves character aspect ratio.
+            let crop = if (ch as f32) > (cw as f32) * 1.5 {
+                image::imageops::rotate90(&raw_crop)
+            } else {
+                raw_crop
+            };
             let (text, mean_conf) = self.recognize_crop(&crop, &dict)?;
             if is_meaningful_ocr_line(&text, mean_conf) {
                 lines.push(text);

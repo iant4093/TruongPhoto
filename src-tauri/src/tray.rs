@@ -84,37 +84,79 @@ fn copy_text_to_clipboard(text: String) {
     let _ = std::thread::Builder::new()
         .name("tp-clipboard".into())
         .spawn(move || {
-            use std::io::Write;
-            use std::process::{Command, Stdio};
-
-            #[cfg(target_os = "macos")]
-            let mut cmd = Command::new("pbcopy");
-
             #[cfg(target_os = "windows")]
-            let mut cmd = {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                let mut c = Command::new("clip");
-                c.creation_flags(CREATE_NO_WINDOW);
-                c
-            };
-
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            let mut cmd = Command::new("xclip");
-
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            cmd.args(["-selection", "clipboard"]);
-
-            if let Ok(mut child) = cmd
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
             {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
+                use std::os::windows::ffi::OsStrExt;
+                use windows::Win32::Foundation::{GlobalFree, HANDLE};
+                use windows::Win32::System::DataExchange::{
+                    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+                };
+                use windows::Win32::System::Memory::{
+                    GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+                };
+                const CF_UNICODETEXT: u32 = 13;
+
+                let wide: Vec<u16> = std::ffi::OsStr::new(&text)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let byte_len = wide.len() * std::mem::size_of::<u16>();
+
+                for attempt in 0..3 {
+                    // SAFETY: Standard Win32 clipboard sequence with owned HGLOBAL memory.
+                    let opened = unsafe { OpenClipboard(None) }.is_ok();
+                    if !opened {
+                        if attempt < 2 {
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                        }
+                        continue;
+                    }
+                    unsafe {
+                        let _ = EmptyClipboard();
+                        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, byte_len) {
+                            let ptr = GlobalLock(hmem) as *mut u16;
+                            if !ptr.is_null() {
+                                std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+                                let _ = GlobalUnlock(hmem);
+                                if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hmem.0))).is_err() {
+                                    let _ = GlobalFree(Some(hmem));
+                                }
+                            } else {
+                                let _ = GlobalFree(Some(hmem));
+                            }
+                        }
+                        let _ = CloseClipboard();
+                    }
+                    break;
                 }
-                let _ = child.wait();
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                use std::io::Write;
+                use std::process::{Command, Stdio};
+
+                #[cfg(target_os = "macos")]
+                let mut cmd = Command::new("pbcopy");
+
+                #[cfg(not(target_os = "macos"))]
+                let mut cmd = {
+                    let mut c = Command::new("xclip");
+                    c.args(["-selection", "clipboard"]);
+                    c
+                };
+
+                if let Ok(mut child) = cmd
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    let _ = child.wait();
+                }
             }
         });
 }

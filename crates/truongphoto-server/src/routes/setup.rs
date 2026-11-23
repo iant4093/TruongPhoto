@@ -98,10 +98,11 @@ pub async fn setup_initialize(
     validate_profile_pin(&req.admin_profile_pin)?;
     validate_server_pin(&req.server_pin)?;
 
-    let managed_uploads_dir = req.managed_uploads_dir.trim().to_string();
-    let thumbnails_dir = req.thumbnails_dir.trim().to_string();
-    let cache_dir = req.cache_dir.trim().to_string();
-    let backup_dir = req.backup_dir.trim().to_string();
+    let managed_uploads_dir =
+        truongphoto_core::process::normalize_folder_path(&req.managed_uploads_dir);
+    let thumbnails_dir = truongphoto_core::process::normalize_folder_path(&req.thumbnails_dir);
+    let cache_dir = truongphoto_core::process::normalize_folder_path(&req.cache_dir);
+    let backup_dir = truongphoto_core::process::normalize_folder_path(&req.backup_dir);
     for (label, dir) in [
         ("managed_uploads_dir", &managed_uploads_dir),
         ("thumbnails_dir", &thumbnails_dir),
@@ -123,7 +124,8 @@ pub async fn setup_initialize(
         .filter(|s| !s.is_empty())
     {
         Some(raw_path) => {
-            let path = Path::new(raw_path);
+            let norm_path = truongphoto_core::process::normalize_folder_path(raw_path);
+            let path = Path::new(&norm_path);
             if !path.is_dir() {
                 return Err(AppError::validation(
                     "initial_folder_path must refer to an existing directory.",
@@ -145,7 +147,7 @@ pub async fn setup_initialize(
             let vol = resolve_volume_identity(path);
             Some((
                 Uuid::new_v4().to_string(),
-                raw_path.to_string(),
+                norm_path,
                 derived_name,
                 vol.volume_uuid,
                 vol.volume_label,

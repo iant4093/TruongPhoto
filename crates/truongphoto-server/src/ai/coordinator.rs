@@ -2,6 +2,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use truongphoto_ai::{AiError, AiPipeline, HybridVectorIndex};
@@ -26,6 +27,7 @@ pub struct AiCoordinator {
     vision_indices: RwLock<HashMap<AiTier, Arc<HybridVectorIndex>>>,
     faces_index: Arc<HybridVectorIndex>,
     downloads: Mutex<HashMap<String, CancellationToken>>,
+    decode_backoff: Mutex<HashMap<String, (u32, Instant)>>,
     pub wake: Arc<Notify>,
     pub worker_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -54,6 +56,7 @@ impl AiCoordinator {
             vision_indices: RwLock::new(HashMap::new()),
             faces_index,
             downloads: Mutex::new(HashMap::new()),
+            decode_backoff: Mutex::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
             worker_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -136,6 +139,51 @@ impl AiCoordinator {
         self.downloads.lock().remove(model_id);
     }
 
+    /// Returns `true` if `asset_id` recently failed Stage 2 decoding and is still in backoff.
+    pub fn is_decode_backed_off(&self, asset_id: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self.decode_backoff.lock();
+        if let Some(&(_, until)) = map.get(asset_id) {
+            if now < until {
+                return true;
+            }
+            map.remove(asset_id);
+        }
+        false
+    }
+
+    /// Records a Stage 2 decode failure with exponential backoff (60s -> 300s -> 900s -> 3600s)
+    /// so corrupt files do not starve valid pending assets behind them in the queue.
+    pub fn record_decode_failure(&self, asset_id: &str) {
+        let now = Instant::now();
+        let mut map = self.decode_backoff.lock();
+        if map.len() >= 4096 {
+            map.retain(|_, (_, until)| *until > now);
+            if map.len() >= 4096 {
+                map.clear();
+            }
+        }
+        let failures = map
+            .get(asset_id)
+            .map(|(n, _)| n.saturating_add(1))
+            .unwrap_or(1);
+        let secs = match failures {
+            1 => 60,
+            2 => 300,
+            3 => 900,
+            _ => 3600,
+        };
+        map.insert(
+            asset_id.to_string(),
+            (failures, now + Duration::from_secs(secs)),
+        );
+    }
+
+    /// Clears any decode failure backoff entry once an asset decodes successfully.
+    pub fn clear_decode_failure(&self, asset_id: &str) {
+        self.decode_backoff.lock().remove(asset_id);
+    }
+
     /// Cancels active downloads, evicts all ONNX Runtime and Chat sessions,
     /// and ensures vector index state is clean for shutdown.
     /// (`HybridVectorIndex` persists `.tombstones.roar` atomically on every mutation.)
@@ -144,6 +192,6 @@ impl AiCoordinator {
             token.cancel();
         }
         self.pipeline.ort.evict_all_sessions();
-        self.pipeline.chat.evict_idle(std::time::Duration::ZERO);
+        self.pipeline.chat.shutdown();
     }
 }

@@ -365,90 +365,8 @@ pub(crate) async fn execute_hybrid_search(
         })
         .await?;
 
-    if candidates.vector_ids.is_empty() {
-        if want_ocr && !ocr_hits.is_empty() {
-            let (items, total_count) = materialize_ocr_hits(
-                state,
-                rbac.scope.clone(),
-                ocr_hits,
-                req.sort_by.as_deref(),
-                offset,
-                limit,
-            )
-            .await?;
-            return Ok(SearchResponse {
-                items,
-                total_count,
-                planner_mode: PlannerMode::SqlOnly,
-                elapsed_ms: started.elapsed().as_millis() as u64,
-            });
-        }
-        if want_ocr {
-            let scope = rbac.scope.clone();
-            let req_sql = req.clone();
-            let (assets, total_count) = state
-                .db
-                .read(move |conn| repo::search::list_sql_filtered_assets(conn, &scope, &req_sql))
-                .await?;
-            return Ok(SearchResponse {
-                items: sql_assets_to_hits(assets, true),
-                total_count,
-                planner_mode: PlannerMode::SqlOnly,
-                elapsed_ms: started.elapsed().as_millis() as u64,
-            });
-        }
-        return Ok(SearchResponse {
-            items: Vec::new(),
-            total_count: 0,
-            planner_mode: PlannerMode::SqlOnly,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        });
-    }
-
-    let pipeline = Arc::clone(state.ai.pipeline());
-    let q_embed = query_str.clone();
-    let embed_res =
-        tokio::task::spawn_blocking(move || pipeline.vision.embed_text(active_tier, &q_embed))
-            .await
-            .map_err(|e| AppError::internal(format!("Search text embed worker panicked: {e}")))?;
-
-    let q_vec = match embed_res {
-        Ok(v) => v,
-        Err(AiError::ModelNotInstalled(_)) | Err(AiError::Ort(_)) => {
-            // Gracefully degrade to OCR / SQL filters when vision model or ORT is not installed.
-            if want_ocr && !ocr_hits.is_empty() {
-                let (items, total_count) = materialize_ocr_hits(
-                    state,
-                    rbac.scope.clone(),
-                    ocr_hits,
-                    req.sort_by.as_deref(),
-                    offset,
-                    limit,
-                )
-                .await?;
-                return Ok(SearchResponse {
-                    items,
-                    total_count,
-                    planner_mode: PlannerMode::SqlOnly,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                });
-            }
-            if want_ocr {
-                let scope = rbac.scope.clone();
-                let req_sql = req.clone();
-                let (assets, total_count) = state
-                    .db
-                    .read(move |conn| {
-                        repo::search::list_sql_filtered_assets(conn, &scope, &req_sql)
-                    })
-                    .await?;
-                return Ok(SearchResponse {
-                    items: sql_assets_to_hits(assets, true),
-                    total_count,
-                    planner_mode: PlannerMode::SqlOnly,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                });
-            }
+    let (collapsed, planner_mode) = if candidates.vector_ids.is_empty() {
+        if !want_ocr {
             return Ok(SearchResponse {
                 items: Vec::new(),
                 total_count: 0,
@@ -456,56 +374,86 @@ pub(crate) async fn execute_hybrid_search(
                 elapsed_ms: started.elapsed().as_millis() as u64,
             });
         }
-        Err(e) => {
-            return Err(AppError::internal(format!(
-                "Vision text embedding failed: {e}"
-            )));
+        // Fall through into unified OCR + Metadata fusion with empty semantic hits.
+        (Vec::new(), PlannerMode::SqlOnly)
+    } else {
+        let pipeline = Arc::clone(state.ai.pipeline());
+        let q_embed = query_str.clone();
+        let embed_res =
+            tokio::task::spawn_blocking(move || pipeline.vision.embed_text(active_tier, &q_embed))
+                .await
+                .map_err(|e| {
+                    AppError::internal(format!("Search text embed worker panicked: {e}"))
+                })?;
+
+        match embed_res {
+            Ok(q_vec) => {
+                let active_index = state.ai.vision_index(active_tier).map_err(|e| {
+                    AppError::internal(format!("Failed to open vision vector index: {e}"))
+                })?;
+                let has_explicit_sort =
+                    req.sort_by.as_deref().is_some_and(|s| !s.trim().is_empty());
+                let fetch_k = if has_explicit_sort {
+                    overfetch_k(limit.saturating_add(offset))
+                        .saturating_mul(4)
+                        .max(1000)
+                } else {
+                    overfetch_k(limit.saturating_add(offset))
+                };
+                let allowed_vids = candidates.vector_ids;
+
+                let (raw_vec_hits, mode) = tokio::task::spawn_blocking(move || {
+                    active_index.search_hybrid(&q_vec, &allowed_vids, fetch_k)
+                })
+                .await
+                .map_err(|e| AppError::internal(format!("Vector search worker panicked: {e}")))?
+                .map_err(|e| AppError::internal(format!("Vector search failed: {e}")))?;
+
+                let vids: Vec<u32> = raw_vec_hits.iter().map(|(vid, _)| *vid).collect();
+                let vid_map = state
+                    .db
+                    .read(move |conn| repo::ai::resolve_vision_vector_ids(conn, active_tier, &vids))
+                    .await?;
+
+                let keyframe_hits: Vec<KeyframeHit> = raw_vec_hits
+                    .into_iter()
+                    .filter_map(|(vector_id, score)| {
+                        vid_map
+                            .get(&vector_id)
+                            .map(|(asset_id, timestamp_ms)| KeyframeHit {
+                                vector_id,
+                                asset_id: asset_id.clone(),
+                                timestamp_ms: *timestamp_ms,
+                                score,
+                            })
+                    })
+                    .collect();
+
+                let collapse_limit = keyframe_hits.len().max(1);
+                (
+                    collapse_video_keyframes(keyframe_hits, collapse_limit),
+                    mode,
+                )
+            }
+            Err(AiError::ModelNotInstalled(_)) | Err(AiError::Ort(_)) => {
+                if !want_ocr {
+                    return Ok(SearchResponse {
+                        items: Vec::new(),
+                        total_count: 0,
+                        planner_mode: PlannerMode::SqlOnly,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+                }
+                // Gracefully degrade to fused OCR + deterministic metadata hits.
+                (Vec::new(), PlannerMode::SqlOnly)
+            }
+            Err(e) => {
+                return Err(AppError::internal(format!(
+                    "Vision text embedding failed: {e}"
+                )));
+            }
         }
     };
-
-    let active_index = state
-        .ai
-        .vision_index(active_tier)
-        .map_err(|e| AppError::internal(format!("Failed to open vision vector index: {e}")))?;
-    let has_explicit_sort = req.sort_by.as_deref().is_some_and(|s| !s.trim().is_empty());
-    let fetch_k = if has_explicit_sort {
-        overfetch_k(limit.saturating_add(offset))
-            .saturating_mul(4)
-            .max(1000)
-    } else {
-        overfetch_k(limit.saturating_add(offset))
-    };
-    let allowed_vids = candidates.vector_ids;
-
-    let (raw_vec_hits, planner_mode) = tokio::task::spawn_blocking(move || {
-        active_index.search_hybrid(&q_vec, &allowed_vids, fetch_k)
-    })
-    .await
-    .map_err(|e| AppError::internal(format!("Vector search worker panicked: {e}")))?
-    .map_err(|e| AppError::internal(format!("Vector search failed: {e}")))?;
-
-    let vids: Vec<u32> = raw_vec_hits.iter().map(|(vid, _)| *vid).collect();
-    let vid_map = state
-        .db
-        .read(move |conn| repo::ai::resolve_vision_vector_ids(conn, active_tier, &vids))
-        .await?;
-
-    let keyframe_hits: Vec<KeyframeHit> = raw_vec_hits
-        .into_iter()
-        .filter_map(|(vector_id, score)| {
-            vid_map
-                .get(&vector_id)
-                .map(|(asset_id, timestamp_ms)| KeyframeHit {
-                    vector_id,
-                    asset_id: asset_id.clone(),
-                    timestamp_ms: *timestamp_ms,
-                    score,
-                })
-        })
-        .collect();
-
-    let collapse_limit = keyframe_hits.len().max(1);
-    let collapsed = collapse_video_keyframes(keyframe_hits, collapse_limit);
 
     let meta_id_set: std::collections::HashSet<&str> = if want_ocr {
         metadata_hits.iter().map(String::as_str).collect()
@@ -515,9 +463,9 @@ pub(crate) async fn execute_hybrid_search(
     let has_meta_hits = !meta_id_set.is_empty();
     // When deterministic metadata (camera, lens, focal length, aperture, ISO, filename, folder, or
     // named person) matched the query, avoid polluting results with low-confidence SigLIP2 noise
-    // for proper nouns / EXIF codes; still keep semantic boost on metadata matches and very strong
-    // visual matches (>= 0.165).
-    const META_SEMANTIC_EXTRA_MIN_SCORE: f32 = 0.165;
+    // for proper nouns / EXIF codes; still keep semantic boost on metadata matches and strong
+    // visual matches (>= 0.12).
+    const META_SEMANTIC_EXTRA_MIN_SCORE: f32 = 0.12;
 
     let mut by_asset: HashMap<String, PendingHit> = HashMap::new();
     for hit in collapsed {

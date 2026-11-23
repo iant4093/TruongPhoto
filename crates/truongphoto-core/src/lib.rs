@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod fingerprint;
 pub mod models;
+pub mod process;
 pub mod rbac;
 pub mod ws;
 

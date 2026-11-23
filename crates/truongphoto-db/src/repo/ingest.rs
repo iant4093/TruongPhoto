@@ -132,27 +132,60 @@ pub fn list_folder_file_index(
     Ok(map)
 }
 
-/// Marks disappeared `asset_files` rows as `is_missing = 1`.
+/// `O(log N)` lookup of a single indexed file by `(folder_id, rel_path)` using the unique index.
+pub fn get_folder_file_by_rel_path(
+    conn: &Connection,
+    folder_id: &str,
+    rel_path: &str,
+) -> DbResult<Option<ExistingFileEntry>> {
+    let entry = conn
+        .query_row(
+            "SELECT id, asset_id, rel_path, file_size, mtime_ms, partial_blake3, is_missing
+             FROM asset_files
+             WHERE folder_id = ?1 AND rel_path = ?2
+             LIMIT 1",
+            params![folder_id, rel_path],
+            |row| {
+                let sz: i64 = row.get(3)?;
+                Ok(ExistingFileEntry {
+                    file_id: row.get(0)?,
+                    asset_id: row.get(1)?,
+                    rel_path: row.get(2)?,
+                    file_size: u64::try_from(sz).unwrap_or(0),
+                    mtime_ms: row.get(4)?,
+                    partial_blake3: row.get(5)?,
+                    is_missing: row.get::<_, i64>(6)? != 0,
+                })
+            },
+        )
+        .optional()?;
+    Ok(entry)
+}
+
+/// Marks disappeared `asset_files` rows as `is_missing = 1` in bounded chunks.
 pub fn mark_files_missing(conn: &Connection, file_ids: &[String], now_ms: i64) -> DbResult<usize> {
     if file_ids.is_empty() {
         return Ok(0);
     }
 
-    let mut params: Vec<Value> = vec![Value::Integer(now_ms)];
-    let mut placeholders = Vec::with_capacity(file_ids.len());
-    for (i, id) in file_ids.iter().enumerate() {
-        params.push(Value::Text(id.clone()));
-        placeholders.push(format!("?{}", i + 2));
-    }
+    let mut total_affected = 0usize;
+    for chunk in file_ids.chunks(400) {
+        let mut params: Vec<Value> = vec![Value::Integer(now_ms)];
+        let mut placeholders = Vec::with_capacity(chunk.len());
+        for (i, id) in chunk.iter().enumerate() {
+            params.push(Value::Text(id.clone()));
+            placeholders.push(format!("?{}", i + 2));
+        }
 
-    let sql = format!(
-        "UPDATE asset_files
-         SET is_missing = 1, updated_at_ms = ?1
-         WHERE id IN ({}) AND is_missing = 0",
-        placeholders.join(", ")
-    );
-    let affected = conn.execute(&sql, params_from_iter(params))?;
-    Ok(affected)
+        let sql = format!(
+            "UPDATE asset_files
+             SET is_missing = 1, updated_at_ms = ?1
+             WHERE id IN ({}) AND is_missing = 0",
+            placeholders.join(", ")
+        );
+        total_affected += conn.execute(&sql, params_from_iter(params))?;
+    }
+    Ok(total_affected)
 }
 
 /// Looks up a missing physical file matching `(partial_blake3, file_size)` within the same folder
@@ -1375,6 +1408,7 @@ pub fn cleanup_missing_files(conn: &Connection, folder_id: &str, now_ms: i64) ->
                                  WHERE id = ?3",
                                 params![rem_file_id, now_ms, asset_id],
                             )?;
+                            crate::repo::map::sync_asset_geo(conn, &asset_id)?;
                         } else {
                             conn.execute(
                                 "UPDATE assets

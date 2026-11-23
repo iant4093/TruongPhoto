@@ -29,8 +29,20 @@ impl ClassicChatRouter {
             return merged;
         }
 
-        // 0. Informational meta-questions ("who are in my pics", "what's in my library", "hi", etc.)
+        // 0. Deterministic single-filter removal ("remove the location filter", clickable chip removal).
         let lower_raw = text.to_ascii_lowercase();
+        if crate::chat::sidecar::try_apply_filter_removal(
+            &lower_raw,
+            &input.prior_filters,
+            &mut turn,
+        ) {
+            let mut merged = merge_router_plan(&input.prior_filters, &turn);
+            merged.assistant_reply = build_assistant_reply(&merged);
+            merged.follow_up_suggestions = build_suggestions(&merged);
+            return merged;
+        }
+
+        // 0b. Informational meta-questions ("who are in my pics", "what's in my library", "hi", etc.)
         let trimmed_punct =
             lower_raw.trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace());
         let is_explicit_show = [
@@ -93,10 +105,26 @@ impl ClassicChatRouter {
         }
         text = after_dates;
 
-        // 4. Known RBAC-visible person names.
+        // 4. Known RBAC-visible person names + "without people" / "no people" negation.
         let (people, after_people) = extract_known_people(&text, &input.known_person_names);
         turn.person_names = people;
         text = after_people;
+
+        for neg_phrase in [
+            "without any people",
+            "without people",
+            "no people",
+            "without faces",
+            "no faces",
+            "unpeopled",
+            "nobody",
+        ] {
+            let (found, next) = strip_phrase_ci(&text, neg_phrase);
+            if found {
+                turn.has_people = Some(false);
+                text = next;
+            }
+        }
 
         // 5. Cameras (`shot on ...`, `taken with ...`, `camera ...`).
         let (camera, after_camera) = extract_camera(&text);
@@ -423,6 +451,15 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                 NaiveDate::from_ymd_opt(y, m, 1).unwrap(),
                 NaiveDate::from_ymd_opt(y, m, days_in_month(y, m)).unwrap(),
             )
+        }),
+        ("last weekend", |t, _, _| {
+            let days_from_mon = t.weekday().num_days_from_monday() as i64;
+            if days_from_mon == 6 {
+                (t - ChronoDuration::days(1), t)
+            } else {
+                let sat = t - ChronoDuration::days(days_from_mon + 2);
+                (sat, sat + ChronoDuration::days(1))
+            }
         }),
         ("last week", |t, _, _| (t - ChronoDuration::days(7), t)),
         ("this week", |t, _, _| {

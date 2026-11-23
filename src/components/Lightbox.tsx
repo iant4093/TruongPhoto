@@ -51,6 +51,7 @@ export const Lightbox: React.FC = () => {
   const canMutate = user?.role === 'admin' || user?.role === 'contributor';
 
   const [detail, setDetail] = useState<AssetDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [infoOpen, setInfoOpen] = useState(false);
@@ -77,6 +78,7 @@ export const Lightbox: React.FC = () => {
     startPanY: number;
     pinchStartDist: number | null;
     pinchStartZoom: number;
+    wasPinching: boolean;
     lastTapAt: number;
     longPressTimer: number | null;
     dragging: boolean;
@@ -88,11 +90,21 @@ export const Lightbox: React.FC = () => {
     startPanY: 0,
     pinchStartDist: null,
     pinchStartZoom: 1,
+    wasPinching: false,
     lastTapAt: 0,
     longPressTimer: null,
     dragging: false,
     didDrag: false,
   });
+
+  const clearLongPress = useCallback(() => {
+    if (gestureRef.current.longPressTimer !== null) {
+      window.clearTimeout(gestureRef.current.longPressTimer);
+      gestureRef.current.longPressTimer = null;
+    }
+  }, []);
+
+  useEffect(() => () => clearLongPress(), [clearLongPress]);
 
   const currentIndex = useMemo(() => {
     if (!lightboxAssetId) return -1;
@@ -115,14 +127,17 @@ export const Lightbox: React.FC = () => {
   }, [currentIndex, hasNext, lightboxAssetIds, setLightboxAsset]);
 
   useEffect(() => {
+    clearLongPress();
     if (!lightboxAssetId) {
       setDetail(null);
+      setDetailLoading(false);
       setInfoOpen(false);
       setNavDir('fade');
       return;
     }
 
     let active = true;
+    setDetailLoading(true);
     setError(null);
     setRawDemosaic(false);
     setLivePlaying(false);
@@ -139,12 +154,16 @@ export const Lightbox: React.FC = () => {
       .catch((err) => {
         if (!active) return;
         setError(errorMessage(err));
+      })
+      .finally(() => {
+        if (active) setDetailLoading(false);
       });
 
     return () => {
       active = false;
+      clearLongPress();
     };
-  }, [lightboxAssetId]);
+  }, [clearLongPress, lightboxAssetId]);
 
   // Preload adjacent prev/next photo previews in the background for instantaneous arrow navigation.
   useEffect(() => {
@@ -480,18 +499,12 @@ export const Lightbox: React.FC = () => {
 
   const liveVideoUrl = activeDetail?.playback.live_video_url ?? mediaLiveVideoUrl(lightboxAssetId);
 
-  const clearLongPress = () => {
-    if (gestureRef.current.longPressTimer !== null) {
-      window.clearTimeout(gestureRef.current.longPressTimer);
-      gestureRef.current.longPressTimer = null;
-    }
-  };
-
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     clearLongPress();
     if (e.touches.length === 2) {
       gestureRef.current.pinchStartDist = touchDistance(e.touches[0], e.touches[1]);
       gestureRef.current.pinchStartZoom = zoom;
+      gestureRef.current.wasPinching = true;
       return;
     }
     if (e.touches.length === 1) {
@@ -536,8 +549,11 @@ export const Lightbox: React.FC = () => {
 
   const handleTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
     clearLongPress();
-    if (gestureRef.current.pinchStartDist !== null) {
+    if (gestureRef.current.pinchStartDist !== null || gestureRef.current.wasPinching) {
       gestureRef.current.pinchStartDist = null;
+      if (e.touches.length === 0) {
+        gestureRef.current.wasPinching = false;
+      }
       return;
     }
     if (zoom === 1 && e.changedTouches.length === 1) {
@@ -549,6 +565,12 @@ export const Lightbox: React.FC = () => {
         else goNext();
       }
     }
+  };
+
+  const handleTouchCancel = () => {
+    clearLongPress();
+    gestureRef.current.pinchStartDist = null;
+    gestureRef.current.wasPinching = false;
   };
 
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -682,7 +704,10 @@ export const Lightbox: React.FC = () => {
       aria-label="Media lightbox"
     >
       <header className="lightbox-toolbar" data-tauri-drag-region>
-        <div className="row lightbox-toolbar-left" style={{ gap: 10, minWidth: 0 }}>
+        <div
+          className="row lightbox-toolbar-left"
+          style={{ gap: 10, minWidth: 0, flex: '1 1 180px' }}
+        >
           <button
             type="button"
             className="icon-button lightbox-close-btn"
@@ -847,6 +872,7 @@ export const Lightbox: React.FC = () => {
           onTouchStart={handleTouchStart}
           onTouchMove={handleTouchMove}
           onTouchEnd={handleTouchEnd}
+          onTouchCancel={handleTouchCancel}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
@@ -952,6 +978,7 @@ export const Lightbox: React.FC = () => {
             <AssetInspector
               assetId={lightboxAssetId}
               initialDetail={activeDetail}
+              loadingInitialDetail={detailLoading}
               onAssetUpdated={(updated) => setDetail(updated)}
             />
           </aside>

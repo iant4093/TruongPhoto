@@ -414,6 +414,21 @@ pub fn reassign_face(
     new_person_name: Option<&str>,
     now_ms: i64,
 ) -> DbResult<Option<ReassignFaceResponse>> {
+    Ok(
+        reassign_face_returning_old(conn, face_id, target_person_id, new_person_name, now_ms)?
+            .map(|(res, _old)| res),
+    )
+}
+
+/// Reassigns `face_id` and returns `(response, previous_person_id)` so callers can recompute
+/// the actual previous person's centroid rather than relying on the request path parameter.
+pub fn reassign_face_returning_old(
+    conn: &Connection,
+    face_id: &str,
+    target_person_id: Option<&str>,
+    new_person_name: Option<&str>,
+    now_ms: i64,
+) -> DbResult<Option<(ReassignFaceResponse, Option<String>)>> {
     let existing: Option<Option<String>> = conn
         .query_row(
             "SELECT person_id FROM faces WHERE id = ?1",
@@ -487,13 +502,16 @@ pub fn reassign_face(
         Ok(None)
     })?;
 
-    Ok(Some(ReassignFaceResponse {
-        face_id: face_id.to_string(),
-        person_id: resolved_person_id,
-    }))
+    Ok(Some((
+        ReassignFaceResponse {
+            face_id: face_id.to_string(),
+            person_id: resolved_person_id,
+        },
+        old_person_id,
+    )))
 }
 
-/// Lists detected faces on `asset_id` strictly within `scope`.
+/// Lists detected faces on `asset_id` strictly within `scope` (filtering hidden people for non-admins).
 pub fn list_asset_faces(
     conn: &Connection,
     scope: &RbacScope,
@@ -501,6 +519,11 @@ pub fn list_asset_faces(
 ) -> DbResult<Vec<FaceView>> {
     let mut params: Vec<Value> = vec![Value::Text(asset_id.to_string())];
     let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
+    let hidden_clause = if matches!(scope, RbacScope::AdminAll) {
+        ""
+    } else {
+        "AND (f.person_id IS NULL OR p.is_hidden = 0)"
+    };
 
     let sql = format!(
         "SELECT
@@ -520,6 +543,7 @@ pub fn list_asset_faces(
          WHERE f.asset_id = ?1
            AND a.deleted_at_ms IS NULL
            AND a.is_hidden = 0
+           {hidden_clause}
            AND {rbac_clause}
          ORDER BY f.det_score DESC, f.created_at_ms ASC, f.id ASC"
     );

@@ -287,7 +287,7 @@ pub async fn reassign_face(
     let res = state
         .db
         .write(move |conn| {
-            let res = repo::people::reassign_face(
+            let (res, old_person_id) = repo::people::reassign_face_returning_old(
                 conn,
                 &face_id,
                 req.target_person_id.as_deref(),
@@ -296,11 +296,13 @@ pub async fn reassign_face(
             )?
             .ok_or_else(|| DbError::NotFound("Face not found.".to_string()))?;
 
-            if !person_id.is_empty() {
+            if let Some(ref old_pid) = old_person_id {
+                let _ = recompute_person_centroid(conn, &faces_idx, old_pid, now_ms);
+            } else if !person_id.is_empty() && person_id != "unassigned" {
                 let _ = recompute_person_centroid(conn, &faces_idx, &person_id, now_ms);
             }
             if let Some(ref new_pid) = res.person_id {
-                if new_pid != &person_id {
+                if old_person_id.as_deref() != Some(new_pid.as_str()) {
                     let _ = recompute_person_centroid(conn, &faces_idx, new_pid, now_ms);
                 }
             }

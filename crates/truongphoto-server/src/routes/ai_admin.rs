@@ -218,7 +218,6 @@ async fn run_model_download(
     let models_dir = state.ai.models_dir().to_path_buf();
     let ws_tx = state.ws_tx.clone();
     let db = state.db.clone();
-    let dir_for_cb = local_dir_str.clone();
     let kind_for_cb = kind.clone();
 
     let result = downloader
@@ -234,22 +233,15 @@ async fn run_model_download(
                     message: None,
                 });
                 let db_clone = db.clone();
-                let dir_clone = dir_for_cb.clone();
                 let id_str = spec.id.to_string();
                 let now_ms = Utc::now().timestamp_millis();
                 tokio::spawn(async move {
-                    let row = repo::ai::AiModelRow {
-                        model_id: id_str,
-                        status: AiModelStatus::Downloading,
-                        local_dir: Some(dir_clone),
-                        bytes_total: total,
-                        bytes_downloaded: downloaded,
-                        sha256_manifest: None,
-                        error_message: None,
-                        updated_at_ms: now_ms,
-                    };
                     let _ = db_clone
-                        .write(move |conn| repo::ai::upsert_ai_model_row(conn, &row))
+                        .write(move |conn| {
+                            repo::ai::update_ai_model_download_progress(
+                                conn, &id_str, downloaded, total, now_ms,
+                            )
+                        })
                         .await;
                 });
             }
@@ -383,9 +375,31 @@ pub async fn delete_ai_model(
 
     let dir = model_dir(state.ai.models_dir(), spec.id);
     if dir.exists() {
-        tokio::fs::remove_dir_all(&dir)
-            .await
-            .map_err(|e| AppError::internal(format!("Failed to delete model files: {e}")))?;
+        let mut last_err: Option<std::io::Error> = None;
+        let attempts = if cfg!(windows) { 6 } else { 2 };
+        for attempt in 0..attempts {
+            match tokio::fs::remove_dir_all(&dir).await {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(Duration::from_millis(80 * (attempt as u64 + 1))).await;
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(AppError::internal(format!(
+                "Failed to delete model files: {e}"
+            )));
+        }
     }
 
     let id_str = spec.id.to_string();

@@ -170,6 +170,12 @@ impl HybridVectorIndex {
         self.delta_ids.read().len() as usize >= DELTA_COMPACT_THRESHOLD
     }
 
+    /// Returns the total number of slots allocated in the append-only `.f16` store,
+    /// used as a monotonic floor so deleted `vector_id` slots are never reused.
+    pub fn flat_count(&self) -> u64 {
+        self.flat.count()
+    }
+
     /// Rebuilds the base `.usearch` index from all non-tombstoned rows in `vectors.f16`,
     /// atomically swaps it onto disk, re-opens via read-only `Index::view`, and clears delta.
     pub fn compact_and_swap(&self) -> Result<(), AiError> {

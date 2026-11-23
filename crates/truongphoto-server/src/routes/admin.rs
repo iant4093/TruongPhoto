@@ -441,8 +441,14 @@ pub async fn update_settings(
         .await?;
 
     if mdns_changed {
-        let mut mdns = state.mdns.lock();
-        mdns.reconfigure(updated.mdns_hostname.clone(), updated.mdns_enabled);
+        let state_mdns = Arc::clone(&state);
+        let hostname = updated.mdns_hostname.clone();
+        let enabled = updated.mdns_enabled;
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut mdns = state_mdns.mdns.lock();
+            mdns.reconfigure(hostname, enabled);
+        })
+        .await;
     }
 
     let _ = state.ws_tx.send(WsServerEvent::SettingsChanged {

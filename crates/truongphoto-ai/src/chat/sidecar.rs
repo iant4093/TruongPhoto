@@ -159,7 +159,7 @@ impl SidecarLlamaRouter {
             .arg("--no-webui")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(bin_dir) = bin_path.parent() {
             cmd.current_dir(bin_dir);
         }
@@ -170,16 +170,55 @@ impl SidecarLlamaRouter {
         let mut child = cmd
             .spawn()
             .map_err(|e| AiError::ExternalTool(format!("spawn {}: {e}", bin_path.display())))?;
+        truongphoto_core::process::assign_to_kill_on_close_job(&child);
+
+        // Drain stderr continuously into a small bounded ring buffer so the pipe never stalls
+        // and startup failures include actionable Vulkan/CUDA/GGUF diagnostics.
+        let stderr_tail: std::sync::Arc<Mutex<std::collections::VecDeque<String>>> =
+            std::sync::Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(24)));
+        if let Some(stderr) = child.stderr.take() {
+            let tail_ref = std::sync::Arc::clone(&stderr_tail);
+            let _ = std::thread::Builder::new()
+                .name("tp-llama-stderr".into())
+                .spawn(move || {
+                    use std::io::{BufRead, BufReader};
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let mut q = tail_ref.lock();
+                        if q.len() >= 24 {
+                            q.pop_front();
+                        }
+                        q.push_back(trimmed.chars().take(240).collect());
+                    }
+                });
+        }
 
         let health_timeout = if tier == ChatTier::Tier3 {
             Duration::from_secs(120)
         } else {
             Duration::from_secs(45)
         };
-        if let Err(e) = wait_for_server_health(port, &mut child, health_timeout) {
+        if let Err(e) =
+            wait_for_server_health(port, &mut child, health_timeout, &self.shutting_down)
+        {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e);
+            let tail_msg = {
+                let q = stderr_tail.lock();
+                if q.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " | stderr: {}",
+                        q.iter().cloned().collect::<Vec<_>>().join(" ; ")
+                    )
+                }
+            };
+            return Err(AiError::ExternalTool(format!("{e}{tail_msg}")));
         }
 
         *guard = Some(SidecarProcess {
@@ -454,6 +493,12 @@ impl ChatRouterBackend for SidecarLlamaRouter {
     fn warmup(&self, tier: ChatTier) -> bool {
         matches!(self.ensure_server_port(tier), Ok(Some(_)))
     }
+
+    fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let mut guard = self.process.lock();
+        *guard = None;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,13 +700,20 @@ fn compact_prior_filters_json(prior: &RouterPlan) -> String {
 
 fn build_router_system_prompt(input: &ChatTurnInput) -> String {
     let prior_json = compact_prior_filters_json(&input.prior_filters);
-    let cur_y = input.current_date_utc.year();
-    let cur_m = input.current_date_utc.month();
+    let today = input.current_date_utc.date_naive();
+    let cur_y = today.year();
+    let cur_m = today.month();
     let (this_m_from, this_m_to) = calendar_month_range(cur_y, cur_m);
     let (prev1_y, prev1_m) = shift_calendar_month(cur_y, cur_m, -1);
     let (last_m_from, last_m_to) = calendar_month_range(prev1_y, prev1_m);
     let (prev2_y, prev2_m) = shift_calendar_month(cur_y, cur_m, -2);
     let (two_m_from, two_m_to) = calendar_month_range(prev2_y, prev2_m);
+
+    let yesterday = today - chrono::Duration::days(1);
+    let days_from_mon = today.weekday().num_days_from_monday() as i64;
+    let this_week_start = today - chrono::Duration::days(days_from_mon);
+    let last_week_start = today - chrono::Duration::days(7);
+    let (last_wknd_sat, last_wknd_sun) = last_weekend_dates(today);
 
     let date_span = match &input.library.date_range {
         Some((lo, hi)) => format!("{lo} to {hi}"),
@@ -706,13 +758,14 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
            * \"aperture_min_f\" / \"aperture_max_f\": exact \"f/1.4\" -> both 1.4; \"wide open / bokeh / shallow\" without a number -> max 2.0 only; \"f/8 or narrower\" -> min 8.0 only.\n\
            * \"iso_min\" / \"iso_max\": exact \"ISO 100\" -> both 100; \"ISO 3200+\" -> min 3200.\n\
            * \"shutter_speed_min_sec\" / \"shutter_speed_max_sec\": decimal seconds! Faster = smaller (\"1/1000s or faster\" -> max 0.001); slower/long exposure = larger (\"long exposure / silky water\" -> min 0.05 only).\n\
-           * \"orientation\": \"portrait\" (vertical/tall/phone wallpaper), \"landscape\" (horizontal/desktop wallpaper), or \"square\".\n\
-         - Dates: output ISO \"date_from\" / \"date_to\" (\"YYYY-MM-DD\"). Use Calendar month reference for \"this month\", \"last month\", \"two months ago\"; open-ended bounds like \"before October\" -> date_to only, \"after September\" -> date_from only; standalone month like \"in June\" -> that month in the current/most recent year.\n\
+           * \"orientation\": \"portrait\" (vertical/phone wallpaper), \"landscape\" (horizontal/desktop wallpaper), or \"square\" (square crop/1:1).\n\
+         - Dates: output ISO \"date_from\" / \"date_to\" (\"YYYY-MM-DD\"). Use Date reference below for \"yesterday\", \"this week\", \"last weekend\", \"last week\", \"this month\", \"last month\", \"two months ago\"; open-ended bounds like \"before October\" -> date_to only, \"after September\" -> date_from only; standalone month like \"in June\" -> that month in the current/most recent year.\n\
          - Omit \"tags\" unless user explicitly asks for a tag (\"tagged X\" / \"#X\"). Omit \"kind\" unless explicitly asking for only photos/videos/raw/live photos.\n\
          - Set clear_prior_filters=true when switching topic, starting over, or removing a prior filter (re-emit the remaining filters you want to keep); set false when narrowing prior active filters.\n\
          - Write a crisp, natural \"assistant_reply\" (1–2 sentences for answers, 1 sentence for searches) and 2–3 short grounded \"follow_up_suggestions\". Never invent file paths or extra JSON keys.\n\
          Library Overview (RBAC-visible):\n\
-         - Today (UTC): {} | \"this month\": {}..{} | \"last month\": {}..{} | \"two months ago\": {}..{}\n\
+         - Today (UTC): {} | \"yesterday\": {} | \"this week\": {}..{} | \"last weekend\": {}..{} | \"last week\": {}..{}\n\
+         - Calendar months: \"this month\": {}..{} | \"last month\": {}..{} | \"two months ago\": {}..{}\n\
          - Total items: {} (capture span: {})\n\
          - Folders / Events: {:?}\n\
          - People (photo counts): {:?}\n\
@@ -720,7 +773,14 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
          - Lenses: {:?}\n\
          - Top tags: {:?}\n\
          - Prior active filters: {}",
-        input.current_date_utc.format("%Y-%m-%d"),
+        input.current_date_utc.format("%A, %Y-%m-%d"),
+        yesterday.format("%Y-%m-%d"),
+        this_week_start.format("%Y-%m-%d"),
+        today.format("%Y-%m-%d"),
+        last_wknd_sat.format("%Y-%m-%d"),
+        last_wknd_sun.format("%Y-%m-%d"),
+        last_week_start.format("%Y-%m-%d"),
+        today.format("%Y-%m-%d"),
         this_m_from,
         this_m_to,
         last_m_from,
@@ -736,6 +796,20 @@ fn build_router_system_prompt(input: &ChatTurnInput) -> String {
         input.library.top_tags,
         prior_json,
     )
+}
+
+fn last_weekend_dates(today: NaiveDate) -> (NaiveDate, NaiveDate) {
+    let days_from_mon = today.weekday().num_days_from_monday() as i64;
+    // If today is Sun (6), last completed weekend is prev Sat..Sun (today - 8 .. today - 7)?
+    // Actually if today is Mon(0)..Sat(5), most recent Saturday is today - (days_from_mon + 2) days.
+    // If today is Sun(6), most recent Sat..Sun is yesterday..today (today - 1 .. today).
+    if days_from_mon == 6 {
+        (today - chrono::Duration::days(1), today)
+    } else {
+        let sat = today - chrono::Duration::days(days_from_mon + 2);
+        let sun = sat + chrono::Duration::days(1);
+        (sat, sun)
+    }
 }
 
 fn clear_all_search_filters(plan: &mut RouterPlan) {
@@ -895,7 +969,11 @@ fn has_numeric_unit(lower: &str, suffix: &str) -> bool {
 
 /// Deterministic single-filter removal for turns like `"remove the location filter"`,
 /// `"remove the Location: Portland Zoo filter"`, or `"drop the date filter"`.
-fn try_apply_filter_removal(lower: &str, prior: &RouterPlan, plan: &mut RouterPlan) -> bool {
+pub(crate) fn try_apply_filter_removal(
+    lower: &str,
+    prior: &RouterPlan,
+    plan: &mut RouterPlan,
+) -> bool {
     let is_removal = lower.contains("remove the")
         || lower.contains("remove filter")
         || lower.contains("drop the")
@@ -905,8 +983,13 @@ fn try_apply_filter_removal(lower: &str, prior: &RouterPlan, plan: &mut RouterPl
     }
 
     // Extract the filter target label (before any `:` value like `"remove the Location: Mountain Resort filter"`)
-    // so filter values such as "Resort" or "Vintage" cannot accidentally trigger unrelated removals.
-    let target_clause = lower.split_once(':').map(|(lhs, _)| lhs).unwrap_or(lower);
+    // and strip trailing `"from my search"` / `"from search"` phrasing so it never drops dates or semantic_query.
+    let target_raw = lower.split_once(':').map(|(lhs, _)| lhs).unwrap_or(lower);
+    let target_clause = target_raw
+        .replace("from my search", "")
+        .replace("from the search", "")
+        .replace("from search", "");
+    let target_clause = target_clause.as_str();
 
     let mut updated = prior.clone();
     updated.intent = Some("search".to_string());
@@ -915,10 +998,13 @@ fn try_apply_filter_removal(lower: &str, prior: &RouterPlan, plan: &mut RouterPl
     updated.follow_up_suggestions = plan.follow_up_suggestions.clone();
 
     let mut removed_any = false;
-    if has_word(target_clause, "search")
-        || has_word(target_clause, "query")
+    if has_word(target_clause, "query")
         || has_word(target_clause, "subject")
         || has_word(target_clause, "scene")
+        || lower.contains("remove the search:")
+        || lower.contains("remove the search filter")
+        || lower.contains("drop the search filter")
+        || lower.contains("clear the search filter")
     {
         updated.semantic_query = None;
         removed_any = true;
@@ -938,8 +1024,10 @@ fn try_apply_filter_removal(lower: &str, prior: &RouterPlan, plan: &mut RouterPl
     if has_word(target_clause, "date")
         || has_word(target_clause, "month")
         || has_word(target_clause, "year")
-        || has_word(target_clause, "from")
         || has_word(target_clause, "until")
+        || lower.contains("remove the from ")
+        || lower.contains("drop the from ")
+        || lower.contains("clear the from ")
     {
         updated.date_from_ms = None;
         updated.date_to_ms = None;
@@ -1485,14 +1573,20 @@ fn sanitize_sidecar_plan(
     }
 
     let has_orientation_cue = has_word(&lower, "vertical")
-        || has_word(&lower, "portrait")
-        || has_word(&lower, "portraits")
-        || has_word(&lower, "tall")
-        || lower.contains("wallpaper")
         || has_word(&lower, "horizontal")
-        || has_word(&lower, "landscape")
-        || has_word(&lower, "landscapes")
-        || has_word(&lower, "square");
+        || lower.contains("wallpaper")
+        || lower.contains("portrait orientation")
+        || lower.contains("portrait mode")
+        || lower.contains("portrait aspect")
+        || lower.contains("landscape orientation")
+        || lower.contains("landscape mode")
+        || lower.contains("landscape aspect")
+        || lower.contains("square crop")
+        || lower.contains("square format")
+        || lower.contains("square orientation")
+        || lower.contains("square aspect")
+        || lower.contains("aspect ratio")
+        || lower.contains("1:1");
 
     if !has_orientation_cue && prior.orientation.is_none() {
         plan.orientation = None;
@@ -1609,16 +1703,60 @@ fn sanitize_sidecar_plan(
         "fall",
         "autumn",
     ];
-    // Season date rescue: run BEFORE moving season words from location_query to semantic_query,
+    // Relative date & season rescue: run BEFORE moving season words from location_query to semantic_query,
     // and allow combining with person/camera filters (e.g. "summer photos of Sebastian").
     if plan.date_from_ms.is_none() && plan.date_to_ms.is_none() {
-        if let Some((from_ms, to_ms)) = season_date_range_ms(&lower, now_utc) {
+        let today = now_utc.date_naive();
+        let rescue_range: Option<((i64, i64), &str)> = if has_word(&lower, "yesterday") {
+            let yday = today - chrono::Duration::days(1);
+            let s = Utc.from_utc_datetime(&yday.and_hms_opt(0, 0, 0).expect("valid"));
+            let e = Utc.from_utc_datetime(&yday.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "yesterday"))
+        } else if lower.contains("last weekend") {
+            let (sat, sun) = last_weekend_dates(today);
+            let s = Utc.from_utc_datetime(&sat.and_hms_opt(0, 0, 0).expect("valid"));
+            let e = Utc.from_utc_datetime(&sun.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "last weekend"))
+        } else if has_word(&lower, "christmas") || has_word(&lower, "xmas") {
+            let cy = if today.month() == 12 && today.day() >= 24 {
+                today.year()
+            } else {
+                today.year() - 1
+            };
+            let s_d = NaiveDate::from_ymd_opt(cy, 12, 24).expect("valid");
+            let e_d = NaiveDate::from_ymd_opt(cy, 12, 26).expect("valid");
+            let s = Utc.from_utc_datetime(&s_d.and_hms_opt(0, 0, 0).expect("valid"));
+            let e = Utc.from_utc_datetime(&e_d.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
+            Some(((s.timestamp_millis(), e.timestamp_millis()), "Christmas"))
+        } else {
+            season_date_range_ms(&lower, now_utc).map(|r| {
+                let name = if has_word(&lower, "summer") {
+                    "summer"
+                } else if has_word(&lower, "spring") {
+                    "spring"
+                } else if has_word(&lower, "fall") || has_word(&lower, "autumn") {
+                    "fall"
+                } else {
+                    "winter"
+                };
+                (r, name)
+            })
+        };
+
+        if let Some(((from_ms, to_ms), label)) = rescue_range {
             plan.date_from_ms = Some(from_ms);
             plan.date_to_ms = Some(to_ms);
             if plan.location_query.as_deref().is_some_and(|l| {
                 matches!(
                     l.trim().to_ascii_lowercase().as_str(),
-                    "summer" | "spring" | "fall" | "autumn" | "winter"
+                    "summer"
+                        | "spring"
+                        | "fall"
+                        | "autumn"
+                        | "winter"
+                        | "yesterday"
+                        | "christmas"
+                        | "xmas"
                 )
             }) {
                 plan.location_query = None;
@@ -1626,7 +1764,13 @@ fn sanitize_sidecar_plan(
             if plan.semantic_query.as_deref().is_some_and(|s| {
                 matches!(
                     s.trim().to_ascii_lowercase().as_str(),
-                    "summer" | "spring" | "fall" | "autumn" | "winter"
+                    "summer"
+                        | "spring"
+                        | "fall"
+                        | "autumn"
+                        | "winter"
+                        | "yesterday"
+                        | "last weekend"
                 )
             }) {
                 plan.semantic_query = None;
@@ -1640,16 +1784,7 @@ fn sanitize_sidecar_plan(
                     .to_ascii_lowercase()
                     .contains("didn't find")
             {
-                let season_name = if has_word(&lower, "summer") {
-                    "summer"
-                } else if has_word(&lower, "spring") {
-                    "spring"
-                } else if has_word(&lower, "fall") || has_word(&lower, "autumn") {
-                    "fall"
-                } else {
-                    "winter"
-                };
-                plan.assistant_reply = format!("Here are your {season_name} photos.");
+                plan.assistant_reply = format!("Here are your {label} photos.");
             }
         }
     }
@@ -1778,10 +1913,18 @@ where
         .map_err(|_| AiError::ExternalTool("sidecar HTTP channel closed".to_string()))?
 }
 
-fn wait_for_server_health(port: u16, child: &mut Child, timeout: Duration) -> Result<(), AiError> {
+fn wait_for_server_health(
+    port: u16,
+    child: &mut Child,
+    timeout: Duration,
+    shutting_down: &AtomicBool,
+) -> Result<(), AiError> {
     let deadline = Instant::now() + timeout;
     let url = format!("http://127.0.0.1:{port}/health");
     loop {
+        if shutting_down.load(Ordering::Acquire) {
+            return Err(AiError::Cancelled);
+        }
         if let Some(status) = child
             .try_wait()
             .map_err(|e| AiError::ExternalTool(format!("llama-server wait: {e}")))?

@@ -85,6 +85,35 @@ export async function openExternalUrl(url: string): Promise<void> {
   }
 }
 
+export interface NativeDesktopUpdate {
+  version: string;
+  body: string | null;
+  installAndRestart: () => Promise<void>;
+}
+
+/**
+ * Queries the signed Tauri native updater feed when running inside the desktop app.
+ * Returns `null` when running in a browser, when already up to date, or if no signed feed is published.
+ */
+export async function checkNativeUpdater(): Promise<NativeDesktopUpdate | null> {
+  if (!isTauri()) return null;
+  try {
+    const { check } = await import('@tauri-apps/plugin-updater');
+    const update = await check();
+    if (!update) return null;
+    return {
+      version: update.version,
+      body: update.body ?? null,
+      installAndRestart: async () => {
+        await update.downloadAndInstall();
+        await restartApp();
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function restartApp(): Promise<void> {
   assertTauri();
   const { relaunch } = await import('@tauri-apps/plugin-process');

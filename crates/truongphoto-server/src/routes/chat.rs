@@ -57,45 +57,67 @@ fn auto_title_from_prompt(prompt: &str) -> String {
     }
 }
 
-fn resolve_rbac_person_ids(
+struct ResolvedPeopleOutcome {
+    person_ids: Option<Vec<String>>,
+    unmatched: Vec<String>,
+    ambiguous: Vec<(String, Vec<String>)>,
+}
+
+fn resolve_rbac_people(
     requested_names: &[String],
     visible_people: &[PersonSummary],
-) -> Option<Vec<String>> {
+) -> ResolvedPeopleOutcome {
     if requested_names.is_empty() {
-        return None;
+        return ResolvedPeopleOutcome {
+            person_ids: None,
+            unmatched: Vec::new(),
+            ambiguous: Vec::new(),
+        };
     }
 
     let mut resolved = Vec::with_capacity(requested_names.len());
     let mut seen = HashSet::new();
+    let mut unmatched = Vec::new();
+    let mut ambiguous = Vec::new();
 
     for raw_name in requested_names {
         let trimmed = raw_name.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let matched_id = visible_people
-            .iter()
-            .find(|p| {
-                p.name
-                    .as_deref()
-                    .is_some_and(|n| n.trim().eq_ignore_ascii_case(trimmed))
-            })
-            .or_else(|| {
-                // Fall back to unique first-name / word-token match (e.g. "Nate" -> "Nate Higgers").
-                let mut token_matches = visible_people.iter().filter(|p| {
+        let exact = visible_people.iter().find(|p| {
+            p.name
+                .as_deref()
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case(trimmed))
+        });
+
+        let matched_id = if let Some(person) = exact {
+            Some(person.id.clone())
+        } else {
+            // Fall back to first-name / word-token match (e.g. "Nate" -> "Nate Higgers").
+            let token_matches: Vec<&PersonSummary> = visible_people
+                .iter()
+                .filter(|p| {
                     p.name.as_deref().is_some_and(|n| {
                         n.split_whitespace()
                             .any(|word| word.eq_ignore_ascii_case(trimmed))
                     })
-                });
-                let first = token_matches.next();
-                if token_matches.next().is_none() {
-                    first
-                } else {
-                    None
-                }
-            })
-            .map(|p| p.id.clone());
+                })
+                .collect();
+            if token_matches.len() == 1 {
+                Some(token_matches[0].id.clone())
+            } else if token_matches.len() > 1 {
+                let candidates: Vec<String> = token_matches
+                    .iter()
+                    .filter_map(|p| p.name.as_deref().map(str::trim).map(str::to_string))
+                    .collect();
+                ambiguous.push((trimmed.to_string(), candidates));
+                None
+            } else {
+                unmatched.push(trimmed.to_string());
+                None
+            }
+        };
 
         let pid = matched_id.unwrap_or_else(|| UNMATCHED_PERSON_SENTINEL.to_string());
         if seen.insert(pid.clone()) {
@@ -103,10 +125,14 @@ fn resolve_rbac_person_ids(
         }
     }
 
-    if resolved.is_empty() {
-        None
-    } else {
-        Some(resolved)
+    ResolvedPeopleOutcome {
+        person_ids: if resolved.is_empty() {
+            None
+        } else {
+            Some(resolved)
+        },
+        unmatched,
+        ambiguous,
     }
 }
 
@@ -465,8 +491,16 @@ fn synthesize_grounded_answer(
 fn describe_zero_hit_filters(
     plan: &RouterPlan,
     unmatched_people: &[String],
+    ambiguous_people: &[(String, Vec<String>)],
     known_people: &[String],
 ) -> String {
+    if let Some((query_name, candidates)) = ambiguous_people.first() {
+        let preview: Vec<&str> = candidates.iter().take(6).map(String::as_str).collect();
+        return format!(
+            "Multiple people match \"{query_name}\": {}. Which one did you mean?",
+            preview.join(", ")
+        );
+    }
     if !unmatched_people.is_empty() {
         let missing = unmatched_people.join(", ");
         return if known_people.is_empty() {
@@ -699,23 +733,18 @@ pub async fn send_message(
     .map_err(|e| AppError::internal(format!("Chat query routing failed: {e}")))?;
 
     let is_answer_only = plan.intent.as_deref() == Some("answer");
-    let unmatched_people: Vec<String> = if is_answer_only {
-        Vec::new()
+    let resolved_people = if is_answer_only {
+        ResolvedPeopleOutcome {
+            person_ids: None,
+            unmatched: Vec::new(),
+            ambiguous: Vec::new(),
+        }
     } else {
-        plan.person_names
-            .iter()
-            .filter(|name| {
-                resolve_rbac_person_ids(&[(*name).clone()], &visible_people)
-                    .is_some_and(|ids| ids.iter().any(|id| id == UNMATCHED_PERSON_SENTINEL))
-            })
-            .cloned()
-            .collect()
+        resolve_rbac_people(&plan.person_names, &visible_people)
     };
-    let person_ids = if is_answer_only {
-        None
-    } else {
-        resolve_rbac_person_ids(&plan.person_names, &visible_people)
-    };
+    let unmatched_people = resolved_people.unmatched;
+    let ambiguous_people = resolved_people.ambiguous;
+    let person_ids = resolved_people.person_ids;
     let search_limit = req
         .limit
         .unwrap_or(DEFAULT_CHAT_LIMIT)
@@ -866,22 +895,41 @@ pub async fn send_message(
         }
     } else if plan.assistant_reply.trim().is_empty() {
         plan.assistant_reply = if search_resp.items.is_empty() {
-            describe_zero_hit_filters(&plan, &unmatched_people, &known_people_for_msg)
+            describe_zero_hit_filters(
+                &plan,
+                &unmatched_people,
+                &ambiguous_people,
+                &known_people_for_msg,
+            )
         } else {
             format!("Found {} matching item(s).", search_resp.total_count)
         };
     } else if has_any_search_criteria && search_resp.items.is_empty() {
         let lower = plan.assistant_reply.to_ascii_lowercase();
-        if !unmatched_people.is_empty()
+        if !ambiguous_people.is_empty()
+            || !unmatched_people.is_empty()
             || (!lower.contains("no match")
                 && !lower.contains("couldn't find")
                 && !lower.contains("didn't find")
                 && !lower.contains("none found"))
         {
-            plan.assistant_reply =
-                describe_zero_hit_filters(&plan, &unmatched_people, &known_people_for_msg);
+            plan.assistant_reply = describe_zero_hit_filters(
+                &plan,
+                &unmatched_people,
+                &ambiguous_people,
+                &known_people_for_msg,
+            );
         }
-        plan.follow_up_suggestions = build_zero_hit_relaxation_suggestions(&plan, &library_summary);
+        if let Some((_, candidates)) = ambiguous_people.first() {
+            plan.follow_up_suggestions = candidates
+                .iter()
+                .take(3)
+                .map(|full_name| format!("Show me photos of {full_name}"))
+                .collect();
+        } else {
+            plan.follow_up_suggestions =
+                build_zero_hit_relaxation_suggestions(&plan, &library_summary);
+        }
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;

@@ -91,7 +91,10 @@ export const WindowsCaptionButtons: React.FC = () => {
         void getCurrentWindow()
           .isMaximized()
           .then((m) => {
-            if (alive) setMaximized(m);
+            if (alive) {
+              setMaximized(m);
+              document.documentElement.classList.toggle('is-maximized', m);
+            }
           })
           .catch(() => {});
       } catch {
@@ -113,6 +116,7 @@ export const WindowsCaptionButtons: React.FC = () => {
     return () => {
       alive = false;
       unlisten?.();
+      document.documentElement.classList.remove('is-maximized');
     };
   }, []);
   return (
@@ -133,7 +137,9 @@ export const WindowsCaptionButtons: React.FC = () => {
         title={maximized ? 'Restore Down' : 'Maximize'}
         onClick={run(async (w) => {
           await w.toggleMaximize();
-          setMaximized(await w.isMaximized());
+          const m = await w.isMaximized();
+          setMaximized(m);
+          document.documentElement.classList.toggle('is-maximized', m);
         })}
       >
         <Glyph kind={maximized ? 'restore' : 'maximize'} />

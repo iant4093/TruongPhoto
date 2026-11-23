@@ -263,8 +263,15 @@ pub fn run() {
             commands::quit_app,
             commands::check_update_feed,
         ])
-        .build(context)
-        .expect("error while building TruongPhoto Tauri application");
+        .build(context);
+
+    let app = match app {
+        Ok(app) => app,
+        Err(err) => {
+            report_fatal_startup_error(&err.to_string());
+            std::process::exit(1);
+        }
+    };
 
     app.run(|handle, event| match event {
         #[cfg(target_os = "macos")]
@@ -276,6 +283,51 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+fn report_fatal_startup_error(message: &str) {
+    tracing::error!("TruongPhoto fatal startup error: {message}");
+    eprintln!("TruongPhoto failed to start: {message}");
+    let paths = truongphoto_core::StoragePaths::default();
+    let _ = std::fs::create_dir_all(&paths.data_dir);
+    let log_path = paths.data_dir.join("startup-error.log");
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry = format!("[{unix_secs}] {message}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+        let body_text = format!(
+            "TruongPhoto failed to start:\n\n{message}\n\nCheck startup-error.log in your TruongPhoto data folder for details."
+        );
+        let body: Vec<u16> = std::ffi::OsStr::new(&body_text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let title: Vec<u16> = std::ffi::OsStr::new("TruongPhoto Failed to Start")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: Both strings are valid NUL-terminated UTF-16 buffers.
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                PCWSTR(body.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
 }
 
 #[cfg(test)]

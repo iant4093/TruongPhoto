@@ -80,4 +80,9 @@ pub trait ChatRouterBackend: Send + Sync {
     fn warmup(&self, _tier: ChatTier) -> bool {
         false
     }
+
+    /// Permanently shuts down the backend, preventing new sidecar spawns and killing any active runtime.
+    fn shutdown(&self) {
+        let _ = self.evict_idle(Duration::ZERO);
+    }
 }

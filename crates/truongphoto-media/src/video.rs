@@ -351,8 +351,11 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
                 "-hls_segment_filename",
             ])
             .arg(&seg_pattern)
-            .arg(&playlist_path)
-            .output()
+            .arg(&playlist_path);
+        truongphoto_core::process::run_command_with_timeout(
+            &mut cmd,
+            std::time::Duration::from_secs(15 * 60),
+        )
     };
 
     let mut output = match run_hls(&caps.h264_encoder) {
@@ -387,12 +390,61 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
 
     let total_bytes = dir_size_bytes(&tmp_dir)?;
 
-    if output_dir.exists() {
-        let _ = std::fs::remove_dir_all(output_dir);
+    // Safely move aside any existing output_dir first so Windows Defender or an active reader
+    // does not leave output_dir half-deleted and break rename().
+    let old_backup = if output_dir.exists() {
+        let backup = parent.join(format!(".hls.old.{}.{}", std::process::id(), nonce));
+        let mut moved = false;
+        let attempts = if cfg!(windows) { 5 } else { 1 };
+        for attempt in 0..attempts {
+            match std::fs::rename(output_dir, &backup) {
+                Ok(()) => {
+                    moved = true;
+                    break;
+                }
+                Err(_) if attempt + 1 < attempts => {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+                }
+                Err(_) => break,
+            }
+        }
+        if moved {
+            Some(backup)
+        } else {
+            let _ = std::fs::remove_dir_all(output_dir);
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut rename_err: Option<std::io::Error> = None;
+    let attempts = if cfg!(windows) { 5 } else { 1 };
+    for attempt in 0..attempts {
+        match std::fs::rename(&tmp_dir, output_dir) {
+            Ok(()) => {
+                rename_err = None;
+                break;
+            }
+            Err(e) => {
+                rename_err = Some(e);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+                }
+            }
+        }
     }
-    if let Err(e) = std::fs::rename(&tmp_dir, output_dir) {
+
+    if let Some(e) = rename_err {
+        if let Some(backup) = old_backup {
+            let _ = std::fs::rename(&backup, output_dir);
+        }
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(MediaError::Io(e));
+    }
+
+    if let Some(backup) = old_backup {
+        let _ = std::fs::remove_dir_all(&backup);
     }
 
     Ok(total_bytes)

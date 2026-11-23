@@ -992,14 +992,21 @@ fn extract_video_metadata(path: &Path) -> ExtractedMetadata {
                 _ => {}
             }
             if let Some(gps) = track.gps_info() {
-                video_meta.gps_lat = gps.latitude_decimal();
-                video_meta.gps_lon = gps.longitude_decimal();
-                if let (Some(la), Some(lo)) = (video_meta.gps_lat, video_meta.gps_lon) {
-                    if let Some(geo) = geocode::reverse_geocode(la, lo) {
-                        video_meta.geo_city = Some(geo.city);
-                        video_meta.geo_admin1 = Some(geo.admin1);
-                        video_meta.geo_country = Some(geo.country);
-                        video_meta.geo_country_code = Some(geo.country_code);
+                if let (Some(la), Some(lo)) = (gps.latitude_decimal(), gps.longitude_decimal()) {
+                    let is_valid = la.is_finite()
+                        && lo.is_finite()
+                        && (-90.0..=90.0).contains(&la)
+                        && (-180.0..=180.0).contains(&lo)
+                        && !(la.abs() < 1e-4 && lo.abs() < 1e-4);
+                    if is_valid {
+                        video_meta.gps_lat = Some(la);
+                        video_meta.gps_lon = Some(lo);
+                        if let Some(geo) = geocode::reverse_geocode(la, lo) {
+                            video_meta.geo_city = Some(geo.city);
+                            video_meta.geo_admin1 = Some(geo.admin1);
+                            video_meta.geo_country = Some(geo.country);
+                            video_meta.geo_country_code = Some(geo.country_code);
+                        }
                     }
                 }
             }
@@ -1027,6 +1034,47 @@ fn extract_video_metadata(path: &Path) -> ExtractedMetadata {
                 .bit_rate
                 .as_deref()
                 .and_then(|s| s.trim().parse::<u64>().ok());
+
+            if meta.capture_at_ms.is_none() {
+                let raw_creation = fmt
+                    .tags
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("com.apple.quicktime.creationdate"))
+                    .or_else(|| {
+                        fmt.tags
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("creation_time"))
+                    })
+                    .map(|(_, v)| v.trim());
+                if let Some(ts_str) = raw_creation.filter(|s| !s.is_empty()) {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str)
+                        .or_else(|_| {
+                            chrono::DateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%z")
+                        })
+                        .or_else(|_| {
+                            chrono::DateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%z")
+                        })
+                    {
+                        let ms = dt.timestamp_millis();
+                        if ms > 0 {
+                            video_meta.taken_at_ms = Some(ms);
+                            meta.capture_at_ms = Some(ms);
+                            meta.capture_tz_offset_m = Some(dt.offset().local_minus_utc() / 60);
+                        }
+                    } else if let Ok(naive) =
+                        chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%.f")
+                            .or_else(|_| {
+                                chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
+                            })
+                    {
+                        let ms = naive.and_utc().timestamp_millis();
+                        if ms > 0 {
+                            video_meta.taken_at_ms = Some(ms);
+                            meta.capture_at_ms = Some(ms);
+                        }
+                    }
+                }
+            }
 
             if meta.content_identifier.is_none() {
                 meta.content_identifier = fmt.tags.iter().find_map(|(k, v)| {

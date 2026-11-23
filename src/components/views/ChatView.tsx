@@ -297,6 +297,7 @@ export const ChatView: React.FC = () => {
   const lastAssistantRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
+  const sessionEpochRef = useRef(0);
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
@@ -449,20 +450,26 @@ export const ChatView: React.FC = () => {
   }, [promptInput]);
 
   useEffect(() => {
+    sessionEpochRef.current += 1;
     textareaRef.current?.focus();
   }, [activeChatSessionId]);
 
   const submitPrompt = async (text: string) => {
     const trimmed = text.trim();
     if (!trimmed || chatSending) return;
+    const epoch = sessionEpochRef.current;
     setPromptInput('');
     try {
       await sendChatPrompt(trimmed);
     } catch (err) {
-      setPromptInput((cur) => (cur.trim().length === 0 ? trimmed : cur));
+      if (epoch === sessionEpochRef.current) {
+        setPromptInput((cur) => (cur.trim().length === 0 ? trimmed : cur));
+      }
       notifyError(err, 'Chat search failed');
     } finally {
-      textareaRef.current?.focus();
+      if (epoch === sessionEpochRef.current) {
+        textareaRef.current?.focus();
+      }
     }
   };
 
@@ -545,8 +552,11 @@ export const ChatView: React.FC = () => {
                           id: 'thread-open',
                           label: 'Open Conversation',
                           icon: <MessageSquare size={14} />,
+                          disabled: chatSending,
                           onSelect: () => {
-                            void selectChatSession(session.id);
+                            void selectChatSession(session.id).catch((err) =>
+                              notifyError(err, 'Could not load conversation'),
+                            );
                           },
                         },
                         { type: 'separator', id: 'thread-sep' },
@@ -555,6 +565,7 @@ export const ChatView: React.FC = () => {
                           label: 'Delete Conversation',
                           icon: <Trash2 size={14} />,
                           danger: true,
+                          disabled: chatSending,
                           onSelect: () => handleDeleteSession(session.id),
                         },
                       ])

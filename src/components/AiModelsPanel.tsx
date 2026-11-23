@@ -745,11 +745,8 @@ export const AiModelsPanel: React.FC = () => {
                     {pct}%
                   </span>
                 </div>
-                <div className="progress-track">
-                  <div
-                    className="progress-fill"
-                    style={{ width: `${Math.max(4, pct)}%` }}
-                  />
+                <div className="ai-model-progress">
+                  <div style={{ width: `${Math.max(4, pct)}%` }} />
                 </div>
               </div>
             );

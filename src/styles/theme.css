@@ -50,6 +50,7 @@ h2, h3, h4, p { overflow-wrap: anywhere; }
 button svg { flex-shrink: 0; }
 
 .app-window-frame { width: 100vw; height: 100vh; height: 100dvh; background: var(--surface-main); border: 1px solid #3a3a3a; border-radius: 10px; overflow: hidden; }
+.is-maximized .app-window-frame { border: 0; border-radius: 0; }
 .studio-shell { display: grid; grid-template-columns: 208px minmax(0, 1fr); }
 .studio-shell.native-titlebar { border: 0; border-radius: 0; }
 .app-sidebar { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface-sidebar); border-right: 1px solid var(--border-subtle); }
@@ -73,6 +74,7 @@ button svg { flex-shrink: 0; }
 .caption-button:active { background: rgba(255,255,255,.05); color: #bdbdbd; }
 .caption-button:focus-visible { outline: 1px solid #bbb; outline-offset: -2px; }
 .caption-close { border-top-right-radius: 9px; }
+.is-maximized .caption-close { border-top-right-radius: 0; }
 .caption-close:hover { background: #c42b1c; color: #fff; }
 .caption-close:active { background: #c84031; color: #f0d0cc; }
 

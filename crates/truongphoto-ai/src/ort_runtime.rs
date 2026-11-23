@@ -17,7 +17,9 @@ pub enum SessionKey {
     FaceDet,
     FaceRec,
     OcrDet,
-    OcrRec,
+    /// Keyed by padded width bucket (`320`, `640`, `960`) so CoreML static-shape
+    /// compilation does not reject dynamic width changes across OCR crops.
+    OcrRec(u32),
 }
 
 struct CachedSession {
@@ -238,7 +240,7 @@ impl OrtRuntimeManager {
 
         let mut guard = slot.lock();
         if guard.is_none() {
-            let session = self.build_session(&state.env, model_path)?;
+            let session = self.build_session(&state.env, key, model_path)?;
             *guard = Some(CachedSession {
                 session,
                 last_used: Instant::now(),
@@ -254,7 +256,13 @@ impl OrtRuntimeManager {
         Ok(out)
     }
 
-    fn build_session(&self, env: &Environment, model_path: &Path) -> Result<Session, AiError> {
+    fn build_session(
+        &self,
+        env: &Environment,
+        key: SessionKey,
+        model_path: &Path,
+    ) -> Result<Session, AiError> {
+        let _ = key;
         let _ = std::fs::create_dir_all(&self.coreml_cache_dir);
         let intra_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -276,9 +284,12 @@ impl OrtRuntimeManager {
             #[cfg(target_os = "macos")]
             {
                 let cache_dir = self.coreml_cache_dir.to_string_lossy().into_owned();
+                // VisionText runs with variable batch sizes (8 for tag chunks, tail chunk, and 1 for search queries),
+                // so forcing static input shapes causes CoreML compilation or runtime failures on batch changes.
+                let use_static_shapes = !matches!(key, SessionKey::VisionText(_));
                 let ep = ort::ep::CoreML::default()
                     .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
-                    .with_static_input_shapes(true)
+                    .with_static_input_shapes(use_static_shapes)
                     .with_model_cache_dir(&cache_dir)
                     .build();
                 hw_builder = hw_builder

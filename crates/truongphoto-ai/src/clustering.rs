@@ -1,4 +1,5 @@
 use crate::vector::l2_normalize;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Default Stage 1 cosine similarity threshold for matching a face to existing named people.
@@ -134,25 +135,29 @@ pub fn chinese_whispers_cluster(
     const KNN_K: usize = 32;
     let norm_vecs: Vec<Vec<f32>> = nodes.iter().map(|(_, v)| l2_normalize(v)).collect();
 
-    // Build top-K neighbors per node above sim_threshold, then symmetrize into undirected edges.
+    // Build top-K neighbors per node above sim_threshold in parallel, then symmetrize deterministically.
+    let per_node_neighbors: Vec<Vec<(usize, f32)>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let vi = &norm_vecs[i];
+            let mut candidates: Vec<(usize, f32)> = Vec::new();
+            for (j, vj) in norm_vecs.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let sim: f32 = vi.iter().zip(vj.iter()).map(|(&a, &b)| a * b).sum();
+                if sim >= sim_threshold {
+                    candidates.push((j, sim));
+                }
+            }
+            candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            candidates.truncate(KNN_K);
+            candidates
+        })
+        .collect();
+
     let mut adj_maps: Vec<HashMap<usize, f32>> = vec![HashMap::new(); n];
-    for i in 0..n {
-        let mut candidates: Vec<(usize, f32)> = Vec::new();
-        for j in 0..n {
-            if i == j {
-                continue;
-            }
-            let sim: f32 = norm_vecs[i]
-                .iter()
-                .zip(norm_vecs[j].iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
-            if sim >= sim_threshold {
-                candidates.push((j, sim));
-            }
-        }
-        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        candidates.truncate(KNN_K);
+    for (i, candidates) in per_node_neighbors.into_iter().enumerate() {
         for (j, sim) in candidates {
             adj_maps[i].insert(j, sim);
             adj_maps[j].insert(i, sim);

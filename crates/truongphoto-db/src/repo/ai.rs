@@ -347,6 +347,19 @@ pub fn list_vector_ids_for_asset(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Deletes all `vision_embeddings` rows belonging to `(tier, asset_id)` and returns the removed count.
+pub fn delete_vision_embeddings_for_asset(
+    conn: &Connection,
+    tier: AiTier,
+    asset_id: &str,
+) -> DbResult<u64> {
+    let deleted = conn.execute(
+        "DELETE FROM vision_embeddings WHERE model_tier = ?1 AND asset_id = ?2",
+        params![tier.as_str(), asset_id],
+    )?;
+    Ok(u64::try_from(deleted).unwrap_or(0))
+}
+
 /// Deletes all `vision_embeddings` rows belonging to `tier` and returns the removed row count.
 pub fn delete_vision_embeddings_for_tier(conn: &Connection, tier: AiTier) -> DbResult<u64> {
     let deleted = conn.execute(
@@ -356,7 +369,31 @@ pub fn delete_vision_embeddings_for_tier(conn: &Connection, tier: AiTier) -> DbR
     Ok(u64::try_from(deleted).unwrap_or(0))
 }
 
-/// Computes Stage 2 AI queue counters for the active tier and optional staging tier.
+/// Advances download byte counters only while the model row is still in `downloading` status,
+/// preventing detached progress callbacks from reverting `installed` or resurrecting deleted rows.
+pub fn update_ai_model_download_progress(
+    conn: &Connection,
+    model_id: &str,
+    bytes_downloaded: u64,
+    bytes_total: u64,
+    now_ms: i64,
+) -> DbResult<()> {
+    conn.execute(
+        "UPDATE ai_models
+         SET bytes_downloaded = ?1, bytes_total = ?2, updated_at_ms = ?3
+         WHERE model_id = ?4 AND status = 'downloading'",
+        params![
+            i64::try_from(bytes_downloaded).unwrap_or(i64::MAX),
+            i64::try_from(bytes_total).unwrap_or(i64::MAX),
+            now_ms,
+            model_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Computes Stage 2 AI queue counters for the active tier and optional staging tier
+/// (excluding assets on offline folders or with all files missing).
 pub fn count_ai_queue_stats(
     conn: &Connection,
     active_tier: AiTier,
@@ -375,7 +412,14 @@ pub fn count_ai_queue_stats(
                     WHERE ve.model_tier = ?1 AND ve.asset_id = a.id
                 ) THEN 1 ELSE 0 END), 0)
          FROM assets a
-         WHERE a.deleted_at_ms IS NULL AND a.is_hidden = 0",
+         JOIN folders f ON f.id = a.folder_id
+         WHERE a.deleted_at_ms IS NULL
+           AND a.is_hidden = 0
+           AND f.is_offline = 0
+           AND EXISTS (
+               SELECT 1 FROM asset_files af
+               WHERE af.asset_id = a.id AND af.is_missing = 0
+           )",
         params![active_tier.as_str()],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -384,8 +428,14 @@ pub fn count_ai_queue_stats(
         let rem_i64: i64 = conn.query_row(
             "SELECT COUNT(*)
              FROM assets a
+             JOIN folders f ON f.id = a.folder_id
              WHERE a.deleted_at_ms IS NULL
                AND a.is_hidden = 0
+               AND f.is_offline = 0
+               AND EXISTS (
+                   SELECT 1 FROM asset_files af
+                   WHERE af.asset_id = a.id AND af.is_missing = 0
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM vision_embeddings ve
                    WHERE ve.model_tier = ?1 AND ve.asset_id = a.id
@@ -405,7 +455,7 @@ pub fn count_ai_queue_stats(
     })
 }
 
-/// Lists active, non-deleted asset IDs that still need Stage 2 indexing for the active tier.
+/// Lists active, non-deleted, online asset IDs that still need Stage 2 indexing for the active tier.
 pub fn list_assets_needing_stage2(conn: &Connection, limit: usize) -> DbResult<Vec<String>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -414,8 +464,14 @@ pub fn list_assets_needing_stage2(conn: &Connection, limit: usize) -> DbResult<V
     let mut stmt = conn.prepare(
         "SELECT a.id
          FROM assets a
+         JOIN folders f ON f.id = a.folder_id
          WHERE a.deleted_at_ms IS NULL
            AND a.is_hidden = 0
+           AND f.is_offline = 0
+           AND EXISTS (
+               SELECT 1 FROM asset_files af
+               WHERE af.asset_id = a.id AND af.is_missing = 0
+           )
            AND (
                a.ai_stage < 2
                OR NOT EXISTS (
@@ -435,7 +491,7 @@ pub fn list_assets_needing_stage2(conn: &Connection, limit: usize) -> DbResult<V
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Lists active, non-deleted asset IDs missing a vision embedding in `staging_tier`.
+/// Lists active, non-deleted, online asset IDs missing a vision embedding in `staging_tier`.
 pub fn list_assets_needing_staging_tier(
     conn: &Connection,
     staging_tier: AiTier,
@@ -448,8 +504,14 @@ pub fn list_assets_needing_staging_tier(
     let mut stmt = conn.prepare(
         "SELECT a.id
          FROM assets a
+         JOIN folders f ON f.id = a.folder_id
          WHERE a.deleted_at_ms IS NULL
            AND a.is_hidden = 0
+           AND f.is_offline = 0
+           AND EXISTS (
+               SELECT 1 FROM asset_files af
+               WHERE af.asset_id = a.id AND af.is_missing = 0
+           )
            AND NOT EXISTS (
                SELECT 1
                FROM vision_embeddings ve
@@ -664,9 +726,10 @@ pub fn get_face_with_asset_for_thumb(
                 FROM asset_files af
                 WHERE af.asset_id = a.id
                   AND af.is_missing = 0
-                ORDER BY CASE WHEN af.id = a.primary_file_id THEN 0
-                              WHEN af.file_role = 'primary' THEN 1
-                              ELSE 2 END,
+                ORDER BY CASE WHEN a.kind = 'raw_jpg_stack' AND af.file_role = 'jpeg_companion' THEN 0
+                              WHEN af.id = a.primary_file_id THEN 1
+                              WHEN af.file_role = 'primary' THEN 2
+                              ELSE 3 END,
                          af.rel_path ASC
                 LIMIT 1
             ) AS primary_rel_path,

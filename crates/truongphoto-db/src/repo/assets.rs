@@ -957,6 +957,8 @@ fn push_unique_id_placeholders(ids: &[String], params: &mut Vec<Value>) -> Optio
     }
 }
 
+const BATCH_IN_CHUNK: usize = 400;
+
 /// Soft-deletes non-deleted, non-hidden assets in `asset_ids` scoped by `scope`.
 pub fn soft_delete_assets(
     conn: &Connection,
@@ -969,28 +971,32 @@ pub fn soft_delete_assets(
         return Ok(0);
     }
 
-    let mut params: Vec<Value> = vec![
-        Value::Integer(now_ms),
-        Value::Text(actor_user_id.to_string()),
-    ];
-    let Some(id_list) = push_unique_id_placeholders(asset_ids, &mut params) else {
-        return Ok(0);
-    };
-    let rbac_clause = rbac_sql::folder_clause("assets", scope, &mut params);
-    let sql = format!(
-        "UPDATE assets
-         SET deleted_at_ms = ?1, deleted_by = ?2, updated_at_ms = ?1
-         WHERE id IN ({id_list})
-           AND deleted_at_ms IS NULL
-           AND is_hidden = 0
-           AND {rbac_clause}"
-    );
     with_savepoint(conn, "soft_delete_assets", || {
-        let affected = conn.execute(&sql, params_from_iter(params))?;
-        if affected > 0 {
-            crate::repo::map::sync_assets_geo(conn, asset_ids)?;
+        let mut total_affected = 0usize;
+        for chunk in asset_ids.chunks(BATCH_IN_CHUNK) {
+            let mut params: Vec<Value> = vec![
+                Value::Integer(now_ms),
+                Value::Text(actor_user_id.to_string()),
+            ];
+            let Some(id_list) = push_unique_id_placeholders(chunk, &mut params) else {
+                continue;
+            };
+            let rbac_clause = rbac_sql::folder_clause("assets", scope, &mut params);
+            let sql = format!(
+                "UPDATE assets
+                 SET deleted_at_ms = ?1, deleted_by = ?2, updated_at_ms = ?1
+                 WHERE id IN ({id_list})
+                   AND deleted_at_ms IS NULL
+                   AND is_hidden = 0
+                   AND {rbac_clause}"
+            );
+            let affected = conn.execute(&sql, params_from_iter(params))?;
+            if affected > 0 {
+                crate::repo::map::sync_assets_geo(conn, chunk)?;
+                total_affected += affected;
+            }
         }
-        Ok(affected)
+        Ok(total_affected)
     })
 }
 
@@ -1005,24 +1011,28 @@ pub fn restore_assets(
         return Ok(0);
     }
 
-    let mut params: Vec<Value> = vec![Value::Integer(now_ms)];
-    let Some(id_list) = push_unique_id_placeholders(asset_ids, &mut params) else {
-        return Ok(0);
-    };
-    let rbac_clause = rbac_sql::folder_clause("assets", scope, &mut params);
-    let sql = format!(
-        "UPDATE assets
-         SET deleted_at_ms = NULL, deleted_by = NULL, updated_at_ms = ?1
-         WHERE id IN ({id_list})
-           AND deleted_at_ms IS NOT NULL
-           AND {rbac_clause}"
-    );
     with_savepoint(conn, "restore_assets", || {
-        let affected = conn.execute(&sql, params_from_iter(params))?;
-        if affected > 0 {
-            crate::repo::map::sync_assets_geo(conn, asset_ids)?;
+        let mut total_affected = 0usize;
+        for chunk in asset_ids.chunks(BATCH_IN_CHUNK) {
+            let mut params: Vec<Value> = vec![Value::Integer(now_ms)];
+            let Some(id_list) = push_unique_id_placeholders(chunk, &mut params) else {
+                continue;
+            };
+            let rbac_clause = rbac_sql::folder_clause("assets", scope, &mut params);
+            let sql = format!(
+                "UPDATE assets
+                 SET deleted_at_ms = NULL, deleted_by = NULL, updated_at_ms = ?1
+                 WHERE id IN ({id_list})
+                   AND deleted_at_ms IS NOT NULL
+                   AND {rbac_clause}"
+            );
+            let affected = conn.execute(&sql, params_from_iter(params))?;
+            if affected > 0 {
+                crate::repo::map::sync_assets_geo(conn, chunk)?;
+                total_affected += affected;
+            }
         }
-        Ok(affected)
+        Ok(total_affected)
     })
 }
 
@@ -1096,30 +1106,32 @@ pub fn get_assets_for_purge(
         return Ok(candidates);
     }
 
-    let mut file_params: Vec<Value> = Vec::with_capacity(candidates.len());
-    let mut placeholders = Vec::with_capacity(candidates.len());
-    for (idx, c) in candidates.iter().enumerate() {
-        file_params.push(Value::Text(c.asset_id.clone()));
-        placeholders.push(format!("?{}", idx + 1));
-    }
-
-    let files_sql = format!(
-        "SELECT
-            id, asset_id, folder_id, rel_path, file_role, mime_type, extension,
-            file_size, mtime_ms, partial_blake3, content_identifier,
-            embedded_video_offset, embedded_video_length, is_missing
-         FROM asset_files
-         WHERE asset_id IN ({})
-         ORDER BY rel_path ASC",
-        placeholders.join(", ")
-    );
-
-    let mut file_stmt = conn.prepare(&files_sql)?;
-    let file_rows = file_stmt.query_map(params_from_iter(file_params), row_to_asset_file)?;
     let mut by_asset: HashMap<String, Vec<AssetFileView>> = HashMap::new();
-    for file in file_rows {
-        let f = file?;
-        by_asset.entry(f.asset_id.clone()).or_default().push(f);
+    for chunk in candidates.chunks(BATCH_IN_CHUNK) {
+        let mut file_params: Vec<Value> = Vec::with_capacity(chunk.len());
+        let mut placeholders = Vec::with_capacity(chunk.len());
+        for (idx, c) in chunk.iter().enumerate() {
+            file_params.push(Value::Text(c.asset_id.clone()));
+            placeholders.push(format!("?{}", idx + 1));
+        }
+
+        let files_sql = format!(
+            "SELECT
+                id, asset_id, folder_id, rel_path, file_role, mime_type, extension,
+                file_size, mtime_ms, partial_blake3, content_identifier,
+                embedded_video_offset, embedded_video_length, is_missing
+             FROM asset_files
+             WHERE asset_id IN ({})
+             ORDER BY rel_path ASC",
+            placeholders.join(", ")
+        );
+
+        let mut file_stmt = conn.prepare(&files_sql)?;
+        let file_rows = file_stmt.query_map(params_from_iter(file_params), row_to_asset_file)?;
+        for file in file_rows {
+            let f = file?;
+            by_asset.entry(f.asset_id.clone()).or_default().push(f);
+        }
     }
 
     for candidate in &mut candidates {

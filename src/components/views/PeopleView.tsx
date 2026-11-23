@@ -303,18 +303,24 @@ export const PeopleView: React.FC = () => {
 
   // Admin clustering state
   const [clustering, setClustering] = useState(false);
+  const listSeqRef = useRef(0);
 
   const load = useCallback(
     async (includeHidden = showHidden) => {
+      const seq = ++listSeqRef.current;
       setLoading(true);
       setError(null);
       try {
         const res = await listPeople(isAdmin && includeHidden ? { include_hidden: true } : undefined);
+        if (seq !== listSeqRef.current) return;
         setItems(res.items);
       } catch (err) {
+        if (seq !== listSeqRef.current) return;
         setError(errorMessage(err));
       } finally {
-        setLoading(false);
+        if (seq === listSeqRef.current) {
+          setLoading(false);
+        }
       }
     },
     [isAdmin, showHidden],
@@ -345,26 +351,21 @@ export const PeopleView: React.FC = () => {
 
   const handleToggleMergeMode = () => {
     if (!isAdmin) return;
-    setMergeMode((prev) => {
-      const next = !prev;
-      setMergeSelectedIds([]);
-      setMergeTargetId('');
-      return next;
-    });
+    setMergeMode((prev) => !prev);
+    setMergeSelectedIds([]);
+    setMergeTargetId('');
   };
 
   const toggleMergeSelect = (personId: string) => {
-    setMergeSelectedIds((prev) => {
-      const next = prev.includes(personId)
-        ? prev.filter((id) => id !== personId)
-        : [...prev, personId];
-      if (next.length > 0 && !next.includes(mergeTargetId)) {
-        setMergeTargetId(next[0]);
-      } else if (next.length === 0) {
-        setMergeTargetId('');
-      }
-      return next;
-    });
+    const next = mergeSelectedIds.includes(personId)
+      ? mergeSelectedIds.filter((id) => id !== personId)
+      : [...mergeSelectedIds, personId];
+    setMergeSelectedIds(next);
+    if (next.length > 0 && !next.includes(mergeTargetId)) {
+      setMergeTargetId(next[0]);
+    } else if (next.length === 0) {
+      setMergeTargetId('');
+    }
   };
 
   const handleMergeSubmit = async () => {
@@ -728,6 +729,12 @@ export const PeopleView: React.FC = () => {
             );
           })}
         </div>
+      ) : items.length > 0 && searchQuery.trim() ? (
+        <EmptyState
+          icon={<Users size={28} strokeWidth={1.3} />}
+          title={`No people match "${searchQuery.trim()}"`}
+          description="Try a different name or clear the search box to see everyone."
+        />
       ) : (
         <EmptyState
           icon={<Users size={28} strokeWidth={1.3} />}

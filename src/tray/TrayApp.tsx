@@ -76,12 +76,25 @@ export const TrayApp: React.FC = () => {
   const [selectedQrUrl, setSelectedQrUrl] = useState<string | null>(null);
   const [togglingAi, setTogglingAi] = useState(false);
   const wsRef = useRef<WsClient | null>(null);
+  const loadSeqRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  const disconnectLiveSocket = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.disconnect();
+      wsRef.current = null;
+    }
+    setWsConnected(false);
+  }, []);
 
   const connectLiveSocket = useCallback(() => {
-    if (wsRef.current) return;
+    if (wsRef.current || !mountedRef.current) return;
     const client = new WsClient({
-      onConnectionChange: (connected) => setWsConnected(connected),
+      onConnectionChange: (connected) => {
+        if (mountedRef.current) setWsConnected(connected);
+      },
       onEvent: (event: WsServerEvent) => {
+        if (!mountedRef.current) return;
         if (event.type === 'heartbeat') {
           setLiveStats({
             uptimeSecs: event.uptime_secs,
@@ -123,14 +136,18 @@ export const TrayApp: React.FC = () => {
   }, []);
 
   const loadTrayState = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     setError(null);
     try {
       if (isTauri()) {
         const info = await getDesktopBootstrap();
+        if (!mountedRef.current || seq !== loadSeqRef.current) return;
         setBootstrapInfo(info);
         await desktopBootstrap(info.desktop_bootstrap_token);
+        if (!mountedRef.current || seq !== loadSeqRef.current) return;
       }
       const sys = await getSystemInfo();
+      if (!mountedRef.current || seq !== loadSeqRef.current) return;
       setSystemInfo(sys);
       setPowerState(sys.power);
       setThrottleState(sys.throttle ?? null);
@@ -139,30 +156,46 @@ export const TrayApp: React.FC = () => {
       connectLiveSocket();
 
       const ai = await getAiModelsDashboard().catch(() => null);
+      if (!mountedRef.current || seq !== loadSeqRef.current) return;
       if (ai) {
         setAiDashboard(ai);
       }
     } catch (err) {
-      if (err instanceof ApiClientError && err.code === 'DESKTOP_PIN_LOCKED') {
-        setStatusLabel('PIN Locked');
-        setError('Desktop PIN lock is enabled. Unlock in the main window.');
-      } else if (err instanceof ApiClientError && err.code === 'NOT_INITIALIZED') {
-        setStatusLabel('Starting');
-        setError('First-run setup has not been completed yet.');
+      if (!mountedRef.current || seq !== loadSeqRef.current) return;
+      if (
+        err instanceof ApiClientError &&
+        (err.code === 'DESKTOP_PIN_LOCKED' || err.code === 'NOT_INITIALIZED')
+      ) {
+        disconnectLiveSocket();
+        setSystemInfo(null);
+        setAiDashboard(null);
+        setLiveStats(null);
+        setTailscaleUrl(null);
+        setQrOpen(false);
+        setSelectedQrUrl(null);
+        if (err.code === 'DESKTOP_PIN_LOCKED') {
+          setStatusLabel('PIN Locked');
+          setError('Desktop PIN lock is enabled. Unlock in the main window.');
+        } else {
+          setStatusLabel('Starting');
+          setError('First-run setup has not been completed yet.');
+        }
       } else {
         setStatusLabel('Starting');
         setError(err instanceof Error ? err.message : String(err));
       }
     }
-  }, [connectLiveSocket]);
+  }, [connectLiveSocket, disconnectLiveSocket]);
 
   useEffect(() => {
+    mountedRef.current = true;
     void loadTrayState();
     return () => {
-      wsRef.current?.disconnect();
-      wsRef.current = null;
+      mountedRef.current = false;
+      loadSeqRef.current += 1;
+      disconnectLiveSocket();
     };
-  }, [loadTrayState]);
+  }, [loadTrayState, disconnectLiveSocket]);
 
   useEffect(() => {
     if (!isTauri()) return;

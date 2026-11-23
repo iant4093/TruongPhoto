@@ -16,6 +16,7 @@ import { Badge } from './ui';
 export interface AssetInspectorProps {
   assetId: string;
   initialDetail?: AssetDetail | null;
+  loadingInitialDetail?: boolean;
   onAssetUpdated?: (detail: AssetDetail) => void;
 }
 
@@ -49,6 +50,7 @@ function toDatetimeLocalValue(ms: number | null | undefined): string {
 export const AssetInspector: React.FC<AssetInspectorProps> = ({
   assetId,
   initialDetail = null,
+  loadingInitialDetail = false,
   onAssetUpdated,
 }) => {
   const user = useAppStore((s) => s.user);
@@ -111,6 +113,13 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
       return;
     }
 
+    // Parent (e.g. Lightbox) is already fetching this asset; wait for initialDetail instead of double-fetching.
+    if (loadingInitialDetail) {
+      setLoading(true);
+      setError(null);
+      return;
+    }
+
     let active = true;
     setLoading(true);
     setError(null);
@@ -132,7 +141,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     return () => {
       active = false;
     };
-  }, [assetId, initialDetail, syncFormFromDetail]);
+  }, [assetId, initialDetail, loadingInitialDetail, syncFormFromDetail]);
 
   const activeTags = useMemo<MediaTagView[]>(() => {
     if (!detail) return [];

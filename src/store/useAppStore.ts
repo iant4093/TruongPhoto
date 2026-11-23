@@ -97,6 +97,7 @@ export interface AppState {
   searchRequest: SearchRequest;
   searchResponse: SearchResponse | null;
   searchLoading: boolean;
+  searchError: string | null;
   aiDashboard: AiModelsDashboardResponse | null;
 
   // Phase 3 Conversational Search state
@@ -197,6 +198,7 @@ const initialDataState = {
   searchRequest: defaultSearchRequest(),
   searchResponse: null as SearchResponse | null,
   searchLoading: false,
+  searchError: null as string | null,
   aiDashboard: null as AiModelsDashboardResponse | null,
   chatDrawerOpen: false,
   chatSessions: [] as ChatSessionSummary[],
@@ -211,6 +213,48 @@ const initialDataState = {
 let wsClient: WsClient | null = null;
 let searchSeq = 0;
 let chatSeq = 0;
+
+const signedOutState = () => ({
+  authenticated: false,
+  serverGatePassed: false,
+  bootstrapError: null as string | null,
+  profiles: null as ProfileSummary[] | null,
+  user: null as UserPublic | null,
+  allowedFolderIds: null as string[] | null,
+  systemInfo: null as SystemInfoResponse | null,
+  folders: [] as FolderView[],
+  adminUsers: [] as AdminUserView[],
+  adminSettings: null as AppSettings | null,
+  wsConnected: false,
+  liveMetrics: null as LiveMetrics | null,
+  powerState: null as PowerState | null,
+  throttleStatus: null as ThrottleStatus | null,
+  tailscaleStatus: null as TailscaleStatus | null,
+  inspectorOpen: false,
+  activeNav: 'timeline' as NavTab,
+  searchQuery: '',
+  selectedAssetId: null as string | null,
+  lightboxAssetId: null as string | null,
+  lightboxAssetIds: [] as string[],
+  lightboxInitialTimestampSec: null as number | null,
+  uploadModalOpen: false,
+  activeJobs: {} as Record<number, ActiveJobInfo>,
+  libraryRevision: 0,
+  searchActive: false,
+  searchRequest: defaultSearchRequest(),
+  searchResponse: null as SearchResponse | null,
+  searchLoading: false,
+  searchError: null as string | null,
+  aiDashboard: null as AiModelsDashboardResponse | null,
+  chatDrawerOpen: false,
+  chatSessions: [] as ChatSessionSummary[],
+  activeChatSessionId: null as string | null,
+  chatMessages: [] as ChatMessageView[],
+  chatActiveFilters: null as RouterPlan | null,
+  chatSending: false,
+  chatPendingStartedAt: null as number | null,
+  chatLastReranked: false,
+});
 
 export function errorMessage(err: unknown): string {
   if (err instanceof ApiClientError) return err.message;
@@ -273,9 +317,10 @@ export const useAppStore = create<AppState>((set, get) => {
             ? {
                 searchActive: false,
                 searchQuery: '',
-                searchRequest: initialDataState.searchRequest,
+                searchRequest: defaultSearchRequest(),
                 searchResponse: null,
                 searchLoading: false,
+                searchError: null,
               }
             : {}),
         };
@@ -354,6 +399,7 @@ export const useAppStore = create<AppState>((set, get) => {
       set({
         searchActive: true,
         searchLoading: true,
+        searchError: null,
         searchRequest: merged,
         searchQuery: nextQuery,
       });
@@ -361,11 +407,15 @@ export const useAppStore = create<AppState>((set, get) => {
       try {
         const res = await searchLibrary(merged);
         if (seq === searchSeq) {
-          set({ searchResponse: res, searchLoading: false });
+          set({ searchResponse: res, searchLoading: false, searchError: null });
         }
       } catch (err) {
         if (seq === searchSeq) {
-          set({ searchLoading: false });
+          set({
+            searchResponse: null,
+            searchLoading: false,
+            searchError: errorMessage(err),
+          });
         }
         throw err;
       }
@@ -426,6 +476,7 @@ export const useAppStore = create<AppState>((set, get) => {
         searchRequest: defaultSearchRequest(),
         searchResponse: null,
         searchLoading: false,
+        searchError: null,
       });
     },
 
@@ -682,42 +733,7 @@ export const useAppStore = create<AppState>((set, get) => {
       get().disconnectWs();
       searchSeq += 1;
       chatSeq += 1;
-      set({
-        authenticated: false,
-        serverGatePassed: false,
-        profiles: null,
-        user: null,
-        allowedFolderIds: null,
-        folders: [],
-        adminUsers: [],
-        adminSettings: null,
-        wsConnected: false,
-        liveMetrics: null,
-        throttleStatus: null,
-        tailscaleStatus: null,
-        inspectorOpen: false,
-        activeNav: 'timeline',
-        searchQuery: '',
-        selectedAssetId: null,
-        lightboxAssetId: null,
-        lightboxAssetIds: [],
-        lightboxInitialTimestampSec: null,
-        uploadModalOpen: false,
-        activeJobs: {},
-        libraryRevision: 0,
-        searchActive: false,
-        searchRequest: defaultSearchRequest(),
-        searchResponse: null,
-        searchLoading: false,
-        aiDashboard: null,
-        chatDrawerOpen: false,
-        chatSessions: [],
-        activeChatSessionId: null,
-        chatMessages: [],
-        chatActiveFilters: null,
-        chatSending: false,
-        chatLastReranked: false,
-      });
+      set(signedOutState());
     },
 
     refreshSystemInfo: async () => {
@@ -909,41 +925,7 @@ export const useAppStore = create<AppState>((set, get) => {
       get().disconnectWs();
       searchSeq += 1;
       chatSeq += 1;
-      set({
-        authenticated: false,
-        serverGatePassed: false,
-        profiles: null,
-        user: null,
-        allowedFolderIds: null,
-        folders: [],
-        adminUsers: [],
-        adminSettings: null,
-        wsConnected: false,
-        liveMetrics: null,
-        throttleStatus: null,
-        tailscaleStatus: null,
-        inspectorOpen: false,
-        searchQuery: '',
-        selectedAssetId: null,
-        lightboxAssetId: null,
-        lightboxAssetIds: [],
-        lightboxInitialTimestampSec: null,
-        uploadModalOpen: false,
-        activeJobs: {},
-        libraryRevision: 0,
-        searchActive: false,
-        searchRequest: defaultSearchRequest(),
-        searchResponse: null,
-        searchLoading: false,
-        aiDashboard: null,
-        chatDrawerOpen: false,
-        chatSessions: [],
-        activeChatSessionId: null,
-        chatMessages: [],
-        chatActiveFilters: null,
-        chatSending: false,
-        chatLastReranked: false,
-      });
+      set(signedOutState());
     },
 
     resetForTest: () => {

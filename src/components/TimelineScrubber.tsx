@@ -90,6 +90,52 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     onJumpToMonth(bucket.year, bucket.month);
   };
 
+  const handlePointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    setDragging(false);
+    setHoverBucket(null);
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  };
+
+  const activeIdx = useMemo(() => {
+    if (hoverBucket) {
+      const found = buckets.findIndex(
+        (b) => b.year === hoverBucket.year && b.month === hoverBucket.month,
+      );
+      if (found >= 0) return found;
+    }
+    if (activeYear !== null) {
+      const found = buckets.findIndex((b) => b.year === activeYear);
+      if (found >= 0) return found;
+    }
+    return 0;
+  }, [activeYear, buckets, hoverBucket]);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    let nextIdx: number | null = null;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+      nextIdx = Math.min(buckets.length - 1, activeIdx + 1);
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+      nextIdx = Math.max(0, activeIdx - 1);
+    } else if (e.key === 'PageDown') {
+      nextIdx = Math.min(buckets.length - 1, activeIdx + 6);
+    } else if (e.key === 'PageUp') {
+      nextIdx = Math.max(0, activeIdx - 6);
+    } else if (e.key === 'Home') {
+      nextIdx = 0;
+    } else if (e.key === 'End') {
+      nextIdx = buckets.length - 1;
+    }
+    if (nextIdx === null) return;
+    e.preventDefault();
+    const target = buckets[nextIdx];
+    if (target) {
+      setHoverBucket(target);
+      onJumpToMonth(target.year, target.month);
+    }
+  };
+
   return (
     <>
       <div
@@ -99,12 +145,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         aria-label="Timeline chronological scrubber"
         aria-valuemin={0}
         aria-valuemax={Math.max(0, buckets.length - 1)}
-        aria-valuetext={hoverBucket ? formatBucketLabel(hoverBucket) : undefined}
+        aria-valuenow={activeIdx}
+        aria-valuetext={
+          hoverBucket
+            ? formatBucketLabel(hoverBucket)
+            : buckets[activeIdx]
+              ? formatBucketLabel(buckets[activeIdx])
+              : undefined
+        }
         tabIndex={0}
+        onKeyDown={handleKeyDown}
         onPointerMove={handlePointerMove}
         onPointerDown={handlePointerDown}
         onPointerUp={handlePointerUp}
-        onPointerCancel={() => setDragging(false)}
+        onPointerCancel={handlePointerCancel}
         onPointerLeave={() => {
           if (!dragging) setHoverBucket(null);
         }}

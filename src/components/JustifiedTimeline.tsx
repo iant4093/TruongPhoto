@@ -297,6 +297,20 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
     }
   };
 
+  const albumPickerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!albumPickerOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (albumPickerRef.current && target && !albumPickerRef.current.contains(target)) {
+        setAlbumPickerOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [albumPickerOpen]);
+
   const handleOpenAlbumPicker = async () => {
     if (!canMutate) return;
     if (albumPickerOpen) {
@@ -555,11 +569,13 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                 Favorite
               </button>
 
-              <div style={{ position: 'relative' }}>
+              <div ref={albumPickerRef} style={{ position: 'relative' }}>
                 <button
                   type="button"
                   className="button"
                   disabled={bulkBusy}
+                  aria-expanded={albumPickerOpen}
+                  aria-haspopup="dialog"
                   onClick={() => void handleOpenAlbumPicker()}
                 >
                   <FolderPlus size={13} />

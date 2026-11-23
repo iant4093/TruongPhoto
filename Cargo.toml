@@ -116,10 +116,15 @@ tauri-plugin-single-instance = "2.5.5"
 # Platform native hooks (matching TruongPaper power.rs)
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_DataExchange",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Storage_FileSystem",
 ] }

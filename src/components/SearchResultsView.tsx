@@ -108,6 +108,8 @@ export const SearchResultsView: React.FC = () => {
   const searchQuery = useAppStore((s) => s.searchQuery);
   const searchResponse = useAppStore((s) => s.searchResponse);
   const searchLoading = useAppStore((s) => s.searchLoading);
+  const searchError = useAppStore((s) => s.searchError);
+  const runSearch = useAppStore((s) => s.runSearch);
   const loadMoreSearch = useAppStore((s) => s.loadMoreSearch);
   const clearSearch = useAppStore((s) => s.clearSearch);
   const openLightbox = useAppStore((s) => s.openLightbox);
@@ -147,6 +149,22 @@ export const SearchResultsView: React.FC = () => {
       />
 
       <SearchFilterBar />
+
+      {searchError && (
+        <div className="error-banner error-banner-dismissible" role="alert" style={{ marginBottom: 14 }}>
+          <span>{searchError}</span>
+          <button
+            type="button"
+            className="button"
+            disabled={searchLoading}
+            onClick={() =>
+              void runSearch({ offset: 0 }).catch((err) => notifyError(err, 'Search failed'))
+            }
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {searchLoading && !searchResponse ? (
         <div className="view-loading" role="status">

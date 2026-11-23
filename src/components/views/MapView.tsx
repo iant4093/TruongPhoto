@@ -30,14 +30,23 @@ const INITIAL_BBOX = {
 };
 
 let pmtilesProtocolRegistered = false;
+let cachedWebGLSupport: boolean | null = null;
 
 export function hasWebGLSupport(): boolean {
   if (typeof document === 'undefined') return false;
   if (typeof navigator !== 'undefined' && /jsdom/i.test(navigator.userAgent)) return false;
+  if (cachedWebGLSupport !== null) return cachedWebGLSupport;
   try {
     const canvas = document.createElement('canvas');
-    return Boolean(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+    const gl = (canvas.getContext('webgl2') || canvas.getContext('webgl')) as
+      | WebGLRenderingContext
+      | WebGL2RenderingContext
+      | null;
+    cachedWebGLSupport = Boolean(gl);
+    gl?.getExtension('WEBGL_lose_context')?.loseContext();
+    return cachedWebGLSupport;
   } catch {
+    cachedWebGLSupport = false;
     return false;
   }
 }
@@ -194,17 +203,31 @@ export const MapView: React.FC = () => {
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<MapLibreMap | null>(null);
+  const [mapInstanceVersion, setMapInstanceVersion] = useState(0);
   const markersRef = useRef<Marker[]>([]);
   const pointsSeqRef = useRef(0);
   const clustersSeqRef = useRef(0);
 
-  const loadInitialMap = useCallback(async () => {
+  const loadInitialMap = useCallback(async (forceWorldBounds = false) => {
     setLoading(true);
     setError(null);
     const seq = ++clustersSeqRef.current;
     try {
       const cfg = await getMapConfig();
-      const clusterRes = await getMapClusters(INITIAL_BBOX);
+      const map = !forceWorldBounds ? mapInstanceRef.current : null;
+      const queryBbox = map
+        ? (() => {
+            const bounds = map.getBounds();
+            return {
+              min_lat: Math.max(-85, bounds.getSouth()),
+              max_lat: Math.min(85, bounds.getNorth()),
+              min_lng: Math.max(-180, bounds.getWest()),
+              max_lng: Math.min(180, bounds.getEast()),
+              zoom: Math.max(0, Math.min(20, Math.round(map.getZoom()))),
+            };
+          })()
+        : INITIAL_BBOX;
+      const clusterRes = await getMapClusters(queryBbox);
       if (seq !== clustersSeqRef.current) return;
       setConfig(cfg);
       setClusters(clusterRes.clusters);
@@ -273,7 +296,7 @@ export const MapView: React.FC = () => {
     }
     setSelectedCluster(null);
     setStripAssets([]);
-    void loadInitialMap();
+    void loadInitialMap(true);
   }, [clusters, loadInitialMap]);
 
   const mapTileMode = config?.tile_mode ?? null;
@@ -302,6 +325,7 @@ export const MapView: React.FC = () => {
       attributionControl: false,
     });
     mapInstanceRef.current = map;
+    setMapInstanceVersion((v) => v + 1);
 
     const onMoveEnd = () => {
       const bounds = map.getBounds();
@@ -374,7 +398,7 @@ export const MapView: React.FC = () => {
         .addTo(map);
       markersRef.current.push(marker);
     }
-  }, [webglAvailable, clusters, handleSelectCluster]);
+  }, [webglAvailable, clusters, handleSelectCluster, mapInstanceVersion]);
 
   const stripAssetIds = useMemo(() => stripAssets.map((a) => a.id), [stripAssets]);
   const modeLabel = formatModePillLabel(config);

@@ -557,10 +557,7 @@ pub async fn ingest_single_file(
     let rpath = rel_path.clone();
     let existing = state
         .db
-        .read(move |conn| {
-            let idx = repo::ingest::list_folder_file_index(conn, &fid)?;
-            Ok(idx.get(&rpath).cloned())
-        })
+        .read(move |conn| repo::ingest::get_folder_file_by_rel_path(conn, &fid, &rpath))
         .await?;
 
     if let Some(ex) = existing {

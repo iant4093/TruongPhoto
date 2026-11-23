@@ -26,6 +26,7 @@ const endpoint = override.plugins?.updater?.endpoints?.[0] ?? conf.plugins?.upda
 
 // 1. Signing key for updater artifacts
 const env = { ...process.env };
+env.TP_BUILD_VERSION ??= version;
 if (!env.TAURI_SIGNING_PRIVATE_KEY) {
   const keyFile = join(homedir(), '.tauri', 'truongphoto.key');
   if (!existsSync(keyFile)) {

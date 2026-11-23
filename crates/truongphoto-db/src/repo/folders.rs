@@ -142,6 +142,23 @@ pub fn get_folder_view_by_id(conn: &Connection, folder_id: &str) -> DbResult<Opt
 
 /// Inserts a new watched folder row.
 pub fn create_folder(conn: &Connection, input: &CreateFolder) -> DbResult<FolderRecord> {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM folders WHERE LOWER(root_path) = LOWER(?1) LIMIT 1",
+                params![input.root_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            return Err(crate::error::DbError::Conflict(format!(
+                "Folder already exists for path '{}'.",
+                input.root_path
+            )));
+        }
+    }
+
     let ts = now_ms();
     conn.execute(
         "INSERT INTO folders (

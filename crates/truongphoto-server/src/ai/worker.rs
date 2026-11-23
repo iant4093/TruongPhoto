@@ -18,7 +18,7 @@ use truongphoto_core::{
     AiTier, AssetFileView, AssetKind, AssetSummary, ClusterFacesResponse, FileRole, FolderRecord,
     JobStatus, RbacScope, WsServerEvent,
 };
-use truongphoto_db::{repo, DbError};
+use truongphoto_db::repo;
 use truongphoto_media::decode::decode_image_to_srgb;
 use truongphoto_media::video::video_capabilities;
 use uuid::Uuid;
@@ -318,14 +318,21 @@ async fn process_staging_tier_batch(
     cache_dir: &Path,
     max_assets: usize,
 ) -> Result<usize, anyhow::Error> {
-    let (asset_ids, queue_stats) = state
+    let fetch_limit = max_assets.saturating_mul(4).max(32);
+    let (raw_asset_ids, queue_stats) = state
         .db
         .read(move |conn| {
-            let ids = repo::ai::list_assets_needing_staging_tier(conn, staging_tier, max_assets)?;
+            let ids = repo::ai::list_assets_needing_staging_tier(conn, staging_tier, fetch_limit)?;
             let stats = repo::ai::count_ai_queue_stats(conn, active_tier, Some(staging_tier))?;
             Ok((ids, stats))
         })
         .await?;
+
+    let asset_ids: Vec<String> = raw_asset_ids
+        .into_iter()
+        .filter(|id| !state.ai.is_decode_backed_off(id))
+        .take(max_assets)
+        .collect();
 
     let mut processed = 0usize;
     let total_staging = queue_stats.staging_remaining;
@@ -365,6 +372,7 @@ async fn process_staging_tier_batch(
                 continue;
             };
             let Some(src_path) = resolve_source_path(&folder, src_file) else {
+                state.ai.record_decode_failure(&asset_id);
                 continue;
             };
 
@@ -408,30 +416,36 @@ async fn process_staging_tier_batch(
             .await??;
 
             let vision_vecs = match inferred {
-                StagingInferOutcome::Ready(v) => v,
-                StagingInferOutcome::DecodeSkipped => continue,
+                StagingInferOutcome::Ready(v) => {
+                    state.ai.clear_decode_failure(&asset_id);
+                    v
+                }
+                StagingInferOutcome::DecodeSkipped => {
+                    state.ai.record_decode_failure(&asset_id);
+                    continue;
+                }
                 StagingInferOutcome::EngineUnavailable => {
                     // Vision model not installed or ORT unavailable; do not cut over prematurely.
                     break;
                 }
             };
 
-            let idx_clone = Arc::clone(&staging_idx);
+            let min_next_vid = u32::try_from(staging_idx.flat_count()).unwrap_or(u32::MAX);
             let aid_write = asset_id.clone();
             let now_ms = Utc::now().timestamp_millis();
+            type StagingOutbox = (Vec<u32>, Vec<(u32, Vec<f32>)>);
+            let outbox: Arc<Mutex<Option<StagingOutbox>>> = Arc::new(Mutex::new(None));
+            let outbox_tx = Arc::clone(&outbox);
             state
                 .db
                 .write_batched(move |tx| {
                     let old_ids =
                         repo::ai::list_vector_ids_for_asset(tx, staging_tier, &aid_write)?;
-                    for old_id in old_ids {
-                        let _ = idx_clone.mark_deleted(old_id);
-                    }
-                    let mut next_vid = repo::ai::allocate_next_vision_vector_id(tx, staging_tier)?;
+                    repo::ai::delete_vision_embeddings_for_asset(tx, staging_tier, &aid_write)?;
+                    let mut next_vid = repo::ai::allocate_next_vision_vector_id(tx, staging_tier)?
+                        .max(min_next_vid);
+                    let mut assigned = Vec::with_capacity(vision_vecs.len());
                     for (ts_ms, vec) in vision_vecs {
-                        idx_clone
-                            .add(next_vid, &vec)
-                            .map_err(|e| DbError::InvalidArgument(e.to_string()))?;
                         repo::ai::upsert_vision_embedding(
                             tx,
                             staging_tier,
@@ -440,11 +454,29 @@ async fn process_staging_tier_batch(
                             ts_ms,
                             now_ms,
                         )?;
+                        assigned.push((next_vid, vec));
                         next_vid = next_vid.saturating_add(1);
                     }
+                    *outbox_tx.lock() = Some((old_ids, assigned));
                     Ok(())
                 })
                 .await?;
+
+            // Apply vector index mutations only after SQLite commits, off the db-writer thread.
+            let taken = outbox.lock().take();
+            if let Some((old_ids, assigned_vecs)) = taken {
+                let idx_clone = Arc::clone(&staging_idx);
+                tokio::task::spawn_blocking(move || -> Result<(), AiError> {
+                    for old_id in old_ids {
+                        let _ = idx_clone.mark_deleted(old_id);
+                    }
+                    for (vid, vec) in assigned_vecs {
+                        idx_clone.add(vid, &vec)?;
+                    }
+                    Ok(())
+                })
+                .await??;
+            }
 
             processed += 1;
             let _ = state.ws_tx.send(WsServerEvent::JobProgress {
@@ -500,15 +532,22 @@ async fn process_active_stage2_batch(
     cache_dir: &Path,
     max_assets: usize,
 ) -> Result<usize, anyhow::Error> {
-    let (asset_ids, raw_centroids, queue_stats) = state
+    let fetch_limit = max_assets.saturating_mul(4).max(32);
+    let (raw_asset_ids, raw_centroids, queue_stats) = state
         .db
         .read(move |conn| {
-            let ids = repo::ai::list_assets_needing_stage2(conn, max_assets)?;
+            let ids = repo::ai::list_assets_needing_stage2(conn, fetch_limit)?;
             let cents = repo::ai::list_person_centroids(conn)?;
             let stats = repo::ai::count_ai_queue_stats(conn, active_tier, None)?;
             Ok((ids, cents, stats))
         })
         .await?;
+
+    let asset_ids: Vec<String> = raw_asset_ids
+        .into_iter()
+        .filter(|id| !state.ai.is_decode_backed_off(id))
+        .take(max_assets)
+        .collect();
 
     if asset_ids.is_empty() {
         return Ok(0);
@@ -565,6 +604,7 @@ async fn process_active_stage2_batch(
             continue;
         };
         let Some(src_path) = resolve_source_path(&folder, src_file) else {
+            state.ai.record_decode_failure(&asset_id);
             continue;
         };
 
@@ -658,8 +698,10 @@ async fn process_active_stage2_batch(
         .await??;
 
         let Some(data) = inferred else {
+            state.ai.record_decode_failure(&asset_id);
             continue;
         };
+        state.ai.clear_decode_failure(&asset_id);
 
         if !data.vision_ok && data.faces.is_empty() && data.ocr.is_none() {
             // No AI models available yet; avoid spinning through the remaining queue.
@@ -667,30 +709,43 @@ async fn process_active_stage2_batch(
         }
 
         let vision_ok = data.vision_ok;
-        let vision_idx_clone = Arc::clone(&vision_idx);
-        let faces_idx_clone = Arc::clone(&faces_idx);
-        let centroids_clone = Arc::clone(&centroids);
+        let min_vision_vid = u32::try_from(vision_idx.flat_count()).unwrap_or(u32::MAX);
+        let min_face_vid = u32::try_from(faces_idx.flat_count()).unwrap_or(u32::MAX);
+        let mut local_centroids = if !data.faces.is_empty() {
+            centroids.lock().clone()
+        } else {
+            Vec::new()
+        };
+        let has_faces = !data.faces.is_empty();
         let aid_write = asset_id.clone();
         let now_ms = Utc::now().timestamp_millis();
+
+        type Stage2Outbox = (
+            Vec<u32>,
+            Vec<(u32, Vec<f32>)>,
+            Vec<(u32, Vec<f32>)>,
+            Vec<(String, u64, Vec<f32>)>,
+        );
+        let outbox: Arc<Mutex<Option<Stage2Outbox>>> = Arc::new(Mutex::new(None));
+        let outbox_tx = Arc::clone(&outbox);
 
         state
             .db
             .write_batched(move |tx| {
+                let mut old_vision_ids = Vec::new();
+                let mut assigned_vision = Vec::new();
                 if data.vision_ok {
-                    let old_ids = repo::ai::list_vector_ids_for_asset(tx, active_tier, &aid_write)?;
-                    for old_id in old_ids {
-                        let _ = vision_idx_clone.mark_deleted(old_id);
-                    }
-                    let mut next_vid = repo::ai::allocate_next_vision_vector_id(tx, active_tier)?;
+                    old_vision_ids =
+                        repo::ai::list_vector_ids_for_asset(tx, active_tier, &aid_write)?;
+                    repo::ai::delete_vision_embeddings_for_asset(tx, active_tier, &aid_write)?;
+                    let mut next_vid = repo::ai::allocate_next_vision_vector_id(tx, active_tier)?
+                        .max(min_vision_vid);
                     let mut seen_ts =
                         std::collections::HashSet::with_capacity(data.vision_vecs.len());
                     for (ts_ms, vec) in data.vision_vecs {
                         if !seen_ts.insert(ts_ms) {
                             continue;
                         }
-                        vision_idx_clone
-                            .add(next_vid, &vec)
-                            .map_err(|e| DbError::InvalidArgument(e.to_string()))?;
                         repo::ai::upsert_vision_embedding(
                             tx,
                             active_tier,
@@ -699,6 +754,7 @@ async fn process_active_stage2_batch(
                             ts_ms,
                             now_ms,
                         )?;
+                        assigned_vision.push((next_vid, vec));
                         next_vid = next_vid.saturating_add(1);
                     }
                     repo::ai::insert_ai_tags_ignoring_rejected(
@@ -710,10 +766,12 @@ async fn process_active_stage2_batch(
                     )?;
                 }
 
+                let mut assigned_faces = Vec::new();
                 if !data.faces.is_empty() {
-                    let mut cent_guard = centroids_clone.lock();
+                    let mut next_fvid =
+                        repo::ai::allocate_next_face_vector_id(tx)?.max(min_face_vid);
                     for face in data.faces {
-                        let pairs: Vec<(String, Vec<f32>)> = cent_guard
+                        let pairs: Vec<(String, Vec<f32>)> = local_centroids
                             .iter()
                             .map(|(pid, _, vec)| (pid.clone(), vec.clone()))
                             .collect();
@@ -733,7 +791,7 @@ async fn process_active_stage2_batch(
                                 .is_ok();
                             if person_still_exists {
                                 if let Some((_, count, vec)) =
-                                    cent_guard.iter_mut().find(|(id, _, _)| id == &pid)
+                                    local_centroids.iter_mut().find(|(id, _, _)| id == &pid)
                                 {
                                     let updated =
                                         update_running_centroid(vec, *count, &face.embedding);
@@ -746,17 +804,15 @@ async fn process_active_stage2_batch(
                                 }
                                 (Some(pid), "auto")
                             } else {
-                                cent_guard.retain(|(id, _, _)| id != &pid);
+                                local_centroids.retain(|(id, _, _)| id != &pid);
                                 (None, "unassigned")
                             }
                         } else {
                             (None, "unassigned")
                         };
 
-                        let fvid = repo::ai::allocate_next_face_vector_id(tx)?;
-                        faces_idx_clone
-                            .add(fvid, &face.embedding)
-                            .map_err(|e| DbError::InvalidArgument(e.to_string()))?;
+                        let fvid = next_fvid;
+                        next_fvid = next_fvid.saturating_add(1);
                         let face_id = Uuid::new_v4().to_string();
                         repo::ai::insert_face_with_embedding(
                             tx,
@@ -769,6 +825,7 @@ async fn process_active_stage2_batch(
                             assigned_by,
                             now_ms,
                         )?;
+                        assigned_faces.push((fvid, face.embedding));
                     }
                 }
 
@@ -790,9 +847,43 @@ async fn process_active_stage2_batch(
                     repo::ai::mark_asset_ai_stage(tx, &aid_write, 2, now_ms)?;
                 }
 
+                *outbox_tx.lock() = Some((
+                    old_vision_ids,
+                    assigned_vision,
+                    assigned_faces,
+                    local_centroids,
+                ));
                 Ok(())
             })
             .await?;
+
+        // Commit in-memory centroid cache & on-disk vector indices ONLY after SQLite commits.
+        let taken = outbox.lock().take();
+        if let Some((old_vision_ids, assigned_vision, assigned_faces, updated_centroids)) = taken {
+            if has_faces {
+                *centroids.lock() = updated_centroids;
+            }
+            if !old_vision_ids.is_empty()
+                || !assigned_vision.is_empty()
+                || !assigned_faces.is_empty()
+            {
+                let vision_idx_clone = Arc::clone(&vision_idx);
+                let faces_idx_clone = Arc::clone(&faces_idx);
+                tokio::task::spawn_blocking(move || -> Result<(), AiError> {
+                    for old_id in old_vision_ids {
+                        let _ = vision_idx_clone.mark_deleted(old_id);
+                    }
+                    for (vid, vec) in assigned_vision {
+                        vision_idx_clone.add(vid, &vec)?;
+                    }
+                    for (fvid, emb) in assigned_faces {
+                        faces_idx_clone.add(fvid, &emb)?;
+                    }
+                    Ok(())
+                })
+                .await??;
+            }
+        }
 
         if vision_ok {
             processed += 1;

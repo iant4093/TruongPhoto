@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { LogOut, Search, Upload, UploadCloud, X } from 'lucide-react';
-import { ChatDrawer } from './components/ChatDrawer';
 import { ContextMenuHost } from './components/ContextMenu';
 import { FeedbackHost } from './components/Feedback';
 import { InspectorDrawer } from './components/InspectorDrawer';
@@ -44,6 +43,59 @@ const NAV_TITLES: Record<NavTab, string> = {
   settings: 'Settings',
 };
 
+const SearchOmnibar: React.FC<{
+  inputRef: React.RefObject<HTMLInputElement | null>;
+}> = ({ inputRef }) => {
+  const searchQuery = useAppStore((s) => s.searchQuery);
+  const searchActive = useAppStore((s) => s.searchActive);
+  const setSearchQuery = useAppStore((s) => s.setSearchQuery);
+  const runSearch = useAppStore((s) => s.runSearch);
+  const clearSearch = useAppStore((s) => s.clearSearch);
+
+  return (
+    <form
+      className="omnibar"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void runSearch({ query: searchQuery.trim() || null, offset: 0 }).catch((err) =>
+          notifyError(err, 'Search failed'),
+        );
+      }}
+    >
+      <label className="omnibar-field" aria-label="Search library">
+        <Search size={14} aria-hidden="true" />
+        <input
+          ref={inputRef}
+          type="search"
+          placeholder="Search library…"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              if (searchActive || searchQuery) clearSearch();
+              else inputRef.current?.blur();
+            }
+          }}
+        />
+        {(searchQuery || searchActive) && (
+          <button
+            type="button"
+            className="icon-button"
+            style={{ width: 22, height: 22 }}
+            aria-label="Clear search"
+            onClick={clearSearch}
+          >
+            <X size={13} />
+          </button>
+        )}
+        <span className="omnibar-shortcut" aria-hidden="true">
+          /
+        </span>
+      </label>
+    </form>
+  );
+};
+
 export const App: React.FC = () => {
   const bootstrapping = useAppStore((s) => s.bootstrapping);
   const bootstrapError = useAppStore((s) => s.bootstrapError);
@@ -52,11 +104,9 @@ export const App: React.FC = () => {
   const user = useAppStore((s) => s.user);
   const activeNav = useAppStore((s) => s.activeNav);
   const inspectorOpen = useAppStore((s) => s.inspectorOpen);
-  const searchQuery = useAppStore((s) => s.searchQuery);
   const searchActive = useAppStore((s) => s.searchActive);
   const uploadModalOpen = useAppStore((s) => s.uploadModalOpen);
   const lightboxAssetId = useAppStore((s) => s.lightboxAssetId);
-  const chatDrawerOpen = useAppStore((s) => s.chatDrawerOpen);
   const wsConnected = useAppStore((s) => s.wsConnected);
   const activeJobCount = useAppStore((s) => Object.keys(s.activeJobs).length);
 
@@ -66,10 +116,6 @@ export const App: React.FC = () => {
   const selectAsset = useAppStore((s) => s.selectAsset);
   const setInspectorOpen = useAppStore((s) => s.setInspectorOpen);
   const toggleInspector = useAppStore((s) => s.toggleInspector);
-  const setChatDrawerOpen = useAppStore((s) => s.setChatDrawerOpen);
-  const setSearchQuery = useAppStore((s) => s.setSearchQuery);
-  const runSearch = useAppStore((s) => s.runSearch);
-  const clearSearch = useAppStore((s) => s.clearSearch);
   const setUploadModalOpen = useAppStore((s) => s.setUploadModalOpen);
 
   const canUpload = user?.role === 'admin' || user?.role === 'contributor';
@@ -332,46 +378,7 @@ export const App: React.FC = () => {
         {!hideWorkspaceHeader && (
           <header className="workspace-header" data-tauri-drag-region>
             {showSearchOmnibar ? (
-              <form
-                className="omnibar"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void runSearch({ query: searchQuery.trim() || null, offset: 0 }).catch((err) =>
-                    notifyError(err, 'Search failed'),
-                  );
-                }}
-              >
-                <label className="omnibar-field" aria-label="Search library">
-                  <Search size={14} aria-hidden="true" />
-                  <input
-                    ref={searchInputRef}
-                    type="search"
-                    placeholder="Search library…"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Escape') {
-                        if (searchActive || searchQuery) clearSearch();
-                        else searchInputRef.current?.blur();
-                      }
-                    }}
-                  />
-                  {(searchQuery || searchActive) && (
-                    <button
-                      type="button"
-                      className="icon-button"
-                      style={{ width: 22, height: 22 }}
-                      aria-label="Clear search"
-                      onClick={clearSearch}
-                    >
-                      <X size={13} />
-                    </button>
-                  )}
-                  <span className="omnibar-shortcut" aria-hidden="true">
-                    /
-                  </span>
-                </label>
-              </form>
+              <SearchOmnibar inputRef={searchInputRef} />
             ) : (
               <div className="workspace-header-title" data-tauri-drag-region>
                 {NAV_TITLES[activeNav]}
@@ -458,14 +465,11 @@ export const App: React.FC = () => {
             )}
           </main>
 
-          {(inspectorOpen || chatDrawerOpen) && (
+          {inspectorOpen && (
             <div
               className="status-drawer-scrim"
               aria-hidden="true"
-              onClick={() => {
-                if (inspectorOpen) closeInspector();
-                if (chatDrawerOpen) setChatDrawerOpen(false);
-              }}
+              onClick={closeInspector}
             />
           )}
 
@@ -480,8 +484,6 @@ export const App: React.FC = () => {
               onClose={closeInspector}
             />
           </div>
-
-          <ChatDrawer />
         </div>
       </div>
 

@@ -37,12 +37,14 @@ import {
 } from '../../lib/api';
 import { formatBytes, formatDateTime, plural } from '../../lib/format';
 import {
+  checkNativeUpdater,
   checkUpdateFeed,
   getAutostartEnabled,
   isTauri,
   openExternalUrl,
   pickFolderDialog,
   setAutostartEnabled,
+  type NativeDesktopUpdate,
 } from '../../lib/tauri';
 import { confirmAction, notifyError, notifyInfo, notifySuccess } from '../../store/feedback';
 import { useAppStore } from '../../store/useAppStore';
@@ -138,6 +140,8 @@ export const SettingsView: React.FC = () => {
     storeTailscaleStatus,
   );
   const [tailscaleBusy, setTailscaleBusy] = useState(false);
+  const [nativeUpdate, setNativeUpdate] = useState<NativeDesktopUpdate | null>(null);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
 
   // Storage & Backup state
   const [uploadsDir, setUploadsDir] = useState(adminSettings?.managed_uploads_dir ?? '');
@@ -565,17 +569,23 @@ export const SettingsView: React.FC = () => {
 
   const handleCheckUpdates = async () => {
     setCheckingUpdates(true);
+    setNativeUpdate(null);
     try {
-      const ghResult = await checkForUpdates();
+      const [ghResult, native] = await Promise.all([
+        checkForUpdates(),
+        isTauri() ? checkNativeUpdater() : Promise.resolve(null),
+      ]);
       setUpdateResult(ghResult);
-      if (ghResult.update_available && ghResult.latest_version) {
+      setNativeUpdate(native);
+      if (native) {
+        notifySuccess(`Signed update v${native.version} is ready to install.`);
+      } else if (ghResult.update_available && ghResult.latest_version) {
         notifySuccess(`Update v${ghResult.latest_version} is available on GitHub Releases.`);
       } else if (ghResult.status === 'up_to_date') {
         notifyInfo(`TruongPhoto v${ghResult.current_version} is up to date.`);
       } else if (ghResult.message) {
         notifyInfo(ghResult.message);
       }
-      // Also ping Tauri's native updater feed silently if available.
       if (isTauri()) {
         void checkUpdateFeed().catch(() => {});
       }
@@ -583,6 +593,17 @@ export const SettingsView: React.FC = () => {
       notifyError(err, 'Update check failed');
     } finally {
       setCheckingUpdates(false);
+    }
+  };
+
+  const handleInstallNativeUpdate = async () => {
+    if (!nativeUpdate || installingUpdate) return;
+    setInstallingUpdate(true);
+    try {
+      await nativeUpdate.installAndRestart();
+    } catch (err) {
+      notifyError(err, 'Could not install update');
+      setInstallingUpdate(false);
     }
   };
 
@@ -1224,7 +1245,7 @@ export const SettingsView: React.FC = () => {
                     void openExternalUrl(
                       updateResult?.release_url ??
                         'https://github.com/iant4093/TruongPhoto/releases',
-                    )
+                    ).catch((err) => notifyError(err, 'Could not open Releases page'))
                   }
                 >
                   <ExternalLink size={14} />
@@ -1233,37 +1254,61 @@ export const SettingsView: React.FC = () => {
               </div>
             </div>
 
-            {updateResult && (
+            {(updateResult || nativeUpdate) && (
               <div className="update-result-box" role="status">
-                {updateResult.update_available ? (
+                {updateResult?.update_available || nativeUpdate ? (
                   <div className="stack" style={{ gap: 8 }}>
                     <div
                       className="row"
                       style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}
                     >
                       <strong style={{ fontSize: 13 }}>
-                        {updateResult.release_name || `TruongPhoto v${updateResult.latest_version}`}
+                        {updateResult?.release_name ||
+                          `TruongPhoto v${nativeUpdate?.version ?? updateResult?.latest_version}`}
                       </strong>
-                      {updateResult.download_url && (
-                        <button
-                          type="button"
-                          className="button button-primary"
-                          onClick={() => void openExternalUrl(updateResult.download_url!)}
-                        >
-                          <Download size={14} />
-                          <span>
-                            Download {updateResult.asset_name ? updateResult.asset_name : 'Update'}
-                          </span>
-                        </button>
-                      )}
+                      <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                        {nativeUpdate && (
+                          <button
+                            type="button"
+                            className="button button-primary"
+                            disabled={installingUpdate}
+                            onClick={() => void handleInstallNativeUpdate()}
+                          >
+                            <Download size={14} />
+                            <span>
+                              {installingUpdate
+                                ? 'Installing & Restarting…'
+                                : `Install v${nativeUpdate.version} & Restart`}
+                            </span>
+                          </button>
+                        )}
+                        {updateResult?.download_url && (
+                          <button
+                            type="button"
+                            className={nativeUpdate ? 'button' : 'button button-primary'}
+                            onClick={() =>
+                              void openExternalUrl(updateResult.download_url!).catch((err) =>
+                                notifyError(err, 'Could not open update download'),
+                              )
+                            }
+                          >
+                            <Download size={14} />
+                            <span>
+                              Download {updateResult.asset_name ? updateResult.asset_name : 'Update'}
+                            </span>
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    {updateResult.release_notes && (
-                      <pre className="update-release-notes">{updateResult.release_notes}</pre>
+                    {(updateResult?.release_notes || nativeUpdate?.body) && (
+                      <pre className="update-release-notes">
+                        {updateResult?.release_notes || nativeUpdate?.body}
+                      </pre>
                     )}
                   </div>
                 ) : (
                   <div className="view-subtitle" style={{ marginTop: 0 }}>
-                    {updateResult.message || 'You are running the latest release.'}
+                    {updateResult?.message || 'You are running the latest release.'}
                   </div>
                 )}
               </div>
@@ -1281,17 +1326,26 @@ export const SettingsView: React.FC = () => {
               </div>
               <div className="stack">
                 {systemInfo?.mdns_url && (
-                  <div className="row" style={{ justifyContent: 'space-between' }}>
+                  <div
+                    className="row"
+                    style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}
+                  >
                     <button
                       type="button"
                       className="button button-quiet"
-                      onClick={() => void openExternalUrl(systemInfo.mdns_url!)}
+                      style={{ minWidth: 0, overflowWrap: 'anywhere', textAlign: 'left' }}
+                      onClick={() =>
+                        void openExternalUrl(systemInfo.mdns_url!).catch((err) =>
+                          notifyError(err, 'Could not open URL'),
+                        )
+                      }
                     >
                       {systemInfo.mdns_url}
                     </button>
                     <button
                       type="button"
                       className="button"
+                      style={{ flexShrink: 0 }}
                       onClick={() => void handleCopyUrl(systemInfo.mdns_url!)}
                     >
                       {copiedUrl === systemInfo.mdns_url ? <Check size={13} /> : <Copy size={13} />}
@@ -1300,17 +1354,27 @@ export const SettingsView: React.FC = () => {
                   </div>
                 )}
                 {systemInfo?.lan_urls.map((url) => (
-                  <div key={url} className="row" style={{ justifyContent: 'space-between' }}>
+                  <div
+                    key={url}
+                    className="row"
+                    style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}
+                  >
                     <button
                       type="button"
                       className="button button-quiet"
-                      onClick={() => void openExternalUrl(url)}
+                      style={{ minWidth: 0, overflowWrap: 'anywhere', textAlign: 'left' }}
+                      onClick={() =>
+                        void openExternalUrl(url).catch((err) =>
+                          notifyError(err, 'Could not open URL'),
+                        )
+                      }
                     >
                       {url}
                     </button>
                     <button
                       type="button"
                       className="button"
+                      style={{ flexShrink: 0 }}
                       onClick={() => void handleCopyUrl(url)}
                     >
                       {copiedUrl === url ? <Check size={13} /> : <Copy size={13} />}
