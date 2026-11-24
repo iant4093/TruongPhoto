@@ -183,7 +183,7 @@ fn decode_via_ffmpeg_png(path: &Path) -> Result<RgbImage, MediaError> {
     Ok(composite_to_rgb(dyn_img))
 }
 
-fn decode_jpeg_bytes_with_exif_and_icc(
+pub(crate) fn decode_jpeg_bytes_with_exif_and_icc(
     jpeg_bytes: &[u8],
     fallback_orientation: Option<image::metadata::Orientation>,
 ) -> Result<RgbImage, MediaError> {
@@ -197,9 +197,12 @@ fn decode_jpeg_bytes_with_exif_and_icc(
     let icc = decoder.icc_profile().ok().flatten();
     let mut dyn_img = DynamicImage::from_decoder(decoder)
         .map_err(|e| MediaError::Decode(format!("JPEG pixel decode failed: {e}")))?;
+    // `image::ImageDecoder::orientation()` returns `Ok(Orientation::NoTransforms)` when a JPEG
+    // omits EXIF Orientation (common for Canon CR3/Sony ARW embedded previews), so treat
+    // `NoTransforms` as absent and apply the outer RAW container's EXIF orientation instead.
     let effective_orient = match embedded_orient {
-        Some(o) => Some(o),
-        None => fallback_orientation,
+        Some(o) if o != image::metadata::Orientation::NoTransforms => Some(o),
+        _ => fallback_orientation,
     };
     if let Some(orient) = effective_orient {
         dyn_img.apply_orientation(orient);
@@ -211,7 +214,7 @@ fn decode_jpeg_bytes_with_exif_and_icc(
     Ok(rgb)
 }
 
-fn exif_orientation_from_file(path: &Path) -> Option<image::metadata::Orientation> {
+pub(crate) fn exif_orientation_from_file(path: &Path) -> Option<image::metadata::Orientation> {
     let mut parser = nom_exif::MediaParser::new();
     let ms = nom_exif::MediaSource::open(path).ok()?;
     let iter = parser.parse_exif(ms).ok()?;
@@ -400,4 +403,29 @@ pub fn generate_preview_webp(
     let webp_bytes = encode_webp_resized(&rgb, max_edge, 85.0)?;
     atomic_write_bytes(preview_out, &webp_bytes)?;
     Ok(webp_bytes.len() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::codecs::jpeg::JpegEncoder;
+
+    #[test]
+    fn jpeg_without_exif_orientation_applies_outer_raw_fallback_orientation() {
+        // Landscape 40x20 JPEG with NO EXIF orientation tag (like Canon CR3 embedded previews)
+        let img = RgbImage::from_pixel(40, 20, image::Rgb([100, 150, 200]));
+        let mut jpeg = Vec::new();
+        let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 90);
+        enc.encode(img.as_raw(), 40, 20, image::ExtendedColorType::Rgb8)
+            .expect("encode jpeg");
+
+        // Outer CR3 container has EXIF Orientation = 8 (Rotate270) -> output must be portrait 20x40!
+        let fallback = image::metadata::Orientation::from_exif(8);
+        let decoded = decode_jpeg_bytes_with_exif_and_icc(&jpeg, fallback).expect("decode jpeg");
+        assert_eq!(decoded.dimensions(), (20, 40));
+
+        // Without fallback orientation, landscape stays 40x20
+        let decoded_no_fb = decode_jpeg_bytes_with_exif_and_icc(&jpeg, None).expect("decode jpeg");
+        assert_eq!(decoded_no_fb.dimensions(), (40, 20));
+    }
 }

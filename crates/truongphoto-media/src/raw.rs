@@ -550,6 +550,26 @@ pub fn demosaic_raw_to_jpeg(path: &Path) -> Result<(Vec<u8>, &'static str), Medi
     }
 
     if let Some(bytes) = extract_embedded_raw_jpeg(path) {
+        let outer_orient = crate::decode::exif_orientation_from_file(path);
+        if outer_orient.is_some_and(|o| o != image::metadata::Orientation::NoTransforms) {
+            if let Ok(rgb) =
+                crate::decode::decode_jpeg_bytes_with_exif_and_icc(&bytes, outer_orient)
+            {
+                let mut oriented_jpeg = Vec::new();
+                let mut enc = JpegEncoder::new_with_quality(&mut oriented_jpeg, 95);
+                if enc
+                    .encode(
+                        rgb.as_raw(),
+                        rgb.width(),
+                        rgb.height(),
+                        image::ExtendedColorType::Rgb8,
+                    )
+                    .is_ok()
+                {
+                    return Ok((oriented_jpeg, "embedded_preview"));
+                }
+            }
+        }
         return Ok((bytes, "embedded_preview"));
     }
 
