@@ -43,10 +43,13 @@
       "open": "https?://[A-Za-z0-9\\-._~\\[\\]:/?#@!$&'()*+,;=%]+"
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU4NTMyRDQ1NTdDOTYxMTcKUldRWFljbFhSUzFUNkZ5Wm43anhwUmdYWUgvYTdsR3ZWUWU4Y3c4aDNpUmx0TFBjUkZuTHFJZ1QK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU5N0Y3OEMzM0FBNkM0NUMKUldSY3hLWTZ3M2gvV1ZMVnBOUUgrY05zR1ZDMnlrbTBDUmFvRzFOVjVaR0p1K1V0RXFtQlhBRjgK",
       "endpoints": [
         "https://github.com/iant4093/TruongPhoto/releases/latest/download/latest.json"
-      ]
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

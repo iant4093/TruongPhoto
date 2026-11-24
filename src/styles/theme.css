@@ -2704,6 +2704,49 @@ input[type='number'].text-input { width: 90px; }
   background: rgba(255, 255, 255, 0.025);
 }
 
+.update-progress-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.update-progress-track {
+  position: relative;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.update-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent, #0a84ff);
+  transition: width 180ms ease-out;
+}
+
+.update-progress-fill.is-indeterminate {
+  animation: update-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes update-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
+.update-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
 .update-release-notes {
   margin: 0;
   padding: 10px 12px;

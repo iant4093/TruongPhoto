@@ -145,27 +145,6 @@ export const SettingsView: React.FC = () => {
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress | null>(null);
 
-  useEffect(() => {
-    if (!installingUpdate || !isTauri()) return;
-    let active = true;
-    let unlisten: (() => void) | null = null;
-    void import('@tauri-apps/api/event')
-      .then(({ listen }) =>
-        listen<UpdateDownloadProgress>('desktop-update-progress', (ev) => {
-          if (active) setUpdateProgress(ev.payload);
-        }),
-      )
-      .then((fn) => {
-        if (!active) fn();
-        else unlisten = fn;
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-      unlisten?.();
-    };
-  }, [installingUpdate]);
-
   // Storage & Backup state
   const [uploadsDir, setUploadsDir] = useState(adminSettings?.managed_uploads_dir ?? '');
   const [thumbsDir, setThumbsDir] = useState(adminSettings?.thumbnails_dir ?? '');
@@ -619,13 +598,22 @@ export const SettingsView: React.FC = () => {
   const handleInstallNativeUpdate = async () => {
     if (!nativeUpdate || installingUpdate) return;
     setInstallingUpdate(true);
-    setUpdateProgress(null);
+    setUpdateProgress({ downloaded: 0, total: null, finished: false });
+    let unlisten: (() => void) | null = null;
     try {
+      if (isTauri()) {
+        const { listen } = await import('@tauri-apps/api/event');
+        unlisten = await listen<UpdateDownloadProgress>('desktop-update-progress', (ev) => {
+          setUpdateProgress(ev.payload);
+        });
+      }
       await nativeUpdate.installAndRestart();
     } catch (err) {
       notifyError(err, 'Could not install update');
       setInstallingUpdate(false);
       setUpdateProgress(null);
+    } finally {
+      unlisten?.();
     }
   };
 
@@ -1241,17 +1229,27 @@ export const SettingsView: React.FC = () => {
                   <Badge tone="muted">
                     v{updateResult?.current_version ?? systemInfo?.version ?? '0.1.0'}
                   </Badge>
-                  {updateResult?.status === 'update_available' && updateResult.latest_version && (
-                    <Badge tone="ok">v{updateResult.latest_version} available</Badge>
+                  {(nativeUpdate ||
+                    (updateResult?.status === 'update_available' &&
+                      updateResult.latest_version)) && (
+                    <Badge tone="ok">
+                      v{nativeUpdate?.version ?? updateResult?.latest_version} available
+                    </Badge>
                   )}
-                  {updateResult?.status === 'up_to_date' && <Badge tone="ok">Up to date</Badge>}
-                  {updateResult?.status === 'no_releases' && (
+                  {!nativeUpdate && updateResult?.status === 'up_to_date' && (
+                    <Badge tone="ok">Up to date</Badge>
+                  )}
+                  {!nativeUpdate && updateResult?.status === 'no_releases' && (
                     <Badge tone="muted">No releases yet</Badge>
                   )}
-                  {updateResult?.status === 'offline' && <Badge tone="warn">Offline</Badge>}
+                  {!nativeUpdate && updateResult?.status === 'offline' && (
+                    <Badge tone="warn">Offline</Badge>
+                  )}
                 </div>
                 <div className="view-subtitle" style={{ marginTop: 2 }}>
-                  Pulls the latest macOS &amp; Windows installers directly from{' '}
+                  {isTauri()
+                    ? 'Downloads, verifies, and installs signed updates in place from '
+                    : 'Pulls the latest macOS & Windows installers directly from '}
                   <code>iant4093/TruongPhoto</code> on GitHub.
                 </div>
               </div>
@@ -1260,7 +1258,7 @@ export const SettingsView: React.FC = () => {
                 <button
                   type="button"
                   className="button button-primary"
-                  disabled={checkingUpdates}
+                  disabled={checkingUpdates || installingUpdate}
                   onClick={() => void handleCheckUpdates()}
                 >
                   <RefreshCw size={14} className={checkingUpdates ? 'spin-icon' : undefined} />
@@ -1269,6 +1267,7 @@ export const SettingsView: React.FC = () => {
                 <button
                   type="button"
                   className="button"
+                  disabled={installingUpdate}
                   onClick={() =>
                     void openExternalUrl(
                       updateResult?.release_url ??
@@ -1285,7 +1284,7 @@ export const SettingsView: React.FC = () => {
             {(updateResult || nativeUpdate) && (
               <div className="update-result-box" role="status">
                 {updateResult?.update_available || nativeUpdate ? (
-                  <div className="stack" style={{ gap: 8 }}>
+                  <div className="stack" style={{ gap: 10 }}>
                     <div
                       className="row"
                       style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}
@@ -1295,7 +1294,7 @@ export const SettingsView: React.FC = () => {
                           `TruongPhoto v${nativeUpdate?.version ?? updateResult?.latest_version}`}
                       </strong>
                       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
-                        {nativeUpdate && (
+                        {nativeUpdate ? (
                           <button
                             type="button"
                             className="button button-primary"
@@ -1308,30 +1307,71 @@ export const SettingsView: React.FC = () => {
                                 ? updateProgress && !updateProgress.finished
                                   ? updateProgress.total && updateProgress.total > 0
                                     ? `Downloading ${Math.min(100, Math.round((updateProgress.downloaded / updateProgress.total) * 100))}%…`
-                                    : `Downloading ${formatBytes(updateProgress.downloaded)}…`
+                                    : updateProgress.downloaded > 0
+                                      ? `Downloading ${formatBytes(updateProgress.downloaded)}…`
+                                      : 'Starting Download…'
                                   : 'Installing & Restarting…'
                                 : `Install v${nativeUpdate.version} & Restart`}
                             </span>
                           </button>
-                        )}
-                        {updateResult?.download_url && (
-                          <button
-                            type="button"
-                            className={nativeUpdate ? 'button' : 'button button-primary'}
-                            onClick={() =>
-                              void openExternalUrl(updateResult.download_url!).catch((err) =>
-                                notifyError(err, 'Could not open update download'),
-                              )
-                            }
-                          >
-                            <Download size={14} />
-                            <span>
-                              Download {updateResult.asset_name ? updateResult.asset_name : 'Update'}
-                            </span>
-                          </button>
+                        ) : (
+                          updateResult?.download_url && (
+                            <button
+                              type="button"
+                              className="button button-primary"
+                              onClick={() =>
+                                void openExternalUrl(updateResult.download_url!).catch((err) =>
+                                  notifyError(err, 'Could not open update download'),
+                                )
+                              }
+                            >
+                              <Download size={14} />
+                              <span>
+                                Download {updateResult.asset_name ? updateResult.asset_name : 'Update'}
+                              </span>
+                            </button>
+                          )
                         )}
                       </div>
                     </div>
+                    {installingUpdate && (
+                      <div className="update-progress-wrap">
+                        <div className="update-progress-track">
+                          <div
+                            className={`update-progress-fill${
+                              !updateProgress?.finished &&
+                              (!updateProgress?.total || updateProgress.total <= 0)
+                                ? ' is-indeterminate'
+                                : ''
+                            }`}
+                            style={{
+                              width: updateProgress?.finished
+                                ? '100%'
+                                : updateProgress?.total && updateProgress.total > 0
+                                  ? `${Math.min(100, Math.round((updateProgress.downloaded / updateProgress.total) * 100))}%`
+                                  : '35%',
+                            }}
+                          />
+                        </div>
+                        <div className="update-progress-meta">
+                          <span>
+                            {updateProgress?.finished
+                              ? 'Verifying signature, installing update, and restarting TruongPhoto…'
+                              : updateProgress && updateProgress.downloaded > 0
+                                ? `Downloading v${nativeUpdate?.version ?? updateResult?.latest_version ?? ''}…`
+                                : 'Connecting to GitHub Releases…'}
+                          </span>
+                          {updateProgress && !updateProgress.finished && updateProgress.downloaded > 0 && (
+                            <span>
+                              {formatBytes(updateProgress.downloaded)}
+                              {updateProgress.total && updateProgress.total > 0
+                                ? ` / ${formatBytes(updateProgress.total)}`
+                                : ''}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
                     {(updateResult?.release_notes || nativeUpdate?.body) && (
                       <pre className="update-release-notes">
                         {updateResult?.release_notes || nativeUpdate?.body}
