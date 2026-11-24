@@ -248,6 +248,11 @@ pub async fn add_album_assets(
     ApiJson(req): ApiJson<AlbumAssetsRequest>,
 ) -> Result<Json<AddedCountResponse>, AppError> {
     ensure_contributor(&rbac)?;
+    if req.asset_ids.len() > 2_000 {
+        return Err(AppError::validation(
+            "asset_ids cannot exceed 2000 items per request.",
+        ));
+    }
     let user_id = rbac.auth.user.id;
     let role = rbac.auth.user.role;
     let scope = rbac.scope;
@@ -280,6 +285,11 @@ pub async fn remove_album_assets(
     ApiJson(req): ApiJson<AlbumAssetsRequest>,
 ) -> Result<Json<RemovedCountResponse>, AppError> {
     ensure_contributor(&rbac)?;
+    if req.asset_ids.len() > 2_000 {
+        return Err(AppError::validation(
+            "asset_ids cannot exceed 2000 items per request.",
+        ));
+    }
     let user_id = rbac.auth.user.id;
     let role = rbac.auth.user.role;
     let scope = rbac.scope;
@@ -314,6 +324,11 @@ pub async fn replace_album_shares(
     if !auth.user.role.can_contribute() {
         return Err(AppError::forbidden(
             "Contributor or Administrator privileges are required to manage album shares.",
+        ));
+    }
+    if req.shares.len() > 500 {
+        return Err(AppError::validation(
+            "shares cannot exceed 500 entries per album.",
         ));
     }
     let user_id = auth.user.id;

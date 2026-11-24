@@ -127,6 +127,8 @@ fn is_hardware_encoder(enc: &str) -> bool {
 fn smoke_test_encoder(ffmpeg: &Path, encoder: &str) -> bool {
     let mut cmd = Command::new(ffmpeg);
     hide_console_window(&mut cmd);
+    // Probe at 256x256 with the same yuv420p/high/4.2 profile used by HLS so HW encoders with
+    // minimum frame sizes (e.g. NVENC/AMF rejecting 64x64) don't false-negative or false-positive.
     cmd.args([
         "-hide_banner",
         "-v",
@@ -134,11 +136,17 @@ fn smoke_test_encoder(ffmpeg: &Path, encoder: &str) -> bool {
         "-f",
         "lavfi",
         "-i",
-        "color=c=black:s=64x64:d=0.1",
+        "color=c=black:s=256x256:d=0.1",
         "-frames:v",
         "1",
+        "-pix_fmt",
+        "yuv420p",
         "-c:v",
         encoder,
+        "-profile:v",
+        "high",
+        "-level:v",
+        "4.2",
         "-f",
         "null",
         "-",
@@ -152,7 +160,7 @@ fn smoke_test_encoder(ffmpeg: &Path, encoder: &str) -> bool {
 
 fn probe_h264_encoder(ffmpeg: &Path) -> String {
     let preferred: &[&str] = if cfg!(target_os = "macos") {
-        &["h264_videotoolbox", "libopenh264", "libx264"]
+        &["h264_videotoolbox", "libx264", "libopenh264"]
     } else if cfg!(target_os = "windows") {
         &[
             "h264_nvenc",
@@ -374,7 +382,7 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
                 "-profile:v",
                 "high",
                 "-level:v",
-                "4.1",
+                "4.2",
                 "-b:v",
                 "6M",
                 "-maxrate",
@@ -411,10 +419,8 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
         }
     };
 
-    // Automatic software fallback if a hardware encoder fails at runtime (e.g. driver/profile limits).
-    if (!output.status.success() || !playlist_path.is_file())
-        && is_hardware_encoder(&caps.h264_encoder)
-    {
+    // Automatic software fallback if a hardware or non-libx264 encoder fails at runtime.
+    if (!output.status.success() || !playlist_path.is_file()) && caps.h264_encoder != "libx264" {
         if let Ok(fallback) = run_hls("libx264", initial_vf) {
             output = fallback;
         }
@@ -500,6 +506,103 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
     }
 
     Ok(total_bytes)
+}
+
+/// Transcodes a short Live Photo clip (`.mov` / HEVC) into a browser-universal H.264/AAC
+/// `-movflags +faststart` MP4 at `output_path` atomically.
+pub fn transcode_live_clip_to_mp4(src: &Path, output_path: &Path) -> Result<u64, MediaError> {
+    let caps = video_capabilities();
+    let Some(ffmpeg) = caps.ffmpeg_path.as_deref() else {
+        return Err(MediaError::ExternalTool {
+            tool: "ffmpeg",
+            message: "FFmpeg is not installed on this machine".to_string(),
+        });
+    };
+
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| MediaError::ExternalTool {
+            tool: "ffmpeg",
+            message: "Invalid live proxy output path".to_string(),
+        })?;
+    std::fs::create_dir_all(parent)?;
+    static LIVE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = LIVE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".live-tmp-{}-{seq}.mp4", std::process::id()));
+
+    let run_encode = |encoder: &str| {
+        let _ = std::fs::remove_file(&tmp_path);
+        let mut cmd = Command::new(ffmpeg);
+        hide_console_window(&mut cmd);
+        cmd.args(["-y", "-v", "error", "-i"])
+            .arg(src)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-sn",
+                "-dn",
+                "-vf",
+                "scale='trunc(iw/2)*2':'trunc(ih/2)*2',format=yuv420p",
+                "-c:v",
+                encoder,
+                "-profile:v",
+                "high",
+                "-level:v",
+                "4.2",
+                "-b:v",
+                "4M",
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+            ])
+            .arg(&tmp_path);
+        truongphoto_core::process::run_command_with_timeout(
+            &mut cmd,
+            std::time::Duration::from_secs(60),
+        )
+    };
+
+    let mut output = match run_encode(&caps.h264_encoder) {
+        Ok(out) => out,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(MediaError::Io(e));
+        }
+    };
+
+    if (!output.status.success() || !tmp_path.is_file()) && caps.h264_encoder != "libx264" {
+        if let Ok(fallback) = run_encode("libx264") {
+            output = fallback;
+        }
+    }
+
+    if !output.status.success() || !tmp_path.is_file() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(MediaError::ExternalTool {
+            tool: "ffmpeg",
+            message: if stderr.is_empty() {
+                "ffmpeg Live Photo MP4 transcode failed".to_string()
+            } else {
+                stderr
+            },
+        });
+    }
+
+    let size_bytes = std::fs::metadata(&tmp_path)?.len();
+    if let Err(e) = truongphoto_core::process::rename_with_windows_retry(&tmp_path, output_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(MediaError::Io(e));
+    }
+
+    Ok(size_bytes)
 }
 
 #[cfg(test)]

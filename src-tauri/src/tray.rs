@@ -45,8 +45,12 @@ pub fn is_allowed_navigation_url(url: &tauri::Url, bound_port: u16) -> bool {
     false
 }
 
-/// Unminimizes, shows, and focuses the `"main"` desktop window.
+/// Unminimizes, unhides (on macOS after Cmd+H), shows, and focuses the `"main"` desktop window.
 pub fn show_main_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -192,8 +196,9 @@ pub fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
             "quit" => {
                 if let Some(state) = app.try_state::<DesktopAppState>() {
                     state.trigger_shutdown();
+                } else {
+                    app.exit(0);
                 }
-                app.exit(0);
             }
             _ => {}
         })

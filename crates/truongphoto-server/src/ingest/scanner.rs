@@ -47,7 +47,7 @@ impl ScanCoordinator {
         }
     }
 
-    fn folder_lock(&self, folder_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn folder_lock(&self, folder_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.folder_locks.lock();
         map.entry(folder_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -415,15 +415,55 @@ async fn run_folder_scan(
 
     let fid_cleanup = folder.id.clone();
     let now_ms = Utc::now().timestamp_millis();
-    state
+    let default_paths_cleanup = state.default_paths.clone();
+    let faces_idx = Arc::clone(state.ai.faces_index());
+    let (cleanup_artifacts, cleanup_thumbs_dir, cleanup_cache_dir) = state
         .db
         .write(move |conn| {
-            repo::ingest::cleanup_missing_files(conn, &fid_cleanup, now_ms)?;
-            repo::folders::set_folder_last_scanned(conn, &fid_cleanup, now_ms)?;
-            repo::jobs::complete_job(conn, job_id, now_ms)?;
-            Ok(())
+            let tx = conn.transaction()?;
+            let settings = repo::settings::load_app_settings(&tx, &default_paths_cleanup)?;
+            let doomed_assets: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT af.asset_id
+                     FROM asset_files af
+                     WHERE af.folder_id = ?1
+                       AND af.is_missing = 1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM asset_files af2
+                           WHERE af2.asset_id = af.asset_id
+                             AND NOT (af2.folder_id = ?1 AND af2.is_missing = 1)
+                       )",
+                )?;
+                let rows = stmt
+                    .query_map(params![&fid_cleanup], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let artifacts =
+                crate::ingest::trash_gc::collect_artifacts_for_assets(&tx, &doomed_assets)?;
+            repo::ingest::cleanup_missing_files(&tx, &fid_cleanup, now_ms)?;
+            for pid in &artifacts.affected_people {
+                let _ =
+                    crate::routes::people::recompute_person_centroid(&tx, &faces_idx, pid, now_ms);
+            }
+            repo::folders::set_folder_last_scanned(&tx, &fid_cleanup, now_ms)?;
+            repo::jobs::complete_job(&tx, job_id, now_ms)?;
+            tx.commit()?;
+            Ok((
+                artifacts,
+                PathBuf::from(settings.thumbnails_dir),
+                PathBuf::from(settings.cache_dir),
+            ))
         })
         .await?;
+
+    crate::ingest::trash_gc::reap_cleanup_artifacts(
+        Arc::clone(&state.ai),
+        cleanup_thumbs_dir,
+        cleanup_cache_dir,
+        cleanup_artifacts,
+    )
+    .await;
 
     let _ = state.ws_tx.send(WsServerEvent::JobProgress {
         job_id,
@@ -537,13 +577,14 @@ pub async fn ingest_single_file(
     }
 
     let root_path = Path::new(&folder.root_path);
-    if let (Ok(canon_root), Ok(canon_file)) = (
+    let (Ok(canon_root), Ok(canon_file)) = (
         std::fs::canonicalize(root_path),
         std::fs::canonicalize(abs_path),
-    ) {
-        if !canon_file.starts_with(&canon_root) {
-            return Ok(None);
-        }
+    ) else {
+        return Ok(None);
+    };
+    if !canon_file.starts_with(&canon_root) {
+        return Ok(None);
     }
 
     let file_size = sym_meta.len();
@@ -622,7 +663,7 @@ async fn process_candidate_file(
         let new_rel = cand.rel_path.clone();
         let new_mtime = cand.mtime_ms;
         let now_ms = Utc::now().timestamp_millis();
-        let relinked_asset_id = state
+        match state
             .db
             .write(move |conn| {
                 repo::ingest::relink_moved_file(
@@ -634,8 +675,14 @@ async fn process_candidate_file(
                     now_ms,
                 )
             })
-            .await?;
-        return Ok(Some(relinked_asset_id));
+            .await
+        {
+            Ok(relinked_asset_id) => return Ok(Some(relinked_asset_id)),
+            // Another concurrent ingest/scan worker already relinked this missing row;
+            // fall through to normal ingestion rather than dropping or deleting the file.
+            Err(truongphoto_db::DbError::NotFound(_)) => {}
+            Err(err) => return Err(err.into()),
+        }
     }
 
     let Some(category) = classify_path(&cand.abs_path) else {

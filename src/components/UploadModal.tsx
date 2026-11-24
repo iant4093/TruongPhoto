@@ -23,13 +23,24 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const refreshSystemInfo = useAppStore((s) => s.refreshSystemInfo);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   const uploadingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [selectedCount, setSelectedCount] = useState(0);
   const [result, setResult] = useState<UploadResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const runUpload = useCallback(
     async (files: File[]) => {
@@ -43,8 +54,11 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
       try {
         const res = await uploadMediaFiles(files, {
-          onProgress: (pct) => setProgress(pct),
+          onProgress: (pct) => {
+            if (mountedRef.current) setProgress(pct);
+          },
         });
+        if (!mountedRef.current) return;
         setResult(res);
         setProgress(100);
         if (res.uploaded.length > 0) {
@@ -59,12 +73,13 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           notifyError(new Error(`${res.errors.length} file(s) failed to upload`));
         }
       } catch (err) {
+        if (!mountedRef.current) return;
         const msg = errorMessage(err);
         setError(msg);
         notifyError(err, 'Upload failed');
       } finally {
         uploadingRef.current = false;
-        setUploading(false);
+        if (mountedRef.current) setUploading(false);
       }
     },
     [bumpLibraryRevision, refreshFolders, refreshSystemInfo],
@@ -80,12 +95,13 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       return;
     }
 
+    dialogRef.current?.focus();
     const layer = pushEscapeLayer();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && isTopEscapeLayer(layer) && !uploading) {
+      if (event.key === 'Escape' && isTopEscapeLayer(layer) && !uploadingRef.current) {
         event.preventDefault();
         event.stopPropagation();
-        onClose();
+        onCloseRef.current();
       }
     };
     document.addEventListener('keydown', onKeyDown);
@@ -93,7 +109,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       document.removeEventListener('keydown', onKeyDown);
       popEscapeLayer(layer);
     };
-  }, [open, uploading, onClose]);
+  }, [open]);
 
   useEffect(() => {
     if (open && initialFiles.length > 0) {
@@ -111,6 +127,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       }}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         className="panel upload-modal stack"
         role="dialog"
         aria-modal="true"

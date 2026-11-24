@@ -296,6 +296,11 @@ pub async fn trash_assets(
     ApiJson(req): ApiJson<AssetIdsRequest>,
 ) -> Result<Json<TrashedCountResponse>, AppError> {
     ensure_contributor(&rbac)?;
+    if req.asset_ids.len() > 2_000 {
+        return Err(AppError::validation(
+            "asset_ids cannot exceed 2000 items per request.",
+        ));
+    }
     let scope = rbac.scope;
     let actor_id = rbac.auth.user.id;
     let now_ms = Utc::now().timestamp_millis();
@@ -316,6 +321,11 @@ pub async fn restore_trash(
     ApiJson(req): ApiJson<AssetIdsRequest>,
 ) -> Result<Json<RestoredCountResponse>, AppError> {
     ensure_contributor(&rbac)?;
+    if req.asset_ids.len() > 2_000 {
+        return Err(AppError::validation(
+            "asset_ids cannot exceed 2000 items per request.",
+        ));
+    }
     let scope = rbac.scope;
     let now_ms = Utc::now().timestamp_millis();
     let restored_count = state
@@ -338,6 +348,11 @@ pub async fn purge_trash(
         if ids.is_empty() {
             return Ok(Json(PurgeReport::default()));
         }
+        if ids.len() > 2_000 {
+            return Err(AppError::validation(
+                "asset_ids cannot exceed 2000 items per request.",
+            ));
+        }
         Some(ids)
     } else {
         return Err(AppError::validation(
@@ -356,6 +371,7 @@ pub async fn purge_trash(
         Path::new(&settings.thumbnails_dir),
         Path::new(&settings.cache_dir),
         &state.cache_mgr,
+        Some(&state.ai),
         target_ids.as_deref(),
     )
     .await?;

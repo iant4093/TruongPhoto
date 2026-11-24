@@ -9,6 +9,7 @@ const WINDOW_DURATION: Duration = Duration::from_secs(15 * 60);
 const STALE_BUCKET_AGE: Duration = Duration::from_secs(30 * 60);
 const FREE_ATTEMPTS: u32 = 5;
 const MAX_BACKOFF_SECS: u64 = 300;
+const MAX_BUCKETS: usize = 8_192;
 
 /// Rate-limiting bucket key derived from peer network identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -241,6 +242,18 @@ impl AuthRateLimiter {
     fn record_failure_scoped_at(&self, key: &ScopedBucketKey, now: Instant) -> Option<u64> {
         let mut buckets = self.buckets.lock();
         buckets.retain(|_, b| now.duration_since(b.last_attempt) < STALE_BUCKET_AGE);
+        if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(key) {
+            // Evict the oldest 25% of buckets to bound memory under spoofed-IP/key floods.
+            let mut entries: Vec<(ScopedBucketKey, Instant)> = buckets
+                .iter()
+                .map(|(k, v)| (k.clone(), v.last_attempt))
+                .collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let drop_n = (MAX_BUCKETS / 4).max(1);
+            for (old_k, _) in entries.into_iter().take(drop_n) {
+                buckets.remove(&old_k);
+            }
+        }
 
         let bucket = buckets.entry(key.clone()).or_insert_with(|| Bucket {
             failures: 0,

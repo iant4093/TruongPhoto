@@ -196,6 +196,12 @@ impl OrtRuntimeManager {
         map.values().filter(|slot| slot.lock().is_some()).count()
     }
 
+    /// Clears latched CPU-only fallback flags so hardware EPs are retried after model reinstall.
+    pub fn clear_cpu_fallbacks(&self) {
+        self.cpu_fallback_keys.lock().clear();
+        self.hw_ep_failed.store(false, Ordering::Release);
+    }
+
     /// Evicts any cached ONNX Runtime session idle for at least `max_idle`.
     pub fn evict_idle_sessions(&self, max_idle: Duration) -> usize {
         let slots: Vec<Arc<Mutex<Option<CachedSession>>>> =

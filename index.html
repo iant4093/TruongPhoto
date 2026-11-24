@@ -11,8 +11,16 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>TruongPhoto</title>
+    <style>
+      body {
+        background: #202020;
+      }
+      body.tauri-transparent {
+        background: transparent;
+      }
+    </style>
   </head>
-  <body style="background:#202020">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

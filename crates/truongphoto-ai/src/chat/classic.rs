@@ -1,4 +1,4 @@
-use crate::chat::schema::merge_router_plan;
+use crate::chat::schema::{merge_router_plan, shift_plan_dates_to_utc};
 use crate::chat::sidecar::{
     has_word, is_meta_library_question, plan_has_any_criteria, season_date_range_ms,
     strip_folder_count, strip_semantic_filler, try_apply_filter_removal,
@@ -76,7 +76,8 @@ impl ClassicChatRouter {
         }
 
         // 1. Clear / reset triggers & implicit new-topic detection.
-        let (mut cleared, after_clear) = extract_clear_trigger(&text);
+        let (explicit_cleared, after_clear) = extract_clear_trigger(&text);
+        let mut cleared = explicit_cleared;
         text = after_clear;
 
         // Implicit topic switch: "show me ...", "find ...", "search ..." starts a fresh search
@@ -131,11 +132,18 @@ impl ClassicChatRouter {
         text = after_ocr;
 
         // 3. Relative and absolute dates (must run BEFORE location extraction so `in 2024`
-        // or `in March 2025` is consumed as a date rather than a location).
-        let (date_range, after_dates) = extract_date_range(&text, input.current_date_utc);
+        // or `in March 2025` is consumed as a date rather than a location, while skipping tokens
+        // that match known people like "April"/"May"/"June" or known folder names like "Japan 2024").
+        let (date_range, after_dates) = extract_date_range(
+            &text,
+            input.current_date_utc,
+            &input.known_person_names,
+            &input.library.known_folders,
+        );
         if let Some((from_ms, to_ms)) = date_range {
-            turn.date_from_ms = Some(from_ms);
-            turn.date_to_ms = Some(to_ms);
+            turn.date_from_ms = from_ms;
+            turn.date_to_ms = to_ms;
+            shift_plan_dates_to_utc(&mut turn, input.tz_offset_minutes);
         }
         text = after_dates;
 
@@ -192,19 +200,26 @@ impl ClassicChatRouter {
         turn.max_faces = max_f;
         text = after_fc;
 
-        // 6. Known library lenses & cameras FIRST so focal/aperture tokens inside lens names
-        // (e.g., "FE 24-70mm F2.8 GM II") are matched intact before numeric EXIF extraction runs!
+        // 6. Known library lenses & known cameras FIRST so focal/aperture tokens inside lens/camera
+        // names (e.g., "FE 24-70mm F2.8 GM II") are matched intact before numeric EXIF extraction runs!
         let (lens, after_lens) = extract_known_lens(&text, &input.known_lenses);
         turn.lens_model = lens;
         text = after_lens;
 
-        let (camera, after_camera) = extract_camera(&text, &input.known_cameras);
-        turn.camera_model = camera;
-        text = after_camera;
+        let (known_camera, after_known_cam) = extract_known_camera(&text, &input.known_cameras);
+        turn.camera_model = known_camera;
+        text = after_known_cam;
 
-        // 7. EXIF filters (focal length, aperture, ISO, shutter speed) — run BEFORE location
-        // so `"shot at f/1.4"` or `"at 1/1000s"` or `"at ISO 3200"` is never misparsed as location!
+        // 7. EXIF filters (focal length, aperture, ISO, shutter speed) — run BEFORE generic
+        // camera phrasing & location so `"shot with over 100mm"`, `"shot with high ISO"`,
+        // `"shot at f/1.4"`, or `"at 2s"` are never misparsed as camera or location!
         text = extract_exif_filters(&text, &mut turn);
+
+        if turn.camera_model.is_none() {
+            let (fallback_cam, after_cam) = extract_camera_fallback(&text);
+            turn.camera_model = fallback_cam;
+            text = after_cam;
+        }
 
         // 8. Orientation & superlative sort cues.
         let (orient, after_orient) = extract_orientation(&text);
@@ -283,8 +298,10 @@ impl ClassicChatRouter {
         };
 
         // 15. Vague/exploratory browsing rescue when no explicit filter or semantic term survived.
+        // Check `!explicit_cleared` (NOT `!turn.clear_prior_filters`) so implicit topic switches like
+        // `"show me cool pics"` or `"show me my best photos"` after any prior turn still work!
         let mut merged = merge_router_plan(&base_prior, &turn);
-        if !plan_has_any_criteria(&merged) && !turn.clear_prior_filters {
+        if !plan_has_any_criteria(&merged) && !explicit_cleared {
             let wants_recent = [
                 "recent",
                 "latest",
@@ -566,15 +583,71 @@ impl StripSuffixWord for str {
 }
 
 type DateRangeBuilder = fn(NaiveDate, i32, u32) -> (NaiveDate, NaiveDate);
+type DateBounds = (Option<i64>, Option<i64>);
 
-fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>, String) {
+fn closed_date_range_ms(start: NaiveDate, end: NaiveDate) -> DateBounds {
+    let (s, e) = date_range_ms(start, end);
+    (Some(s), Some(e))
+}
+
+fn extract_date_range(
+    text: &str,
+    now_utc: DateTime<Utc>,
+    known_people: &[String],
+    known_folders: &[String],
+) -> (Option<DateBounds>, String) {
     let today = now_utc.date_naive();
     let year = today.year();
     let month = today.month();
     let lower = text.to_ascii_lowercase();
 
-    // 1. "last/past N days/weeks/months/years" (e.g., "last 30 days", "past 2 weeks", "last 2 years").
+    // 0a. Explicit ISO calendar date: `YYYY-MM-DD` (e.g., "photos from 2025-06-15").
     let tokens = tokenize_with_spans(text);
+    for &(tok, s0, e0) in &tokens {
+        let parts: Vec<&str> = tok.split('-').collect();
+        if parts.len() == 3 && parts[0].len() == 4 {
+            if let (Ok(y), Ok(m), Ok(d)) = (
+                parts[0].parse::<i32>(),
+                parts[1].parse::<u32>(),
+                parts[2].parse::<u32>(),
+            ) {
+                if (1970..=2100).contains(&y) {
+                    if let Some(date) = NaiveDate::from_ymd_opt(y, m, d) {
+                        let span_start = strip_optional_leading_prep(text, s0);
+                        return (
+                            Some(closed_date_range_ms(date, date)),
+                            remove_span(text, span_start, e0),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 0b. Explicit "<Month> <D>, <YYYY>" or "<Month> <D> <YYYY>" (e.g., "June 15, 2025").
+    for win in tokens.windows(3) {
+        let (w0, s0, _) = win[0];
+        let (w1, _, _) = win[1];
+        let (w2, _, e2) = win[2];
+        if let (Some(m_num), Some(y_num)) = (parse_month_name(w0), parse_year_token(w2)) {
+            let day_clean = w1
+                .trim_end_matches("st")
+                .trim_end_matches("nd")
+                .trim_end_matches("rd")
+                .trim_end_matches("th");
+            if let Ok(d_num) = day_clean.parse::<u32>() {
+                if let Some(date) = NaiveDate::from_ymd_opt(y_num, m_num, d_num) {
+                    let span_start = strip_optional_leading_prep(text, s0);
+                    return (
+                        Some(closed_date_range_ms(date, date)),
+                        remove_span(text, span_start, e2),
+                    );
+                }
+            }
+        }
+    }
+
+    // 1. "last/past N days/weeks/months/years" (e.g., "last 30 days", "past 2 weeks", "last 2 years").
     for win in tokens.windows(3) {
         let (w0, s0, _) = win[0];
         let (w1, _, _) = win[1];
@@ -594,7 +667,7 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                     if let Some(d_start) = start_opt {
                         let span_start = strip_optional_leading_prep(text, s0);
                         return (
-                            Some(date_range_ms(d_start, today)),
+                            Some(closed_date_range_ms(d_start, today)),
                             remove_span(text, span_start, e2),
                         );
                     }
@@ -623,11 +696,8 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                         _ => None,
                     };
                     if let Some(cutoff) = cutoff_opt {
-                        let start = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
-                        return (
-                            Some(date_range_ms(start, cutoff)),
-                            remove_span(text, s0, e3),
-                        );
+                        let (_, end_ms) = date_range_ms(cutoff, cutoff);
+                        return (Some((None, Some(end_ms))), remove_span(text, s0, e3));
                     }
                 }
             }
@@ -673,7 +743,7 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                     if let Some((d_start, d_end)) = range_opt {
                         let span_start = strip_optional_leading_prep(text, s0);
                         return (
-                            Some(date_range_ms(d_start, d_end)),
+                            Some(closed_date_range_ms(d_start, d_end)),
                             remove_span(text, span_start, e2),
                         );
                     }
@@ -683,10 +753,13 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
     }
 
     // 1d. Named weekday ("last Friday", "on Monday") so it never leaks into `location_query`.
+    // Guard "on sun" (celestial sun, not Sunday); abbreviated "sun" only matches with "last".
     for win in tokens.windows(2) {
         let (w0, s0, _) = win[0];
         let (w1, _, e1) = win[1];
-        if w0.eq_ignore_ascii_case("last") || w0.eq_ignore_ascii_case("on") {
+        let is_last = w0.eq_ignore_ascii_case("last");
+        let is_on = w0.eq_ignore_ascii_case("on");
+        if is_last || is_on {
             let target_wd = match w1.to_ascii_lowercase().as_str() {
                 "monday" | "mon" => Some(chrono::Weekday::Mon),
                 "tuesday" | "tue" | "tues" => Some(chrono::Weekday::Tue),
@@ -694,7 +767,8 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                 "thursday" | "thu" | "thurs" => Some(chrono::Weekday::Thu),
                 "friday" | "fri" => Some(chrono::Weekday::Fri),
                 "saturday" | "sat" => Some(chrono::Weekday::Sat),
-                "sunday" | "sun" => Some(chrono::Weekday::Sun),
+                "sunday" => Some(chrono::Weekday::Sun),
+                "sun" if is_last => Some(chrono::Weekday::Sun),
                 _ => None,
             };
             if let Some(wd) = target_wd {
@@ -707,7 +781,7 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                 let day = today - ChronoDuration::days(diff);
                 let span_start = strip_optional_leading_prep(text, s0);
                 return (
-                    Some(date_range_ms(day, day)),
+                    Some(closed_date_range_ms(day, day)),
                     remove_span(text, span_start, e1),
                 );
             }
@@ -715,24 +789,33 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
     }
 
     // 1e. Year ranges: "from 2023 to 2025", "2023 to 2025", "2023-2025".
+    // Skip ISO numeric ranges like "ISO 1600 to 2000" or "ISO 2000-2048".
     for win in tokens.windows(3) {
         let (w0, s0, _) = win[0];
         let (w1, _, _) = win[1];
         let (w2, _, e2) = win[2];
         if w1.eq_ignore_ascii_case("to") {
+            let before = text[..s0].trim_end();
+            if before.strip_suffix_ci_word("iso").is_some() || before.ends_with("iso") {
+                continue;
+            }
             if let (Some(y1), Some(y2)) = (parse_year_token(w0), parse_year_token(w2)) {
                 let (lo, hi) = if y1 <= y2 { (y1, y2) } else { (y2, y1) };
                 let start = NaiveDate::from_ymd_opt(lo, 1, 1).unwrap();
                 let end = NaiveDate::from_ymd_opt(hi, 12, 31).unwrap();
                 let span_start = strip_optional_leading_prep(text, s0);
                 return (
-                    Some(date_range_ms(start, end)),
+                    Some(closed_date_range_ms(start, end)),
                     remove_span(text, span_start, e2),
                 );
             }
         }
     }
     for &(tok, s0, e0) in &tokens {
+        let before = text[..s0].trim_end();
+        if before.strip_suffix_ci_word("iso").is_some() || before.ends_with("iso") {
+            continue;
+        }
         if let Some((lhs, rhs)) = tok.split_once('-') {
             if let (Some(y1), Some(y2)) = (parse_year_token(lhs), parse_year_token(rhs)) {
                 let (lo, hi) = if y1 <= y2 { (y1, y2) } else { (y2, y1) };
@@ -740,7 +823,7 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                 let end = NaiveDate::from_ymd_opt(hi, 12, 31).unwrap();
                 let span_start = strip_optional_leading_prep(text, s0);
                 return (
-                    Some(date_range_ms(start, end)),
+                    Some(closed_date_range_ms(start, end)),
                     remove_span(text, span_start, e0),
                 );
             }
@@ -762,7 +845,10 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
             let (lo, hi) = if y1 <= y2 { (y1, y2) } else { (y2, y1) };
             let start = NaiveDate::from_ymd_opt(lo, 1, 1).unwrap();
             let end = NaiveDate::from_ymd_opt(hi, 12, 31).unwrap();
-            return (Some(date_range_ms(start, end)), remove_span(text, s, b_end));
+            return (
+                Some(closed_date_range_ms(start, end)),
+                remove_span(text, s, b_end),
+            );
         }
         if let (Some(m1), Some(m2)) = (parse_month_name(a_tok), parse_month_name(b_tok)) {
             let (target_y, end_span) = if idx + 4 < tokens.len() {
@@ -778,13 +864,14 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
             let start = NaiveDate::from_ymd_opt(target_y, lo, 1).unwrap();
             let end = NaiveDate::from_ymd_opt(target_y, hi, days_in_month(target_y, hi)).unwrap();
             return (
-                Some(date_range_ms(start, end)),
+                Some(closed_date_range_ms(start, end)),
                 remove_span(text, s, end_span),
             );
         }
     }
 
-    // 3. "before <Month/YYYY>" / "after <Month/YYYY>" / "since <Month/YYYY>".
+    // 3. "before <Month/YYYY>" / "after <Month/YYYY>" / "since <Month/YYYY>" (open-ended bounds
+    // so multi-turn `"before 2025"` -> `"after 2023"` merges cleanly into `[2024..2024]`).
     for (idx, &(w, s, _)) in tokens.iter().enumerate() {
         let is_before = w.eq_ignore_ascii_case("before");
         let is_after_exclusive = w.eq_ignore_ascii_case("after");
@@ -794,22 +881,20 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
         }
         let (next_w, _, next_e) = tokens[idx + 1];
         if let Some(y_num) = parse_year_token(next_w) {
-            let (start, end) = if is_before {
-                (
-                    NaiveDate::from_ymd_opt(1900, 1, 1).unwrap(),
-                    NaiveDate::from_ymd_opt(y_num - 1, 12, 31).unwrap(),
-                )
+            let bounds = if is_before {
+                let end = NaiveDate::from_ymd_opt(y_num - 1, 12, 31).unwrap();
+                let (_, end_ms) = date_range_ms(end, end);
+                (None, Some(end_ms))
             } else if is_after_exclusive {
                 let s_d = NaiveDate::from_ymd_opt(y_num + 1, 1, 1).unwrap();
-                (s_d, today.max(s_d))
+                let (start_ms, _) = date_range_ms(s_d, s_d);
+                (Some(start_ms), None)
             } else {
                 let s_d = NaiveDate::from_ymd_opt(y_num, 1, 1).unwrap();
-                (s_d, today.max(s_d))
+                let (start_ms, _) = date_range_ms(s_d, s_d);
+                (Some(start_ms), None)
             };
-            return (
-                Some(date_range_ms(start, end)),
-                remove_span(text, s, next_e),
-            );
+            return (Some(bounds), remove_span(text, s, next_e));
         }
         if let Some(m_num) = parse_month_name(next_w) {
             let (target_y, span_end) = if idx + 2 < tokens.len() {
@@ -821,12 +906,11 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
             } else {
                 (if m_num <= month { year } else { year - 1 }, next_e)
             };
-            let (start, end) = if is_before {
+            let bounds = if is_before {
                 let first = NaiveDate::from_ymd_opt(target_y, m_num, 1).unwrap();
-                (
-                    NaiveDate::from_ymd_opt(1900, 1, 1).unwrap(),
-                    first.pred_opt().unwrap_or(first),
-                )
+                let end = first.pred_opt().unwrap_or(first);
+                let (_, end_ms) = date_range_ms(end, end);
+                (None, Some(end_ms))
             } else if is_after_exclusive {
                 let (ny, nm) = if m_num == 12 {
                     (target_y + 1, 1)
@@ -834,15 +918,14 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                     (target_y, m_num + 1)
                 };
                 let s_d = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap();
-                (s_d, today.max(s_d))
+                let (start_ms, _) = date_range_ms(s_d, s_d);
+                (Some(start_ms), None)
             } else {
                 let s_d = NaiveDate::from_ymd_opt(target_y, m_num, 1).unwrap();
-                (s_d, today.max(s_d))
+                let (start_ms, _) = date_range_ms(s_d, s_d);
+                (Some(start_ms), None)
             };
-            return (
-                Some(date_range_ms(start, end)),
-                remove_span(text, s, span_end),
-            );
+            return (Some(bounds), remove_span(text, s, span_end));
         }
     }
 
@@ -948,7 +1031,7 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
             let span_start = strip_optional_leading_prep(text, start);
             let (d_start, d_end) = calc(today, year, month);
             return (
-                Some(date_range_ms(d_start, d_end)),
+                Some(closed_date_range_ms(d_start, d_end)),
                 remove_span(text, span_start, end),
             );
         }
@@ -971,26 +1054,41 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
             let cy_str = cy.to_string();
             let (_, next) = strip_phrase_ci(&cleaned, &cy_str);
             cleaned = next;
-            return (Some(date_range_ms(d_start, d_end)), cleaned);
+            return (Some(closed_date_range_ms(d_start, d_end)), cleaned);
         }
     }
 
     // 6. Standalone seasons (+ optional explicit year like "summer 2025").
-    if let Some((from_ms, to_ms)) = season_date_range_ms(&lower, now_utc) {
-        let mut cleaned = text.to_string();
-        for s_word in ["summer", "spring", "autumn", "fall", "winter"] {
-            if let Some((start, end)) = find_word_phrase_ci(&cleaned, s_word) {
-                let span_start = strip_optional_leading_prep(&cleaned, start);
-                cleaned = remove_span(&cleaned, span_start, end);
-                break;
+    // Guard non-season visual compounds like "hot spring", "free fall", "waterfall".
+    let is_non_season_compound = [
+        "hot spring",
+        "hot springs",
+        "spring water",
+        "bed spring",
+        "coil spring",
+        "free fall",
+        "water fall",
+        "waterfall",
+    ]
+    .iter()
+    .any(|p| lower.contains(p));
+    if !is_non_season_compound {
+        if let Some((from_ms, to_ms)) = season_date_range_ms(&lower, now_utc) {
+            let mut cleaned = text.to_string();
+            for s_word in ["summer", "spring", "autumn", "fall", "winter"] {
+                if let Some((start, end)) = find_word_phrase_ci(&cleaned, s_word) {
+                    let span_start = strip_optional_leading_prep(&cleaned, start);
+                    cleaned = remove_span(&cleaned, span_start, end);
+                    break;
+                }
             }
+            if let Some(ey) = crate::chat::sidecar::extract_explicit_year(&lower) {
+                let ey_str = ey.to_string();
+                let (_, next) = strip_phrase_ci(&cleaned, &ey_str);
+                cleaned = next;
+            }
+            return (Some((Some(from_ms), Some(to_ms))), cleaned);
         }
-        if let Some(ey) = crate::chat::sidecar::extract_explicit_year(&lower) {
-            let ey_str = ey.to_string();
-            let (_, next) = strip_phrase_ci(&cleaned, &ey_str);
-            cleaned = next;
-        }
-        return (Some((from_ms, to_ms)), cleaned);
     }
 
     // 7. "<Month> <YYYY>" e.g. "March 2025".
@@ -1002,20 +1100,33 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
             let start = NaiveDate::from_ymd_opt(y_num, m_num, 1).unwrap();
             let end = NaiveDate::from_ymd_opt(y_num, m_num, days_in_month(y_num, m_num)).unwrap();
             return (
-                Some(date_range_ms(start, end)),
+                Some(closed_date_range_ms(start, end)),
                 remove_span(text, span_start, *e2),
             );
         }
     }
 
     // 8. "in YYYY" / "from YYYY" / "during YYYY" or standalone 4-digit year.
-    // Skip 4-digit numbers preceded by "iso" or "1/" (e.g. "ISO 2000", "1/2000").
+    // Skip 4-digit numbers preceded by "iso" or "1/" (e.g. "ISO 2000", "1/2000"), or part of a
+    // known folder name present in the query (e.g. "Japan 2024" / "CS Grad Pics 2026").
+    let folder_contains_span = |s: usize, e: usize| -> bool {
+        known_folders.iter().any(|f| {
+            let name = strip_folder_count(f);
+            !name.is_empty()
+                && find_word_phrase_ci(text, name).is_some_and(|(fs, fe)| s >= fs && e <= fe)
+        })
+    };
     for (word, s, e) in &tokens {
         if let Some(y_num) = parse_year_token(word) {
             let before = text[..*s].trim_end();
             if before.ends_with('/')
                 || before.strip_suffix_ci_word("iso").is_some()
                 || before.ends_with("iso")
+                || before.strip_suffix_ci_word("to").is_some()
+                    && before[..before.len().saturating_sub(2)]
+                        .to_ascii_lowercase()
+                        .contains("iso")
+                || folder_contains_span(*s, *e)
             {
                 continue;
             }
@@ -1023,15 +1134,23 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
             let start = NaiveDate::from_ymd_opt(y_num, 1, 1).unwrap();
             let end = NaiveDate::from_ymd_opt(y_num, 12, 31).unwrap();
             return (
-                Some(date_range_ms(start, end)),
+                Some(closed_date_range_ms(start, end)),
                 remove_span(text, span_start, *e),
             );
         }
     }
 
     // 9. Standalone month name ("in June", "October") -> most recent occurrence of that month.
+    // Skip tokens matching a known person name (e.g. "photos of April", "photos of May", "June").
     for (word, s, e) in &tokens {
         if let Some(m_num) = parse_month_name(word) {
+            let matches_known_person = known_people.iter().any(|p| {
+                let first = p.split_whitespace().next().unwrap_or(p);
+                first.eq_ignore_ascii_case(word) || p.eq_ignore_ascii_case(word)
+            });
+            if matches_known_person || folder_contains_span(*s, *e) {
+                continue;
+            }
             let prefix_before = text[..*s].trim_end();
             let has_prep = ["in", "during", "from", "of", "on"]
                 .iter()
@@ -1046,7 +1165,7 @@ fn extract_date_range(text: &str, now_utc: DateTime<Utc>) -> (Option<(i64, i64)>
                 NaiveDate::from_ymd_opt(target_year, m_num, days_in_month(target_year, m_num))
                     .unwrap();
             return (
-                Some(date_range_ms(start, end)),
+                Some(closed_date_range_ms(start, end)),
                 remove_span(text, span_start, *e),
             );
         }
@@ -1435,10 +1554,10 @@ fn extract_exif_filters(text: &str, turn: &mut RouterPlan) -> String {
             continue;
         }
         let rest = &ap_scan[idx + 1..];
-        let (num_offset, num_slice) = if let Some(after_slash) = rest.strip_prefix('/') {
-            (idx + 2, after_slash)
+        let (has_slash, num_offset, num_slice) = if let Some(after_slash) = rest.strip_prefix('/') {
+            (true, idx + 2, after_slash)
         } else if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            (idx + 1, rest)
+            (false, idx + 1, rest)
         } else {
             continue;
         };
@@ -1448,9 +1567,50 @@ fn extract_exif_filters(text: &str, turn: &mut RouterPlan) -> String {
         if num_len == 0 {
             continue;
         }
-        if let Ok(val) = num_slice[..num_len].parse::<f64>() {
+        let end = num_offset + num_len;
+        // Guard against non-aperture tokens like "F14A", "F1 car", "F16 jet", "F22 raptor".
+        if ap_scan[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric())
+        {
+            continue;
+        }
+        let num_str = &num_slice[..num_len];
+        if !has_slash && !num_str.contains('.') {
+            let next_word = ap_scan[end..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase();
+            if matches!(
+                next_word.as_str(),
+                "car"
+                    | "cars"
+                    | "race"
+                    | "racing"
+                    | "grand"
+                    | "prix"
+                    | "driver"
+                    | "track"
+                    | "jet"
+                    | "jets"
+                    | "fighter"
+                    | "raptor"
+                    | "eagle"
+                    | "hornet"
+                    | "tomcat"
+                    | "falcon"
+                    | "plane"
+                    | "aircraft"
+                    | "key"
+            ) {
+                continue;
+            }
+        }
+        if let Ok(val) = num_str.parse::<f64>() {
             if (0.7..=64.0).contains(&val) {
-                let end = num_offset + num_len;
                 let prefix = &ap_scan[..idx];
                 let after = ap_scan[end..].trim_start().to_ascii_lowercase();
                 if has_upper_word(prefix)
@@ -1593,6 +1753,47 @@ fn extract_exif_filters(text: &str, turn: &mut RouterPlan) -> String {
                         let span_start = strip_optional_leading_prep(&current, idx);
                         current = remove_span(&current, span_start, end);
                         sh_found = true;
+                    }
+                }
+            }
+        }
+    }
+    if !sh_found {
+        // Decimal or integer second shutter speeds (e.g. "2s", "0.5s", "1.5s", "2 sec").
+        let sec_scan = current.clone();
+        for (tok, s0, e0) in tokenize_with_spans(&sec_scan) {
+            let num_part = tok
+                .strip_suffix('s')
+                .or_else(|| tok.strip_suffix('S'))
+                .filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit() || c == '.'));
+            if let Some(n_str) = num_part {
+                if let Ok(sec) = n_str.parse::<f64>() {
+                    if (0.1..=600.0).contains(&sec) {
+                        let prefix = &sec_scan[..s0];
+                        let tail = sec_scan[e0..].trim_start().to_ascii_lowercase();
+                        if has_upper_word(prefix) || tail.starts_with("or faster") {
+                            turn.shutter_speed_max_sec = Some(sec);
+                        } else if has_lower_word(prefix)
+                            || tail.starts_with("or slower")
+                            || tail.starts_with("or longer")
+                        {
+                            turn.shutter_speed_min_sec = Some(sec);
+                        } else {
+                            turn.shutter_speed_min_sec = Some(sec);
+                            turn.shutter_speed_max_sec = Some(sec);
+                        }
+                        let mut end_span = e0;
+                        if tail.starts_with("shutter") {
+                            if let Some(sh_pos) =
+                                sec_scan[e0..].to_ascii_lowercase().find("shutter")
+                            {
+                                end_span = e0 + sh_pos + "shutter".len();
+                            }
+                        }
+                        let span_start = strip_optional_leading_prep(&current, s0);
+                        current = remove_span(&current, span_start, end_span);
+                        sh_found = true;
+                        break;
                     }
                 }
             }
@@ -1836,7 +2037,7 @@ fn extract_known_lens(text: &str, known_lenses: &[String]) -> (Option<String>, S
     (None, text.to_string())
 }
 
-fn extract_camera(text: &str, known_cameras: &[String]) -> (Option<String>, String) {
+fn extract_known_camera(text: &str, known_cameras: &[String]) -> (Option<String>, String) {
     // 1. Direct match against known cameras in the user's library (longest-first).
     let mut sorted: Vec<&str> = known_cameras
         .iter()
@@ -1858,10 +2059,25 @@ fn extract_camera(text: &str, known_cameras: &[String]) -> (Option<String>, Stri
             return (Some((*cam).to_string()), remove_span(text, span_start, end));
         }
     }
+    (None, text.to_string())
+}
 
+fn extract_camera_fallback(text: &str) -> (Option<String>, String) {
     // 2. Explicit camera phrasing ("shot on Fujifilm X100VI", "taken on my iPhone", "shot with Sony").
+    // Runs AFTER `extract_exif_filters` so EXIF phrases like "shot with over 100mm" or "shot with
+    // high ISO" have already been consumed.
     for trigger in ["shot on", "shot with", "taken on", "taken with", "camera"] {
         if let Some((start, end)) = find_word_phrase_ci(text, trigger) {
+            if trigger == "camera" {
+                let before = text[..start].trim_end().to_ascii_lowercase();
+                if before.ends_with("at")
+                    || before.ends_with("at the")
+                    || before.ends_with("into the")
+                    || before.ends_with("to the")
+                {
+                    continue;
+                }
+            }
             let after = text[end..].trim_start();
             let after_offset = text.len() - after.len();
             let (raw_cam, consumed) = take_clause_tokens(after, 4, CLAUSE_STOP_BOUNDARIES);
@@ -1873,16 +2089,43 @@ fn extract_camera(text: &str, known_cameras: &[String]) -> (Option<String>, Stri
                 }
             }
             if !cam.is_empty() && !cam.eq_ignore_ascii_case("phone") {
-                // Never hijack EXIF focal/aperture/ISO/shutter phrases ("shot with 56mm f/1.4",
-                // "taken at ISO 3200") as a camera model!
                 let first_tok = cam
                     .split_whitespace()
                     .next()
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                let looks_like_exif = first_tok.ends_with("mm")
+                let looks_like_exif_or_non_cam = first_tok.ends_with("mm")
                     || first_tok.starts_with("f/")
                     || first_tok == "iso"
+                    || matches!(
+                        first_tok.as_str(),
+                        "over"
+                            | "under"
+                            | "above"
+                            | "below"
+                            | "more"
+                            | "less"
+                            | "high"
+                            | "low"
+                            | "wide"
+                            | "narrow"
+                            | "slow"
+                            | "fast"
+                            | "long"
+                            | "short"
+                            | "telephoto"
+                            | "ultrawide"
+                            | "macro"
+                            | "smiling"
+                            | "looking"
+                            | "lens"
+                            | "flash"
+                    )
+                    || (first_tok.starts_with("iso")
+                        && first_tok[3..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit()))
                     || (first_tok.starts_with('f')
                         && first_tok[1..]
                             .chars()
@@ -1892,7 +2135,7 @@ fn extract_camera(text: &str, known_cameras: &[String]) -> (Option<String>, Stri
                     || first_tok
                         .chars()
                         .all(|c| c.is_ascii_digit() || c == '-' || c == '.');
-                if looks_like_exif {
+                if looks_like_exif_or_non_cam {
                     continue;
                 }
                 return (
@@ -2472,6 +2715,7 @@ mod tests {
                 ..Default::default()
             },
             current_date_utc: Utc.with_ymd_and_hms(2026, 11, 22, 12, 0, 0).unwrap(),
+            tz_offset_minutes: None,
         }
     }
 

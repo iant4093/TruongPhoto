@@ -321,8 +321,24 @@ export const MapView: React.FC = () => {
     }
   }, []);
 
-  const handleFitAll = useCallback(() => {
+  const handleFitAll = useCallback(async () => {
     const map = mapInstanceRef.current;
+    try {
+      const worldRes = await getMapClusters(INITIAL_BBOX);
+      const worldClusters = worldRes.clusters;
+      if (map && worldClusters.length > 0) {
+        const bounds = new LngLatBounds();
+        for (const c of worldClusters) {
+          bounds.extend([c.min_lon, c.min_lat]);
+          bounds.extend([c.max_lon, c.max_lat]);
+        }
+        setClusters(worldClusters);
+        map.fitBounds(bounds, { padding: 64, maxZoom: 12 });
+        return;
+      }
+    } catch {
+      // Fall through to current clusters or world view
+    }
     if (map && clusters.length > 0) {
       const bounds = new LngLatBounds();
       for (const c of clusters) {
@@ -469,8 +485,9 @@ export const MapView: React.FC = () => {
   const modeLabel = formatModePillLabel(config);
   const totalGeotagged = config?.total_geotagged ?? 0;
 
+  const hasSelectedCluster = Boolean(selectedCluster);
   useEffect(() => {
-    if (!selectedCluster) return;
+    if (!hasSelectedCluster) return;
     const layer = pushEscapeLayer();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && isTopEscapeLayer(layer)) {
@@ -485,7 +502,7 @@ export const MapView: React.FC = () => {
       document.removeEventListener('keydown', onKeyDown);
       popEscapeLayer(layer);
     };
-  }, [selectedCluster]);
+  }, [hasSelectedCluster]);
 
   return (
     <div className="map-view-shell">

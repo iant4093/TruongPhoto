@@ -30,7 +30,7 @@ use truongphoto_media::{
     decode::{generate_preview_webp, generate_thumb_and_histogram},
     metadata::{extract_livp_entry_bytes, inspect_livp},
     raw::demosaic_raw_to_jpeg,
-    video::transcode_to_hls,
+    video::{transcode_live_clip_to_mp4, transcode_to_hls},
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -39,6 +39,12 @@ pub struct OriginalQuery {
     pub file_role: Option<String>,
     pub mode: Option<String>,
     pub download: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct LiveVideoQuery {
+    pub raw: Option<String>,
 }
 
 fn asset_prefix(asset_id: &str) -> &str {
@@ -160,15 +166,7 @@ fn sanitize_download_filename(rel_path: &str) -> String {
 }
 
 fn atomic_write_bytes_sync(dest: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| std::io::Error::other("missing parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut tmp, bytes)?;
-    std::io::Write::flush(&mut tmp)?;
-    tmp.persist(dest).map_err(|e| e.error)?;
-    Ok(())
+    truongphoto_core::process::atomic_write_bytes(dest, bytes)
 }
 
 fn check_etag_match(req_headers: &HeaderMap, etag: &str) -> bool {
@@ -761,8 +759,13 @@ pub async fn get_live_video(
     rbac: RbacContext,
     State(state): State<Arc<AppState>>,
     AxumPath(asset_id): AxumPath<String>,
+    Query(query): Query<LiveVideoQuery>,
     req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let wants_raw = query
+        .raw
+        .as_deref()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let include_trashed = rbac.auth.user.role.can_contribute();
     let scope = rbac.scope.clone();
     let aid_lookup = asset_id.clone();
@@ -785,12 +788,80 @@ pub async fn get_live_video(
     let (_summary, files, folder, _) =
         asset_opt.ok_or_else(|| AppError::not_found("Asset not found."))?;
 
-    // 1. Apple Live Photo companion video file
+    // 1. Apple Live Photo companion video file (transcode non-MP4 `.mov` to universal H.264/AAC MP4
+    // unless `?raw=1` is requested, with seamless fallback to the raw clip when FFmpeg is absent).
     if let Some(live_file) = files
         .iter()
         .find(|f| f.file_role == FileRole::LiveVideo && !f.is_missing)
     {
         let src_path = resolve_asset_file_path(&folder, live_file)?;
+        if !wants_raw && !live_file.extension.eq_ignore_ascii_case("mp4") {
+            let cache_dir = PathBuf::from(&settings.cache_dir);
+            let p0 = asset_prefix(&asset_id);
+            let rel_dir = format!("live/{p0}/{asset_id}");
+            let mp4_path = cache_dir.join(&rel_dir).join("live.mp4");
+            let cache_key = format!("live_proxy_mp4:{asset_id}");
+
+            let mut proxy_ready = mp4_path.is_file();
+            if proxy_ready {
+                state.cache_mgr.touch_throttled(&cache_key).await;
+            } else {
+                let _guard = state.cache_mgr.singleflight_lock(&cache_key).await;
+                if mp4_path.is_file() {
+                    state.cache_mgr.touch_throttled(&cache_key).await;
+                    proxy_ready = true;
+                } else {
+                    let src_clone = src_path.clone();
+                    let dst_clone = mp4_path.clone();
+                    let _permit = state.cache_mgr.acquire_hls_transcode_permit().await;
+                    if let Ok(Ok(size_bytes)) = tokio::task::spawn_blocking(move || {
+                        transcode_live_clip_to_mp4(&src_clone, &dst_clone)
+                    })
+                    .await
+                    {
+                        let now_ms = Utc::now().timestamp_millis();
+                        let _ = state
+                            .cache_mgr
+                            .record_and_evict(
+                                LruCacheEntry {
+                                    cache_key,
+                                    asset_id: Some(asset_id.clone()),
+                                    kind: CacheEntryKind::LiveProxy,
+                                    rel_path: rel_dir,
+                                    size_bytes,
+                                    last_accessed_ms: now_ms,
+                                    created_at_ms: now_ms,
+                                },
+                                &cache_dir,
+                                settings.cache_limit_gb,
+                            )
+                            .await;
+                        proxy_ready = mp4_path.is_file();
+                    }
+                }
+            }
+
+            if proxy_ready {
+                if let Ok(meta) = tokio::fs::metadata(&mp4_path).await {
+                    let etag = format!("\"{}-live-mp4-{}\"", live_file.id, meta.len());
+                    return serve_file_slice_with_range(
+                        ServeSliceOptions {
+                            path: &mp4_path,
+                            slice_offset: 0,
+                            slice_len: meta.len(),
+                            content_type: "video/mp4",
+                            etag: &etag,
+                            cache_control: Some("private, max-age=86400"),
+                            download_filename: None,
+                            extra_header: None,
+                        },
+                        &req_headers,
+                    )
+                    .await;
+                }
+            }
+        }
+
         let meta = tokio::fs::metadata(&src_path)
             .await
             .map_err(|e| AppError::internal(format!("Failed to stat live video: {e}")))?;
@@ -825,6 +896,7 @@ pub async fn get_live_video(
         let rel_dir = format!("live/{p0}/{asset_id}");
         let entry_dir = cache_dir.join(&rel_dir);
         let video_cache_path = entry_dir.join("live.mov");
+        let mp4_cache_path = entry_dir.join("live.mp4");
         let mime_cache_path = entry_dir.join("mime.txt");
         let cache_key = format!("live_proxy:{asset_id}");
 
@@ -842,6 +914,7 @@ pub async fn get_live_video(
                     .unwrap_or_else(|_| "video/quicktime".to_string())
             } else {
                 let vid_out = video_cache_path.clone();
+                let mp4_out = mp4_cache_path.clone();
                 let mime_out = mime_cache_path.clone();
                 let (bytes_len, mime) = tokio::task::spawn_blocking(move || {
                     let entries = inspect_livp(&src_path)?;
@@ -859,10 +932,13 @@ pub async fn get_live_video(
                     // Write MIME sidecar BEFORE `live.mov` so concurrent cache hits never miss it.
                     atomic_write_bytes_sync(&mime_out, mime.as_bytes())?;
                     atomic_write_bytes_sync(&vid_out, &v_bytes)?;
-                    Ok::<_, truongphoto_media::MediaError>((
-                        (v_bytes.len() + mime.len()) as u64,
-                        mime.to_string(),
-                    ))
+                    let mut total = (v_bytes.len() + mime.len()) as u64;
+                    if mime != "video/mp4" {
+                        if let Ok(mp4_len) = transcode_live_clip_to_mp4(&vid_out, &mp4_out) {
+                            total = total.saturating_add(mp4_len);
+                        }
+                    }
+                    Ok::<_, truongphoto_media::MediaError>((total, mime.to_string()))
                 })
                 .await
                 .map_err(|e| AppError::internal(format!("livp unpack panicked: {e}")))?
@@ -891,16 +967,23 @@ pub async fn get_live_video(
             }
         };
 
-        let meta = tokio::fs::metadata(&video_cache_path)
+        let (serve_path, serve_mime, suffix) =
+            if !wants_raw && mime_type.trim() != "video/mp4" && mp4_cache_path.is_file() {
+                (&mp4_cache_path, "video/mp4", "livp-mp4")
+            } else {
+                (&video_cache_path, mime_type.trim(), "livp-video")
+            };
+
+        let meta = tokio::fs::metadata(serve_path)
             .await
             .map_err(|e| AppError::internal(format!("Failed to stat live cache: {e}")))?;
-        let etag = format!("\"{asset_id}-livp-video-{}\"", meta.len());
+        let etag = format!("\"{asset_id}-{suffix}-{}\"", meta.len());
         return serve_file_slice_with_range(
             ServeSliceOptions {
-                path: &video_cache_path,
+                path: serve_path,
                 slice_offset: 0,
                 slice_len: meta.len(),
-                content_type: mime_type.trim(),
+                content_type: serve_mime,
                 etag: &etag,
                 cache_control: Some("private, max-age=86400"),
                 download_filename: None,

@@ -22,7 +22,7 @@ import {
 } from '../lib/api';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
 import { formatBytes, formatRelativeTime, formatUptime } from '../lib/format';
-import { openExternalUrl } from '../lib/tauri';
+import { copyToClipboard, openExternalUrl } from '../lib/tauri';
 import { notifyError, notifyInfo, notifySuccess } from '../store/feedback';
 import { useAppStore } from '../store/useAppStore';
 import { AssetInspector } from './AssetInspector';
@@ -167,11 +167,11 @@ export const InspectorDrawer: React.FC<{
   };
 
   const handleCopyUrl = async (url: string) => {
-    try {
-      await navigator.clipboard?.writeText(url);
+    const ok = await copyToClipboard(url);
+    if (ok) {
       setCopiedUrl(url);
       window.setTimeout(() => setCopiedUrl((cur) => (cur === url ? null : cur)), 1800);
-    } catch {
+    } else {
       notifyInfo(url);
     }
   };
@@ -240,7 +240,7 @@ export const InspectorDrawer: React.FC<{
         </div>
       </div>
 
-      {showingAsset && selectedAssetId ? (
+      {open && showingAsset && selectedAssetId ? (
         <AssetInspector assetId={selectedAssetId} />
       ) : (
         <div className="property-inspector status-drawer-body">
@@ -444,7 +444,11 @@ export const InspectorDrawer: React.FC<{
                       type="button"
                       className="status-url-link"
                       title={entry.url}
-                      onClick={() => void openExternalUrl(entry.url)}
+                      onClick={() =>
+                        void openExternalUrl(entry.url).catch((err) =>
+                          notifyError(err, 'Could not open URL'),
+                        )
+                      }
                     >
                       <span className="status-url-label">{entry.label}</span>
                       <span className="status-url-text">{entry.url}</span>

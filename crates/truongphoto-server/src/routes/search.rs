@@ -30,12 +30,29 @@ struct PendingHit {
     ocr_snippet: Option<String>,
 }
 
+fn slice_has_score_variance(scores: impl Iterator<Item = f32>) -> bool {
+    let mut min_s = f32::INFINITY;
+    let mut max_s = f32::NEG_INFINITY;
+    for s in scores {
+        if s.is_finite() {
+            if s < min_s {
+                min_s = s;
+            }
+            if s > max_s {
+                max_s = s;
+            }
+        }
+    }
+    min_s.is_finite() && max_s.is_finite() && (max_s - min_s) > 1e-4
+}
+
 fn compare_sort_keys(
     sort_by: &str,
     a_id: &str,
     b_id: &str,
     a_score: f32,
     b_score: f32,
+    has_score_variance: bool,
     keys: &HashMap<String, repo::search::AssetSortKey>,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -73,11 +90,9 @@ fn compare_sort_keys(
     let primary = match sort_by {
         "best" => match (ka, kb) {
             (Some(a), Some(b)) => {
-                // When scores differ significantly (e.g. Hybrid semantic search "best sunset photos"),
-                // blend favorite/rating boost with semantic relevance instead of letting a low-scoring
-                // f/1.4 photo outrank a strong visual match.
-                let has_semantic_diff = (a_score - b_score).abs() > 1e-4;
-                if has_semantic_diff {
+                // Use a single slice-wide `has_score_variance` flag so `"best"` defines a strict
+                // total order (never violating transitivity across pairs in `sort_unstable_by`).
+                if has_score_variance {
                     let a_eff = a_score
                         + if a.is_favorite { 0.06 } else { 0.0 }
                         + (a.rating as f32) * 0.015;
@@ -168,8 +183,17 @@ async fn materialize_ocr_hits(
             .db
             .read(move |conn| repo::search::load_asset_sort_keys(conn, &scope_s, &all_ids))
             .await?;
+        let has_score_variance = slice_has_score_variance(ocr_hits.iter().map(|(_, s, _)| *s));
         ocr_hits.sort_unstable_by(|a, b| {
-            compare_sort_keys(&sort_norm, &a.0, &b.0, a.1, b.1, &sort_keys)
+            compare_sort_keys(
+                &sort_norm,
+                &a.0,
+                &b.0,
+                a.1,
+                b.1,
+                has_score_variance,
+                &sort_keys,
+            )
         });
     }
 
@@ -233,6 +257,17 @@ pub async fn search_library(
 const MAX_OFFSET: usize = 5_000;
 
 fn validate_search_request(req: &SearchRequest) -> Result<(), AppError> {
+    if req.person_ids.as_ref().is_some_and(|v| v.len() > 50)
+        || req
+            .exclude_person_ids
+            .as_ref()
+            .is_some_and(|v| v.len() > 50)
+        || req.tags.as_ref().is_some_and(|v| v.len() > 50)
+    {
+        return Err(AppError::validation(
+            "Filter arrays (person_ids, exclude_person_ids, tags) cannot exceed 50 items.",
+        ));
+    }
     for (name, val) in [
         ("focal_length_min_mm", req.focal_length_min_mm),
         ("focal_length_max_mm", req.focal_length_max_mm),
@@ -388,6 +423,7 @@ pub(crate) async fn execute_hybrid_search(
     let scope = rbac.scope.clone();
     let req_clone = req.clone();
     let q_clone = query_str.clone();
+    let explicit_ocr_constraint = req.mode == SearchMode::Hybrid && trimmed_ocr_query.is_some();
     let ocr_q_clone = trimmed_ocr_query.unwrap_or_else(|| query_str.clone());
     let want_ocr = req.mode == SearchMode::Hybrid;
 
@@ -396,7 +432,8 @@ pub(crate) async fn execute_hybrid_search(
         .read(move |conn| {
             let ai_state = repo::ai::get_ai_index_state(conn)?;
             let tier = ai_state.active_vision_tier;
-            let cands = repo::search::build_filtered_candidates(conn, &scope, &req_clone, tier)?;
+            let mut cands =
+                repo::search::build_filtered_candidates(conn, &scope, &req_clone, tier)?;
             let ocr = if want_ocr {
                 repo::search::search_ocr_fts(
                     conn,
@@ -408,7 +445,31 @@ pub(crate) async fn execute_hybrid_search(
             } else {
                 Vec::new()
             };
-            let meta = if want_ocr {
+            if explicit_ocr_constraint {
+                // Scope semantic vector search strictly to OCR-matched assets so valid visual+OCR
+                // matches aren't pushed out of global top-K or evicted by non-OCR `relative_floor`.
+                if ocr.is_empty() {
+                    cands.vector_ids.clear();
+                } else {
+                    let mut scoped_vids = Vec::new();
+                    let tier_str = tier.as_str();
+                    let mut stmt = conn.prepare(
+                        "SELECT vector_id FROM vision_embeddings WHERE model_tier = ?1 AND asset_id = ?2",
+                    )?;
+                    for (aid, _, _) in &ocr {
+                        let rows = stmt.query_map(truongphoto_db::rusqlite::params![tier_str, aid], |r| {
+                            r.get::<_, i64>(0)
+                        })?;
+                        for vid in rows.flatten() {
+                            if let Ok(v) = u32::try_from(vid) {
+                                scoped_vids.push(v);
+                            }
+                        }
+                    }
+                    cands.vector_ids = scoped_vids.into_iter().collect();
+                }
+            }
+            let meta = if want_ocr && !explicit_ocr_constraint {
                 repo::search::search_metadata_matches(
                     conn,
                     &scope,
@@ -422,6 +483,15 @@ pub(crate) async fn execute_hybrid_search(
             Ok((tier, cands, ocr, meta))
         })
         .await?;
+
+    if explicit_ocr_constraint && ocr_hits.is_empty() {
+        return Ok(SearchResponse {
+            items: Vec::new(),
+            total_count: 0,
+            planner_mode: PlannerMode::SqlOnly,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        });
+    }
 
     let (collapsed, planner_mode) = if candidates.vector_ids.is_empty() {
         if !want_ocr {
@@ -527,6 +597,10 @@ pub(crate) async fn execute_hybrid_search(
 
     let tier_min = tier_min_semantic_score(active_tier);
     let top_semantic_score = collapsed.first().map(|h| h.score).unwrap_or(0.0);
+    let broad_meta_vs_visual = want_ocr
+        && !explicit_ocr_constraint
+        && metadata_hits.len() > 40
+        && top_semantic_score >= 0.14;
     // Dynamic relative cutoff trims low-relevance tail noise on larger vision tiers (Large/SO400M)
     // when strong visual matches exist, while always keeping at least the top 3 hits above `tier_min`.
     let relative_floor = if top_semantic_score >= 0.14 {
@@ -543,10 +617,11 @@ pub(crate) async fn execute_hybrid_search(
         if hit.score <= tier_min {
             continue;
         }
-        if kept_semantic >= 3 && hit.score < relative_floor {
+        if !explicit_ocr_constraint && kept_semantic >= 3 && hit.score < relative_floor {
             continue;
         }
         if has_meta_hits
+            && !broad_meta_vs_visual
             && !meta_id_set.contains(hit.asset_id.as_str())
             && hit.score < META_SEMANTIC_EXTRA_MIN_SCORE
         {
@@ -567,15 +642,10 @@ pub(crate) async fn execute_hybrid_search(
     }
 
     if want_ocr {
-        let explicit_ocr_constraint = req
-            .ocr_query
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-
         if explicit_ocr_constraint {
             // Explicit `ocr_query` combined with `query` ("coffee shop photos with text saying Starbucks")
-            // must INTERSECT OCR matches with semantic ranking rather than unioning non-OCR photos.
+            // intersects OCR matches with scoped semantic scores, ranking visual+OCR matches strictly
+            // above OCR-only matches (e.g. plain paper receipts).
             let ocr_map: HashMap<String, (f32, String)> = ocr_hits
                 .into_iter()
                 .map(|(aid, sc, snip)| (aid, (sc, snip)))
@@ -584,7 +654,7 @@ pub(crate) async fn execute_hybrid_search(
             for (aid, (ocr_score, snippet)) in ocr_map {
                 if let Some(mut existing) = by_asset.remove(&aid) {
                     existing.score =
-                        existing.score.max(ocr_score) + 0.25 * existing.score.min(ocr_score);
+                        1.0 + existing.score.max(ocr_score) + 0.25 * existing.score.min(ocr_score);
                     existing.match_reasons.push("OCR".to_string());
                     existing.ocr_snippet = Some(snippet);
                     intersected.insert(aid, existing);
@@ -593,7 +663,7 @@ pub(crate) async fn execute_hybrid_search(
                         aid.clone(),
                         PendingHit {
                             asset_id: aid,
-                            score: ocr_score,
+                            score: (ocr_score * 0.45).min(0.45),
                             timestamp_sec: None,
                             match_reasons: vec!["OCR".to_string()],
                             ocr_snippet: Some(snippet),
@@ -625,16 +695,27 @@ pub(crate) async fn execute_hybrid_search(
 
             // Fuse deterministic EXIF/camera/lens/filename/tag/person matches in Hybrid mode so queries
             // like "canon r7", "12mm", "f/1.4", "iso 6400", or "Portland Zoo" always surface exact matches.
-            // Guard against broad metadata hijacking (e.g. searching "apple" matching 200+ iPhone
-            // camera_make rows at 0.85 above strong SigLIP2 visual hits): when metadata hits are broad
-            // and strong visual hits exist, apply a gentle boost instead of dominating visual relevance.
-            let broad_meta_vs_visual =
-                metadata_hits.len() > 40 && top_semantic_score >= 0.14 && !by_asset.is_empty();
+            // When broad metadata matches (>40) coincide with strong visual matches (e.g. "apple" matching
+            // 200+ iPhones vs real apples, or "Japan" matching a 300-photo trip), boost visual hits and
+            // retain remaining metadata matches below the visual tier rather than dropping them.
+            let broad_meta_vs_visual = broad_meta_vs_visual && !by_asset.is_empty();
             for (rank_idx, asset_id) in metadata_hits.into_iter().enumerate() {
                 if broad_meta_vs_visual {
                     if let Some(existing) = by_asset.get_mut(&asset_id) {
                         existing.score += 0.04;
                         existing.match_reasons.push("Metadata".to_string());
+                    } else {
+                        let fallback_meta_score = (0.11 - (rank_idx as f32) * 0.00002).max(0.05);
+                        by_asset.insert(
+                            asset_id.clone(),
+                            PendingHit {
+                                asset_id,
+                                score: fallback_meta_score,
+                                timestamp_sec: None,
+                                match_reasons: vec!["Metadata".to_string()],
+                                ocr_snippet: None,
+                            },
+                        );
                     }
                     continue;
                 }
@@ -673,6 +754,7 @@ pub(crate) async fn execute_hybrid_search(
             .db
             .read(move |conn| repo::search::load_asset_sort_keys(conn, &scope_s, &all_ids))
             .await?;
+        let has_score_variance = slice_has_score_variance(combined.iter().map(|h| h.score));
         combined.sort_unstable_by(|a, b| {
             compare_sort_keys(
                 &sort_norm,
@@ -680,6 +762,7 @@ pub(crate) async fn execute_hybrid_search(
                 &b.asset_id,
                 a.score,
                 b.score,
+                has_score_variance,
                 &sort_keys,
             )
         });

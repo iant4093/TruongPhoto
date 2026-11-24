@@ -47,6 +47,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return years;
   }, [buckets]);
 
+  const activeIdx = useMemo(() => {
+    if (hoverBucket) {
+      const found = buckets.findIndex(
+        (b) => b.year === hoverBucket.year && b.month === hoverBucket.month,
+      );
+      if (found >= 0) return found;
+    }
+    if (activeYear !== null) {
+      const found = buckets.findIndex((b) => b.year === activeYear);
+      if (found >= 0) return found;
+    }
+    return 0;
+  }, [activeYear, buckets, hoverBucket]);
+
   if (buckets.length === 0) return null;
 
   const resolveBucketAtPointer = (clientY: number): { bucket: TimelineBucket; top: number } => {
@@ -97,20 +111,6 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
   };
-
-  const activeIdx = useMemo(() => {
-    if (hoverBucket) {
-      const found = buckets.findIndex(
-        (b) => b.year === hoverBucket.year && b.month === hoverBucket.month,
-      );
-      if (found >= 0) return found;
-    }
-    if (activeYear !== null) {
-      const found = buckets.findIndex((b) => b.year === activeYear);
-      if (found >= 0) return found;
-    }
-    return 0;
-  }, [activeYear, buckets, hoverBucket]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     let nextIdx: number | null = null;

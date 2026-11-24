@@ -205,6 +205,8 @@ export const TrayApp: React.FC = () => {
       .onFocusChanged(({ payload: focused }) => {
         if (focused) {
           void loadTrayState();
+        } else {
+          disconnectLiveSocket();
         }
       })
       .then((fn) => {
@@ -225,7 +227,7 @@ export const TrayApp: React.FC = () => {
       unlisten?.();
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [loadTrayState]);
+  }, [loadTrayState, disconnectLiveSocket]);
 
   const handleCopy = async (url: string) => {
     try {
@@ -287,9 +289,9 @@ export const TrayApp: React.FC = () => {
   return (
     <div
       className="app-window-frame tray-shell"
-      style={{ width: 360, height: 440, padding: 14, gap: 10 }}
+      style={{ width: '100%', height: '100%', padding: 14, gap: 10 }}
     >
-      <div className="row" style={{ justifyContent: 'space-between' }}>
+      <div className="row" style={{ justifyContent: 'space-between', flexShrink: 0 }}>
         <div className="row">
           <img src="/app-icon.png" width={20} height={20} alt="" />
           <strong style={{ fontSize: 15, letterSpacing: '-0.01em' }}>TruongPhoto</strong>
@@ -303,7 +305,8 @@ export const TrayApp: React.FC = () => {
         </Badge>
       </div>
 
-      <div className="card tray-card" style={{ overflowY: 'auto' }}>
+      <div className="card tray-card" style={{ overflow: 'hidden', minHeight: 0 }}>
+        <div className="tray-card-scroll">
         <div className="property-field" style={{ marginBottom: 0 }}>
           <div className="property-row">
             <span>Assets</span>
@@ -387,7 +390,11 @@ export const TrayApp: React.FC = () => {
                         textOverflow: 'ellipsis',
                         minWidth: 0,
                       }}
-                      onClick={() => void openExternalUrl(url)}
+                      onClick={() =>
+                        void openExternalUrl(url).catch((err) =>
+                          setError(err instanceof Error ? err.message : String(err)),
+                        )
+                      }
                     >
                       <ExternalLink size={11} />
                       <span>{url}</span>
@@ -445,8 +452,9 @@ export const TrayApp: React.FC = () => {
             {error}
           </div>
         )}
+        </div>
 
-        <div className="tray-actions">
+        <div className="tray-actions" style={{ flexShrink: 0 }}>
           {aiDashboard && (
             <div className="tray-actions-row">
               <button

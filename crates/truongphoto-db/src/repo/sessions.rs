@@ -141,6 +141,22 @@ pub fn revoke_sessions_for_user(conn: &Connection, user_id: &str, now_ms: i64) -
     Ok(affected)
 }
 
+/// Revokes all active sessions belonging to `user_id` except `keep_session_id`.
+pub fn revoke_other_sessions_for_user(
+    conn: &Connection,
+    user_id: &str,
+    keep_session_id: &str,
+    now_ms: i64,
+) -> DbResult<usize> {
+    let affected = conn.execute(
+        "UPDATE sessions
+         SET revoked_at_ms = ?3
+         WHERE user_id = ?1 AND id != ?2 AND revoked_at_ms IS NULL",
+        params![user_id, keep_session_id, now_ms],
+    )?;
+    Ok(affected)
+}
+
 /// Deletes expired or already-revoked sessions as of `now_ms`.
 pub fn prune_expired_sessions(conn: &Connection, now_ms: i64) -> DbResult<usize> {
     let affected = conn.execute(

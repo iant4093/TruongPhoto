@@ -120,7 +120,11 @@ async fn csrf_origin_middleware(
         *req.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
     );
-    if !is_safe && !ws::is_same_origin_request(req.headers()) {
+    let peer_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    if !is_safe && !ws::is_same_origin_request(req.headers(), peer_ip) {
         return (StatusCode::FORBIDDEN, "Cross-origin request rejected.").into_response();
     }
     next.run(req).await
@@ -227,6 +231,30 @@ pub async fn start_server(
         bound_port,
         shutdown_token.clone(),
     ));
+
+    // Recover from any prior ungraceful shutdown: cancel stale inflight job rows and reap
+    // orphaned upload staging parts / HLS temp directories.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let _ = state
+        .db
+        .write(move |conn| truongphoto_db::repo::jobs::cancel_stale_inflight_jobs(conn, now_ms))
+        .await;
+    {
+        let default_paths = state.default_paths.clone();
+        if let Ok(settings) = state
+            .db
+            .read(move |conn| {
+                truongphoto_db::repo::settings::load_app_settings(conn, &default_paths)
+            })
+            .await
+        {
+            let uploads_dir = std::path::PathBuf::from(settings.managed_uploads_dir);
+            let cache_dir = std::path::PathBuf::from(settings.cache_dir);
+            tokio::task::spawn_blocking(move || {
+                ingest::trash_gc::reap_stale_temp_files(&uploads_dir, &cache_dir);
+            });
+        }
+    }
 
     let mut bg_tasks = ws::spawn_background_broadcasters(state.clone());
     bg_tasks.push(ingest::trash_gc::spawn_trash_gc_task(state.clone()));

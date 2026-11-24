@@ -1405,6 +1405,7 @@ async fn phase1_e2e_ingest_media_uploads_rbac_trash_and_albums() {
         &app.thumbs_dir,
         &app.cache_dir,
         &app.state.cache_mgr,
+        Some(&app.state.ai),
         30,
     )
     .await

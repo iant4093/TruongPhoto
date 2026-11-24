@@ -1,4 +1,4 @@
-use crate::models::model_dir;
+use crate::models::{find_model_spec, is_model_installed, model_dir};
 use crate::ort_runtime::{OrtRuntimeManager, SessionKey};
 use crate::tags_bank::{tier_tag_threshold, MAX_AUTO_TAGS, PHOTOGRAPHY_TAGS};
 use crate::vector::l2_normalize;
@@ -27,6 +27,12 @@ pub trait VisionBackend: Send + Sync {
         tier: AiTier,
         img_vec: &[f32],
     ) -> Result<Vec<(String, f32)>, AiError>;
+    /// Clears in-memory tokenizer, tag-bank, and text-embedding caches (e.g. after model delete/install).
+    fn clear_caches(&self) {}
+    /// Returns `true` when the vision model files for `tier` are available to run.
+    fn is_tier_available(&self, _tier: AiTier) -> bool {
+        true
+    }
 }
 
 const fn siglip2_image_size(tier: AiTier) -> u32 {
@@ -176,7 +182,10 @@ impl OrtSiglip2Backend {
         if let Ok(raw) = std::fs::read(&cache_path) {
             if raw.len() == expected_bytes {
                 let mut entries = Vec::with_capacity(PHOTOGRAPHY_TAGS.len());
-                let floats: &[f32] = bytemuck::cast_slice(&raw);
+                let floats: Vec<f32> = raw
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
                 for (idx, &tag) in PHOTOGRAPHY_TAGS.iter().enumerate() {
                     let start = idx * dim;
                     entries.push((tag.to_string(), floats[start..start + dim].to_vec()));
@@ -300,6 +309,17 @@ impl VisionBackend for OrtSiglip2Backend {
         hits.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         hits.truncate(MAX_AUTO_TAGS);
         Ok(hits)
+    }
+
+    fn clear_caches(&self) {
+        self.tokenizers.write().clear();
+        self.tag_bank_cache.write().clear();
+        self.text_embed_cache.write().clear();
+    }
+
+    fn is_tier_available(&self, tier: AiTier) -> bool {
+        find_model_spec(tier.vision_model_id())
+            .is_some_and(|spec| is_model_installed(&self.models_dir, spec))
     }
 }
 
@@ -470,5 +490,9 @@ impl VisionBackend for DeterministicTestVisionBackend {
         hits.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         hits.truncate(MAX_AUTO_TAGS);
         Ok(hits)
+    }
+
+    fn clear_caches(&self) {
+        self.tag_bank_cache.write().clear();
     }
 }

@@ -284,23 +284,29 @@ async fn run_model_download(
                 total: Some(spec.approx_bytes),
                 message: Some(format!("Installed {}", spec.name)),
             });
+            state.ai.clear_runtime_caches();
             state.ai.notify_work();
         }
         Err(AiError::Cancelled) => {
-            let row = repo::ai::AiModelRow {
-                model_id: spec.id.to_string(),
-                status: AiModelStatus::NotInstalled,
-                local_dir: Some(local_dir_str),
-                bytes_total: spec.approx_bytes,
-                bytes_downloaded: 0,
-                sha256_manifest: None,
-                error_message: None,
-                updated_at_ms: now_ms,
-            };
-            let _ = state
-                .db
-                .write(move |conn| repo::ai::upsert_ai_model_row(conn, &row))
-                .await;
+            // If `delete_ai_model` already removed the model directory while we were cancelling,
+            // do not resurrect the `ai_models` row.
+            let dir_still_exists = model_dir(state.ai.models_dir(), spec.id).exists();
+            if dir_still_exists {
+                let row = repo::ai::AiModelRow {
+                    model_id: spec.id.to_string(),
+                    status: AiModelStatus::NotInstalled,
+                    local_dir: Some(local_dir_str),
+                    bytes_total: spec.approx_bytes,
+                    bytes_downloaded: 0,
+                    sha256_manifest: None,
+                    error_message: None,
+                    updated_at_ms: now_ms,
+                };
+                let _ = state
+                    .db
+                    .write(move |conn| repo::ai::upsert_ai_model_row(conn, &row))
+                    .await;
+            }
             let _ = state.ws_tx.send(WsServerEvent::JobProgress {
                 job_id: 0,
                 kind,
@@ -365,13 +371,14 @@ pub async fn delete_ai_model(
         .ok_or_else(|| AppError::not_found(format!("Unknown AI model '{model_id}'.")))?;
 
     state.ai.cancel_download(spec.id);
-    let _ = state.ai.pipeline().ort.evict_all_sessions();
-    // Stop any running llama-server sidecar holding GGUF file locks (required on Windows before delete).
+    // Stop any running llama-server sidecar holding GGUF file locks (required on Windows before delete)
+    // and clear all in-memory ORT/Vision/OCR/Chat caches and CPU fallback latches.
     let _ = state
         .ai
         .pipeline()
         .chat
         .evict_idle(std::time::Duration::ZERO);
+    state.ai.clear_runtime_caches();
 
     let dir = model_dir(state.ai.models_dir(), spec.id);
     if dir.exists() {

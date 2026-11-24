@@ -1,6 +1,5 @@
 use crate::error::{ApiJson, AppError};
 use crate::extractors::{RbacContext, RequireAdmin};
-use crate::ingest::cache_mgr::safe_join_relative;
 use crate::state::AppState;
 use axum::{
     extract::{Path as AxumPath, State},
@@ -11,7 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use truongphoto_core::{AiTier, FolderView, RbacScope, WsServerEvent};
+use truongphoto_core::{FolderView, RbacScope, WsServerEvent};
 use truongphoto_db::{repo, DbError};
 use truongphoto_media::volume::resolve_volume_identity;
 use uuid::Uuid;
@@ -212,95 +211,31 @@ pub async fn delete_folder(
     let actor_id = auth.user.id.clone();
     let ip_addr = Some(auth.peer.ip_string());
     let fid_for_db = folder_id.clone();
+    // Stop filesystem watching and wait for any in-flight scan of this folder to finish
+    // BEFORE deleting DB records so a concurrent scan cannot re-insert rows mid-delete.
+    state.watcher.unwatch_folder(&folder_id);
+    let folder_lock = state.scanner.folder_lock(&folder_id);
+    let _folder_guard = folder_lock.lock().await;
+
     let default_paths = state.default_paths.clone();
     let faces_idx = Arc::clone(state.ai.faces_index());
     let now_ms = Utc::now().timestamp_millis();
 
-    struct FolderCleanupArtifacts {
-        thumb_rel_paths: Vec<String>,
-        cache_rel_paths: Vec<String>,
-        vision_vids: Vec<(AiTier, u32)>,
-        face_vids: Vec<u32>,
-        thumbnails_dir: PathBuf,
-        cache_dir: PathBuf,
-    }
-
-    let cleanup = state
+    let (cleanup, thumbnails_dir, cache_dir) = state
         .db
         .write(move |conn| {
             let tx = conn.transaction()?;
 
-            let thumb_rel_paths: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT thumb_rel_path FROM assets WHERE folder_id = ?1 AND thumb_rel_path IS NOT NULL",
-                )?;
+            let folder_asset_ids: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT id FROM assets WHERE folder_id = ?1")?;
                 let rows = stmt
                     .query_map([&fid_for_db], |row| row.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
 
-            let cache_rel_paths: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT l.rel_path FROM lru_cache_entries l JOIN assets a ON a.id = l.asset_id WHERE a.folder_id = ?1",
-                )?;
-                let rows = stmt
-                    .query_map([&fid_for_db], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
-            };
-
-            let vision_vids: Vec<(AiTier, u32)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT ve.model_tier, ve.vector_id
-                     FROM vision_embeddings ve
-                     JOIN assets a ON a.id = ve.asset_id
-                     WHERE a.folder_id = ?1",
-                )?;
-                let rows = stmt
-                    .query_map([&fid_for_db], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })?
-                    .filter_map(|r| {
-                        let (tier_str, vid) = r.ok()?;
-                        let tier = tier_str.parse::<AiTier>().ok()?;
-                        let vid_u32 = u32::try_from(vid).ok()?;
-                        Some((tier, vid_u32))
-                    })
-                    .collect();
-                rows
-            };
-
-            let face_vids: Vec<u32> = {
-                let mut stmt = tx.prepare(
-                    "SELECT DISTINCT COALESCE(fe.vector_id, f.vector_id) AS vid
-                     FROM faces f
-                     JOIN assets a ON a.id = f.asset_id
-                     LEFT JOIN face_embeddings fe ON fe.face_id = f.id
-                     WHERE a.folder_id = ?1
-                       AND COALESCE(fe.vector_id, f.vector_id) IS NOT NULL",
-                )?;
-                let rows = stmt
-                    .query_map([&fid_for_db], |row| row.get::<_, i64>(0))?
-                    .filter_map(|r| r.ok().and_then(|v| u32::try_from(v).ok()))
-                    .collect();
-                rows
-            };
-
-            let affected_people: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT DISTINCT f.person_id
-                     FROM faces f
-                     JOIN assets a ON a.id = f.asset_id
-                     WHERE a.folder_id = ?1
-                       AND f.person_id IS NOT NULL",
-                )?;
-                let rows = stmt
-                    .query_map([&fid_for_db], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
-            };
-
+            let artifacts =
+                crate::ingest::trash_gc::collect_artifacts_for_assets(&tx, &folder_asset_ids)?;
             let settings = repo::settings::load_app_settings(&tx, &default_paths)?;
 
             let deleted = repo::folders::delete_folder(&tx, &fid_for_db)?;
@@ -309,8 +244,9 @@ pub async fn delete_folder(
             }
 
             // Recompute or prune centroids for people whose faces belonged to the deleted folder.
-            for pid in &affected_people {
-                let _ = crate::routes::people::recompute_person_centroid(&tx, &faces_idx, pid, now_ms);
+            for pid in &artifacts.affected_people {
+                let _ =
+                    crate::routes::people::recompute_person_centroid(&tx, &faces_idx, pid, now_ms);
             }
 
             repo::settings::insert_audit_log(
@@ -325,47 +261,20 @@ pub async fn delete_folder(
                 },
             )?;
             tx.commit()?;
-            Ok(FolderCleanupArtifacts {
-                thumb_rel_paths,
-                cache_rel_paths,
-                vision_vids,
-                face_vids,
-                thumbnails_dir: PathBuf::from(settings.thumbnails_dir),
-                cache_dir: PathBuf::from(settings.cache_dir),
-            })
+            Ok((
+                artifacts,
+                PathBuf::from(settings.thumbnails_dir),
+                PathBuf::from(settings.cache_dir),
+            ))
         })
         .await?;
 
-    state.watcher.unwatch_folder(&folder_id);
-
-    // Tombstone deleted vector slots and remove derived thumbs/caches off the request thread.
-    let ai_cleanup = Arc::clone(&state.ai);
-    let _ = tokio::task::spawn_blocking(move || {
-        for (tier, vid) in cleanup.vision_vids {
-            if let Ok(idx) = ai_cleanup.vision_index(tier) {
-                let _ = idx.mark_deleted(vid);
-            }
-        }
-        let faces = ai_cleanup.faces_index();
-        for fvid in cleanup.face_vids {
-            let _ = faces.mark_deleted(fvid);
-        }
-        for rel in cleanup.thumb_rel_paths {
-            if let Some(p) = safe_join_relative(&cleanup.thumbnails_dir, &rel) {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-        for rel in cleanup.cache_rel_paths {
-            if let Some(p) = safe_join_relative(&cleanup.cache_dir, &rel) {
-                // Cache entries include directories (hls/, raw/, live/) as well as files.
-                if p.is_dir() {
-                    let _ = std::fs::remove_dir_all(&p);
-                } else {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-        }
-    })
+    crate::ingest::trash_gc::reap_cleanup_artifacts(
+        Arc::clone(&state.ai),
+        thumbnails_dir,
+        cache_dir,
+        cleanup,
+    )
     .await;
 
     let _ = state.ws_tx.send(WsServerEvent::FolderChanged {

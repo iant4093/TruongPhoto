@@ -91,19 +91,25 @@ export interface NativeDesktopUpdate {
   installAndRestart: () => Promise<void>;
 }
 
+export interface UpdateDownloadProgress {
+  downloaded: number;
+  total: number | null;
+  finished: boolean;
+}
+
 /**
  * Queries the signed Tauri native updater feed when running inside the desktop app.
- * Returns `null` when running in a browser, when already up to date, or if no signed feed is published.
+ * Uses the backend `check_update_feed` command directly so no JS-side Tauri Update
+ * resource is leaked and the feed is only fetched once.
  */
 export async function checkNativeUpdater(): Promise<NativeDesktopUpdate | null> {
   if (!isTauri()) return null;
   try {
-    const { check } = await import('@tauri-apps/plugin-updater');
-    const update = await check();
-    if (!update) return null;
+    const status = await checkUpdateFeed();
+    if (!status.available || !status.version) return null;
     return {
-      version: update.version,
-      body: update.body ?? null,
+      version: status.version,
+      body: status.notes ?? null,
       installAndRestart: async () => {
         await invokeTauri<void>('install_native_update');
       },
@@ -111,6 +117,42 @@ export async function checkNativeUpdater(): Promise<NativeDesktopUpdate | null> 
   } catch {
     return null;
   }
+}
+
+/**
+ * Copies text to the system clipboard, falling back to `document.execCommand('copy')`
+ * on non-HTTPS LAN origins where `navigator.clipboard` is unavailable.
+ * Returns `true` only when a copy actually succeeded.
+ */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall through to legacy textarea copy.
+    }
+  }
+  if (typeof document === 'undefined' || !document.body) return false;
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.top = '-9999px';
+  textarea.style.left = '-9999px';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  } finally {
+    document.body.removeChild(textarea);
+  }
+  return ok;
 }
 
 export async function restartApp(): Promise<void> {

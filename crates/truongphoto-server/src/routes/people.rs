@@ -46,28 +46,7 @@ pub struct PersonAssetsQuery {
 }
 
 fn atomic_write_bytes_sync(dest: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| std::io::Error::other("missing parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut tmp, bytes)?;
-    std::io::Write::flush(&mut tmp)?;
-    match tmp.persist(dest) {
-        Ok(_) => Ok(()),
-        Err(persist_err) => {
-            let tmp_path = persist_err
-                .file
-                .into_temp_path()
-                .keep()
-                .map_err(|k| k.error)?;
-            let res = truongphoto_core::process::rename_with_windows_retry(&tmp_path, dest);
-            if res.is_err() {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-            res
-        }
-    }
+    truongphoto_core::process::atomic_write_bytes(dest, bytes)
 }
 
 pub(crate) fn recompute_person_centroid(

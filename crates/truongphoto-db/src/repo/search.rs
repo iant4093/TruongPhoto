@@ -178,6 +178,9 @@ fn build_geo_match_expr(geo_query: &str, params: &mut Vec<Value>) -> Option<Stri
             per_tok.push(format!(
                 "EXISTS (SELECT 1 FROM asset_files af_ga WHERE af_ga.asset_id = v.id AND LOWER(af_ga.rel_path) LIKE ?{alt_idx} ESCAPE '\\')"
             ));
+            per_tok.push(format!(
+                "EXISTS (SELECT 1 FROM folders f_ga WHERE f_ga.id = v.folder_id AND LOWER(f_ga.name) LIKE ?{alt_idx} ESCAPE '\\')"
+            ));
         }
         geo_token_checks.push(format!("({})", per_tok.join(" OR ")));
     }
@@ -876,6 +879,9 @@ fn append_free_text_metadata_clauses(
             params.push(Value::Text(format!("%{}%", escape_like_lower(alt))));
             ors.push(format!(
                 "EXISTS (SELECT 1 FROM asset_files afqa WHERE afqa.asset_id = v.id AND LOWER(afqa.rel_path) LIKE ?{alt_idx} ESCAPE '\\')"
+            ));
+            ors.push(format!(
+                "EXISTS (SELECT 1 FROM folders fqa_dir WHERE fqa_dir.id = v.folder_id AND LOWER(fqa_dir.name) LIKE ?{alt_idx} ESCAPE '\\')"
             ));
         }
         let tag_word_idx = params.len() + 1;

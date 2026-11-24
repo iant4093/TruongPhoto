@@ -1,7 +1,7 @@
 //! Native-only Tauri v2 IPC commands and managed desktop state.
 //!
 //! All library, auth, folder, and settings operations flow over the embedded Axum REST/WS API.
-//! Tauri IPC exposes only the five native desktop commands listed in `build.rs`.
+//! Tauri IPC exposes only the six native desktop commands listed in `build.rs`.
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, watch};
@@ -57,11 +57,10 @@ pub fn show_main_window(app: tauri::AppHandle) {
     crate::tray::show_main_window(&app);
 }
 
-/// Triggers graceful server/DB shutdown and exits the desktop process.
+/// Triggers graceful server/DB shutdown and exits the desktop process via the single shutdown task.
 #[tauri::command]
-pub fn quit_app(app: tauri::AppHandle, state: tauri::State<'_, DesktopAppState>) {
+pub fn quit_app(_app: tauri::AppHandle, state: tauri::State<'_, DesktopAppState>) {
     state.trigger_shutdown();
-    app.exit(0);
 }
 
 /// Checks the configured Tauri updater feed and returns update availability metadata.
@@ -130,8 +129,48 @@ pub async fn install_native_update(app: tauri::AppHandle) -> Result<(), String> 
         return Err("No update available.".to_string());
     };
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tauri::Emitter;
+
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let last_emitted = Arc::new(AtomicU64::new(0));
+    let progress_app = app.clone();
+    let finish_app = app.clone();
+    let dl_counter = Arc::clone(&downloaded);
+    let emit_counter = Arc::clone(&last_emitted);
+
     update
-        .download_and_install(|_, _| {}, || {})
+        .download_and_install(
+            move |chunk_len, content_length| {
+                let total_dl =
+                    dl_counter.fetch_add(chunk_len as u64, Ordering::Relaxed) + chunk_len as u64;
+                let prev = emit_counter.load(Ordering::Relaxed);
+                let should_emit = total_dl.saturating_sub(prev) >= 256 * 1024
+                    || content_length.is_some_and(|total| total_dl >= total);
+                if should_emit {
+                    emit_counter.store(total_dl, Ordering::Relaxed);
+                    let _ = progress_app.emit(
+                        "desktop-update-progress",
+                        serde_json::json!({
+                            "downloaded": total_dl,
+                            "total": content_length,
+                            "finished": false,
+                        }),
+                    );
+                }
+            },
+            move || {
+                let _ = finish_app.emit(
+                    "desktop-update-progress",
+                    serde_json::json!({
+                        "downloaded": downloaded.load(Ordering::Relaxed),
+                        "total": serde_json::Value::Null,
+                        "finished": true,
+                    }),
+                );
+            },
+        )
         .await
         .map_err(|e| format!("Failed to install update: {e}"))?;
 

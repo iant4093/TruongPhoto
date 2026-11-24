@@ -110,13 +110,18 @@ fn libraw_candidate_paths() -> Vec<String> {
     candidates
 }
 
-fn load_libraw_library() -> Option<libloading::Library> {
-    for candidate in libraw_candidate_paths() {
-        if let Ok(lib) = unsafe { libloading::Library::new(&candidate) } {
-            return Some(lib);
-        }
-    }
-    None
+fn load_libraw_library() -> Option<&'static libloading::Library> {
+    static LIBRAW: std::sync::OnceLock<Option<libloading::Library>> = std::sync::OnceLock::new();
+    LIBRAW
+        .get_or_init(|| {
+            for candidate in libraw_candidate_paths() {
+                if let Ok(lib) = unsafe { libloading::Library::new(&candidate) } {
+                    return Some(lib);
+                }
+            }
+            None
+        })
+        .as_ref()
 }
 
 /// Attempts runtime dynamic loading and full demosaic via `libraw` (`libloading`), returning `None` if unavailable.
@@ -189,19 +194,24 @@ pub fn try_libraw_demosaic_jpeg(path: &Path) -> Option<Vec<u8>> {
             clear_fn: *clear_mem,
         };
 
-        let img = &*mem_guard.ptr;
-        let data_len = img.data_size as usize;
+        let image_type = std::ptr::addr_of!((*mem_guard.ptr).image_type).read();
+        let height = std::ptr::addr_of!((*mem_guard.ptr).height).read();
+        let width = std::ptr::addr_of!((*mem_guard.ptr).width).read();
+        let colors = std::ptr::addr_of!((*mem_guard.ptr).colors).read();
+        let bits = std::ptr::addr_of!((*mem_guard.ptr).bits).read();
+        let data_len = std::ptr::addr_of!((*mem_guard.ptr).data_size).read() as usize;
         if data_len == 0 {
             return None;
         }
-        let pixels = std::slice::from_raw_parts(img.data.as_ptr(), data_len);
+        let data_ptr = std::ptr::addr_of!((*mem_guard.ptr).data).cast::<u8>();
+        let pixels = std::slice::from_raw_parts(data_ptr, data_len);
 
         // LIBRAW_IMAGE_JPEG = 1, LIBRAW_IMAGE_BITMAP = 2
-        if img.image_type == 1 {
+        if image_type == 1 {
             return Some(pixels.to_vec());
         }
-        if img.image_type == 2 && img.colors == 3 && img.bits == 8 {
-            let expected = (img.width as usize) * (img.height as usize) * 3;
+        if image_type == 2 && colors == 3 && bits == 8 {
+            let expected = (width as usize) * (height as usize) * 3;
             if pixels.len() < expected {
                 return None;
             }
@@ -210,8 +220,8 @@ pub fn try_libraw_demosaic_jpeg(path: &Path) -> Option<Vec<u8>> {
             encoder
                 .encode(
                     &pixels[..expected],
-                    img.width as u32,
-                    img.height as u32,
+                    width as u32,
+                    height as u32,
                     image::ExtendedColorType::Rgb8,
                 )
                 .ok()?;

@@ -243,6 +243,9 @@ pub fn sample_video_keyframes(
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut pts_ms = parse_showinfo_pts_ms(&stderr);
+    if pts_ms.len() > frame_paths.len() {
+        pts_ms.truncate(frame_paths.len());
+    }
     if pts_ms.len() != frame_paths.len() {
         let duration_ms = resolve_binary("TP_FFPROBE_PATH", "ffprobe")
             .and_then(|ffprobe| probe_duration_ms(&ffprobe, video_path))

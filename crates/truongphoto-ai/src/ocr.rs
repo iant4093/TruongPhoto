@@ -24,6 +24,8 @@ pub struct OcrResult {
 /// Trait abstracting local optical character recognition.
 pub trait OcrBackend: Send + Sync {
     fn recognize(&self, img: &RgbImage) -> Result<OcrResult, AiError>;
+    /// Clears in-memory OCR dictionary cache (e.g. after model delete/install).
+    fn clear_caches(&self) {}
 }
 
 /// Selects the smallest fixed PP-OCRv6 recognition width bucket (`320`, `640`, or `960`)
@@ -520,6 +522,10 @@ impl OcrBackend for OrtOcrBackend {
             lang_hint: None,
             model_id: "pp-ocrv6".to_string(),
         })
+    }
+
+    fn clear_caches(&self) {
+        *self.dict_cache.write() = None;
     }
 }
 

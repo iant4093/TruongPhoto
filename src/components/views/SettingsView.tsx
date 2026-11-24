@@ -38,13 +38,14 @@ import {
 import { formatBytes, formatDateTime, plural } from '../../lib/format';
 import {
   checkNativeUpdater,
-  checkUpdateFeed,
+  copyToClipboard,
   getAutostartEnabled,
   isTauri,
   openExternalUrl,
   pickFolderDialog,
   setAutostartEnabled,
   type NativeDesktopUpdate,
+  type UpdateDownloadProgress,
 } from '../../lib/tauri';
 import { confirmAction, notifyError, notifyInfo, notifySuccess } from '../../store/feedback';
 import { useAppStore } from '../../store/useAppStore';
@@ -142,6 +143,28 @@ export const SettingsView: React.FC = () => {
   const [tailscaleBusy, setTailscaleBusy] = useState(false);
   const [nativeUpdate, setNativeUpdate] = useState<NativeDesktopUpdate | null>(null);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress | null>(null);
+
+  useEffect(() => {
+    if (!installingUpdate || !isTauri()) return;
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    void import('@tauri-apps/api/event')
+      .then(({ listen }) =>
+        listen<UpdateDownloadProgress>('desktop-update-progress', (ev) => {
+          if (active) setUpdateProgress(ev.payload);
+        }),
+      )
+      .then((fn) => {
+        if (!active) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [installingUpdate]);
 
   // Storage & Backup state
   const [uploadsDir, setUploadsDir] = useState(adminSettings?.managed_uploads_dir ?? '');
@@ -586,9 +609,6 @@ export const SettingsView: React.FC = () => {
       } else if (ghResult.message) {
         notifyInfo(ghResult.message);
       }
-      if (isTauri()) {
-        void checkUpdateFeed().catch(() => {});
-      }
     } catch (err) {
       notifyError(err, 'Update check failed');
     } finally {
@@ -599,20 +619,22 @@ export const SettingsView: React.FC = () => {
   const handleInstallNativeUpdate = async () => {
     if (!nativeUpdate || installingUpdate) return;
     setInstallingUpdate(true);
+    setUpdateProgress(null);
     try {
       await nativeUpdate.installAndRestart();
     } catch (err) {
       notifyError(err, 'Could not install update');
       setInstallingUpdate(false);
+      setUpdateProgress(null);
     }
   };
 
   const handleCopyUrl = async (url: string) => {
-    try {
-      await navigator.clipboard?.writeText(url);
+    const ok = await copyToClipboard(url);
+    if (ok) {
       setCopiedUrl(url);
       window.setTimeout(() => setCopiedUrl((cur) => (cur === url ? null : cur)), 2000);
-    } catch {
+    } else {
       notifyInfo(url);
     }
   };
@@ -1283,7 +1305,11 @@ export const SettingsView: React.FC = () => {
                             <Download size={14} />
                             <span>
                               {installingUpdate
-                                ? 'Installing & Restarting…'
+                                ? updateProgress && !updateProgress.finished
+                                  ? updateProgress.total && updateProgress.total > 0
+                                    ? `Downloading ${Math.min(100, Math.round((updateProgress.downloaded / updateProgress.total) * 100))}%…`
+                                    : `Downloading ${formatBytes(updateProgress.downloaded)}…`
+                                  : 'Installing & Restarting…'
                                 : `Install v${nativeUpdate.version} & Restart`}
                             </span>
                           </button>
@@ -1468,7 +1494,11 @@ export const SettingsView: React.FC = () => {
                     type="button"
                     className="button button-quiet"
                     style={{ minWidth: 0, overflowWrap: 'anywhere', textAlign: 'left' }}
-                    onClick={() => void openExternalUrl(tailscaleStatus.https_url!)}
+                    onClick={() =>
+                      void openExternalUrl(tailscaleStatus.https_url!).catch((err) =>
+                        notifyError(err, 'Could not open Tailscale URL'),
+                      )
+                    }
                   >
                     {tailscaleStatus.https_url}
                   </button>
@@ -1741,15 +1771,21 @@ export const SettingsView: React.FC = () => {
               className="property-field"
               style={{ borderTop: '1px solid var(--border)', paddingTop: 12, marginBottom: 0 }}
             >
-              <div className="property-row">
-                <span>PMTiles Directory</span>
-                <span className="property-value">
+              <div className="property-row" style={{ gap: 12, alignItems: 'flex-start' }}>
+                <span style={{ flexShrink: 0 }}>PMTiles Directory</span>
+                <span
+                  className="property-value"
+                  style={{ whiteSpace: 'normal', overflowWrap: 'anywhere', textAlign: 'right' }}
+                >
                   {adminSettings?.map_pmtiles_dir || 'Default (<data_dir>/maps)'}
                 </span>
               </div>
-              <div className="property-row">
-                <span>Detected .pmtiles Files</span>
-                <span className="property-value">
+              <div className="property-row" style={{ gap: 12, alignItems: 'flex-start' }}>
+                <span style={{ flexShrink: 0 }}>Detected .pmtiles Files</span>
+                <span
+                  className="property-value"
+                  style={{ whiteSpace: 'normal', overflowWrap: 'anywhere', textAlign: 'right' }}
+                >
                   {mapConfig && mapConfig.available_pmtiles.length > 0
                     ? mapConfig.available_pmtiles.join(', ')
                     : 'None (built-in offline world coastline active)'}

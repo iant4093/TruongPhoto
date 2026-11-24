@@ -138,6 +138,9 @@ fn sample_video_keyframes_fps_mode(
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut pts_ms = parse_showinfo_pts_ms(&stderr);
+    if pts_ms.len() > frame_paths.len() {
+        pts_ms.truncate(frame_paths.len());
+    }
     if pts_ms.len() != frame_paths.len() {
         let n = frame_paths.len();
         pts_ms = (0..n).map(|i| (i as i64) * 5_000).collect();
@@ -145,13 +148,28 @@ fn sample_video_keyframes_fps_mode(
 
     let mut keyframes = Vec::with_capacity(frame_paths.len());
     for (path, timestamp_ms) in frame_paths.into_iter().zip(pts_ms.into_iter()) {
-        let img = decode_image_to_srgb(&path).map_err(|e| e.to_string())?;
+        let img = downscale_max_side(
+            decode_image_to_srgb(&path).map_err(|e| e.to_string())?,
+            1600,
+        );
         keyframes.push(SampledKeyframe {
             timestamp_ms,
             image: img,
         });
     }
     Ok(keyframes)
+}
+
+fn downscale_max_side(img: image::RgbImage, limit: u32) -> image::RgbImage {
+    let max_side = img.width().max(img.height());
+    if max_side > limit {
+        let scale = (limit as f32) / (max_side as f32);
+        let new_w = ((img.width() as f32 * scale).round() as u32).max(1);
+        let new_h = ((img.height() as f32 * scale).round() as u32).max(1);
+        image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    }
 }
 
 fn cached_preview_path(cache_dir: &Path, asset_id: &str) -> Option<PathBuf> {
@@ -177,8 +195,11 @@ fn decode_frames_for_asset(
     video_max_frames: u32,
 ) -> Result<Vec<SampledKeyframe>, String> {
     if kind == AssetKind::Video {
-        if let Ok(kfs) = sample_video_keyframes(src_path, video_max_frames) {
+        if let Ok(mut kfs) = sample_video_keyframes(src_path, video_max_frames) {
             if !kfs.is_empty() {
+                for kf in &mut kfs {
+                    kf.image = downscale_max_side(std::mem::take(&mut kf.image), 1600);
+                }
                 return Ok(kfs);
             }
         }
@@ -187,7 +208,10 @@ fn decode_frames_for_asset(
                 return Ok(kfs);
             }
         }
-        let poster = decode_image_to_srgb(src_path).map_err(|e| e.to_string())?;
+        let poster = downscale_max_side(
+            decode_image_to_srgb(src_path).map_err(|e| e.to_string())?,
+            1600,
+        );
         return Ok(vec![SampledKeyframe {
             timestamp_ms: 0,
             image: poster,
@@ -195,17 +219,11 @@ fn decode_frames_for_asset(
     }
 
     // Prefer already-cached 2048px preview when available to skip decoding giant 20-50MB originals.
-    let mut img = match preview_path.and_then(|p| decode_image_to_srgb(p).ok()) {
+    let img = match preview_path.and_then(|p| decode_image_to_srgb(p).ok()) {
         Some(cached) => cached,
         None => decode_image_to_srgb(src_path).map_err(|e| e.to_string())?,
     };
-    let max_side = img.width().max(img.height());
-    if max_side > 1600 {
-        let scale = 1600.0f32 / (max_side as f32);
-        let new_w = ((img.width() as f32 * scale).round() as u32).max(1);
-        let new_h = ((img.height() as f32 * scale).round() as u32).max(1);
-        img = image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle);
-    }
+    let img = downscale_max_side(img, 1600);
     Ok(vec![SampledKeyframe {
         timestamp_ms: 0,
         image: img,
@@ -232,6 +250,9 @@ fn merge_zero_shot_tags(candidates: Vec<(String, f32)>) -> Vec<(String, f64)> {
 struct InferredAssetData {
     vision_vecs: Vec<(i64, Vec<f32>)>,
     vision_ok: bool,
+    vision_reused: bool,
+    faces_engine_ok: bool,
+    ocr_engine_ok: bool,
     tags: Vec<(String, f64)>,
     faces: Vec<DetectedFace>,
     ocr: Option<OcrResult>,
@@ -416,16 +437,13 @@ async fn process_staging_tier_batch(
                         Err(e) => return Err(e),
                     }
                 }
-                let tags: Vec<(String, f64)> = if let Some((_, first_vec)) = vecs.first() {
-                    pipe.vision
-                        .score_zero_shot_tags(staging_tier, first_vec)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(t, c)| (t, f64::from(c)))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                let mut raw_tags = Vec::new();
+                for (_, vec) in &vecs {
+                    if let Ok(scored) = pipe.vision.score_zero_shot_tags(staging_tier, vec) {
+                        raw_tags.extend(scored);
+                    }
+                }
+                let tags = merge_zero_shot_tags(raw_tags);
                 Ok(StagingInferOutcome::Ready(vecs, tags))
             })
             .await??;
@@ -539,9 +557,11 @@ async fn process_staging_tier_batch(
         && remaining_now
             .1
             .iter()
-            .all(|id| state.ai.is_decode_backed_off(id));
+            .all(|id| state.ai.decode_failure_count(id) >= 3);
 
-    if remaining_now.0 == 0 || all_remaining_unindexable {
+    let staging_model_ready = state.ai.pipeline().vision.is_tier_available(staging_tier);
+
+    if staging_model_ready && (remaining_now.0 == 0 || all_remaining_unindexable) {
         // Persist/compact the staging HNSW base index before cutting over so the new active tier
         // immediately survives restarts and serves HNSW queries cleanly.
         if let Ok(staging_idx) = state.ai.vision_index(staging_tier) {
@@ -636,11 +656,16 @@ async fn process_active_stage2_batch(
         }
 
         let aid_lookup = asset_id.clone();
-        let (asset_opt, has_existing_faces, has_existing_ocr) = state
+        let (asset_opt, has_existing_vision, has_existing_faces, has_existing_ocr) = state
             .db
             .read(move |conn| {
                 let asset =
                     repo::assets::get_asset_with_files(conn, &RbacScope::AdminAll, &aid_lookup)?;
+                let vision_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM vision_embeddings WHERE model_tier = ?1 AND asset_id = ?2",
+                    truongphoto_db::rusqlite::params![active_tier.as_str(), &aid_lookup],
+                    |row| row.get(0),
+                )?;
                 let face_count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM faces WHERE asset_id = ?1",
                     truongphoto_db::rusqlite::params![&aid_lookup],
@@ -651,7 +676,7 @@ async fn process_active_stage2_batch(
                     truongphoto_db::rusqlite::params![&aid_lookup],
                     |row| row.get(0),
                 )?;
-                Ok((asset, face_count > 0, ocr_count > 0))
+                Ok((asset, vision_count > 0, face_count > 0, ocr_count > 0))
             })
             .await?;
 
@@ -687,71 +712,82 @@ async fn process_active_stage2_batch(
             }
 
             // Overlap CPU vision inference with hardware-accelerated (CoreML/DirectML) face + OCR inference.
-            let (vision_res, (faces, ocr)) = std::thread::scope(|s| {
-                let vision_handle = s.spawn(|| {
-                    let mut vision_vecs = Vec::with_capacity(frames.len());
-                    let mut raw_tags = Vec::new();
-                    let mut vision_ok = true;
+            // Skip redundant SigLIP2 vision inference when embeddings for `active_tier` already exist
+            // (e.g. after installing Face or OCR models on an already vision-indexed library).
+            let (vision_res, ((faces, faces_engine_ok), (ocr, ocr_engine_ok))) =
+                std::thread::scope(|s| {
+                    let vision_handle = s.spawn(|| {
+                        if has_existing_vision {
+                            return Ok((Vec::new(), Vec::new(), true, true));
+                        }
+                        let mut vision_vecs = Vec::with_capacity(frames.len());
+                        let mut raw_tags = Vec::new();
+                        let mut vision_ok = true;
 
-                    for kf in &frames {
-                        match pipe.vision.embed_image(active_tier, &kf.image) {
-                            Ok(vec) => {
-                                if let Ok(scored) =
-                                    pipe.vision.score_zero_shot_tags(active_tier, &vec)
-                                {
-                                    raw_tags.extend(scored);
+                        for kf in &frames {
+                            match pipe.vision.embed_image(active_tier, &kf.image) {
+                                Ok(vec) => {
+                                    if let Ok(scored) =
+                                        pipe.vision.score_zero_shot_tags(active_tier, &vec)
+                                    {
+                                        raw_tags.extend(scored);
+                                    }
+                                    vision_vecs.push((kf.timestamp_ms, vec));
                                 }
-                                vision_vecs.push((kf.timestamp_ms, vec));
+                                Err(e) if is_unavailable_engine_err(&e) => {
+                                    vision_ok = false;
+                                    break;
+                                }
+                                Err(e) => return Err(e),
                             }
-                            Err(e) if is_unavailable_engine_err(&e) => {
-                                vision_ok = false;
-                                break;
+                        }
+                        Ok((vision_vecs, raw_tags, vision_ok, false))
+                    });
+
+                    let primary_img = &frames[0].image;
+                    let (faces, faces_engine_ok) = if has_existing_faces {
+                        (Vec::new(), true)
+                    } else {
+                        match pipe.faces.detect_and_embed(primary_img) {
+                            Ok(detected) => (detected, true),
+                            Err(e) if is_unavailable_engine_err(&e) => (Vec::new(), false),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "face detection skipped for asset");
+                                (Vec::new(), true)
                             }
-                            Err(e) => return Err(e),
                         }
-                    }
-                    Ok((vision_vecs, raw_tags, vision_ok))
-                });
+                    };
 
-                let primary_img = &frames[0].image;
-                let faces = if has_existing_faces {
-                    Vec::new()
-                } else {
-                    match pipe.faces.detect_and_embed(primary_img) {
-                        Ok(detected) => detected,
-                        Err(e) if is_unavailable_engine_err(&e) => Vec::new(),
-                        Err(e) => {
-                            tracing::debug!(error = %e, "face detection skipped for asset");
-                            Vec::new()
+                    let (ocr, ocr_engine_ok) = if has_existing_ocr {
+                        (None, true)
+                    } else {
+                        match pipe.ocr.recognize(primary_img) {
+                            Ok(res) if res.full_text.trim().chars().count() >= 2 => {
+                                (Some(res), true)
+                            }
+                            Ok(_) => (None, true),
+                            Err(e) if is_unavailable_engine_err(&e) => (None, false),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "OCR skipped for asset");
+                                (None, true)
+                            }
                         }
-                    }
-                };
+                    };
 
-                let ocr = if has_existing_ocr {
-                    None
-                } else {
-                    match pipe.ocr.recognize(primary_img) {
-                        Ok(res) if res.full_text.trim().chars().count() >= 2 => Some(res),
-                        Ok(_) => None,
-                        Err(e) if is_unavailable_engine_err(&e) => None,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "OCR skipped for asset");
-                            None
-                        }
-                    }
-                };
+                    let vision_out = vision_handle.join().map_err(|_| {
+                        AiError::Ort("vision inference worker thread panicked".into())
+                    })?;
+                    Ok::<_, AiError>((vision_out?, ((faces, faces_engine_ok), (ocr, ocr_engine_ok))))
+                })?;
 
-                let vision_out = vision_handle
-                    .join()
-                    .map_err(|_| AiError::Ort("vision inference worker thread panicked".into()))?;
-                Ok::<_, AiError>((vision_out?, (faces, ocr)))
-            })?;
-
-            let (vision_vecs, raw_tags, vision_ok) = vision_res;
+            let (vision_vecs, raw_tags, vision_ok, vision_reused) = vision_res;
 
             Ok(Some(InferredAssetData {
                 vision_vecs,
                 vision_ok,
+                vision_reused,
+                faces_engine_ok,
+                ocr_engine_ok,
                 tags: merge_zero_shot_tags(raw_tags),
                 faces,
                 ocr,
@@ -765,12 +801,16 @@ async fn process_active_stage2_batch(
         };
         state.ai.clear_decode_failure(&asset_id);
 
-        if !data.vision_ok && data.faces.is_empty() && data.ocr.is_none() {
+        if !data.vision_ok && !data.faces_engine_ok && !data.ocr_engine_ok {
             // No AI models available yet; avoid spinning through the remaining queue.
             break;
         }
 
-        let vision_ok = data.vision_ok;
+        // When Vision is absent but Face/OCR engines ARE installed, mark `ai_stage = 2` so we
+        // don't spin re-decoding the same batch every 15s (installing a Vision model later resets
+        // or triggers staging re-index).
+        let mark_stage2 = data.vision_ok || data.faces_engine_ok || data.ocr_engine_ok;
+        let vision_reused = data.vision_reused;
         let min_vision_vid = u32::try_from(vision_idx.flat_count()).unwrap_or(u32::MAX);
         let min_face_vid = u32::try_from(faces_idx.flat_count()).unwrap_or(u32::MAX);
         let mut local_centroids = if !data.faces.is_empty() {
@@ -796,7 +836,7 @@ async fn process_active_stage2_batch(
             .write_batched(move |tx| {
                 let mut old_vision_ids = Vec::new();
                 let mut assigned_vision = Vec::new();
-                if data.vision_ok {
+                if data.vision_ok && !vision_reused {
                     old_vision_ids =
                         repo::ai::list_vector_ids_for_asset(tx, active_tier, &aid_write)?;
                     repo::ai::delete_vision_embeddings_for_asset(tx, active_tier, &aid_write)?;
@@ -905,7 +945,7 @@ async fn process_active_stage2_batch(
                     }
                 }
 
-                if data.vision_ok {
+                if mark_stage2 {
                     repo::ai::mark_asset_ai_stage(tx, &aid_write, 2, now_ms)?;
                 }
 
@@ -947,7 +987,7 @@ async fn process_active_stage2_batch(
             }
         }
 
-        if vision_ok {
+        if mark_stage2 {
             processed += 1;
             let status = if (processed as u64) >= total_pending {
                 JobStatus::Completed
@@ -987,44 +1027,69 @@ async fn process_active_stage2_batch(
     Ok(processed)
 }
 
-/// Runs deterministic Chinese Whispers clustering over all unassigned faces in `faces_index`.
+/// Runs deterministic face matching against existing person centroids first, then Chinese Whispers
+/// clustering over any remaining unassigned faces in `faces_index`.
 pub async fn run_face_clustering(state: &Arc<AppState>) -> Result<ClusterFacesResponse, AppError> {
-    let unassigned = state
+    let (unassigned, existing_centroids_raw) = state
         .db
-        .read(repo::ai::list_unassigned_faces_with_vectors)
+        .read(|conn| {
+            let unassigned = repo::ai::list_unassigned_faces_with_vectors(conn)?;
+            let centroids = repo::ai::list_person_centroids(conn)?;
+            Ok((unassigned, centroids))
+        })
         .await?;
 
-    if unassigned.len() < 2 {
+    if unassigned.is_empty() {
         return Ok(ClusterFacesResponse::default());
     }
+
+    let existing_centroids: Vec<(String, Vec<f32>)> = existing_centroids_raw
+        .into_iter()
+        .filter_map(|(pid, _cnt, blob)| {
+            let vec = decode_centroid_le(&blob)?;
+            if vec.is_empty() {
+                None
+            } else {
+                Some((pid, vec))
+            }
+        })
+        .collect();
 
     let faces_idx = Arc::clone(state.ai.faces_index());
-    let (cluster_inputs, vid_to_face_id, vid_to_vec) = tokio::task::spawn_blocking(move || {
-        let mut nodes = Vec::with_capacity(unassigned.len());
-        let mut vid_to_face_id = HashMap::with_capacity(unassigned.len());
-        let mut vid_to_vec = HashMap::with_capacity(unassigned.len());
+    let (matched_existing, cluster_inputs, vid_to_face_id, vid_to_vec) =
+        tokio::task::spawn_blocking(move || {
+            let mut matched_existing: Vec<(String, String)> = Vec::new();
+            let mut nodes = Vec::with_capacity(unassigned.len());
+            let mut vid_to_face_id = HashMap::with_capacity(unassigned.len());
+            let mut vid_to_vec = HashMap::with_capacity(unassigned.len());
 
-        for (face_id, vid) in unassigned {
-            if let Some(vec) = faces_idx.flat().get_f32(vid) {
-                nodes.push((vid, vec.clone()));
-                vid_to_face_id.insert(vid, face_id);
-                vid_to_vec.insert(vid, vec);
+            for (face_id, vid) in unassigned {
+                if let Some(vec) = faces_idx.flat().get_f32(vid) {
+                    if let Some((pid, _sim)) =
+                        match_face_to_centroids(&vec, &existing_centroids, DEFAULT_CW_SIM_THRESHOLD)
+                    {
+                        matched_existing.push((face_id, pid));
+                        continue;
+                    }
+                    nodes.push((vid, vec.clone()));
+                    vid_to_face_id.insert(vid, face_id);
+                    vid_to_vec.insert(vid, vec);
+                }
             }
-        }
 
-        let clusters = chinese_whispers_cluster(&nodes, DEFAULT_CW_SIM_THRESHOLD, 2, CW_SEED);
-        (clusters, vid_to_face_id, vid_to_vec)
-    })
-    .await
-    .map_err(|e| AppError::internal(format!("Face clustering worker panicked: {e}")))?;
-
-    if cluster_inputs.is_empty() {
-        return Ok(ClusterFacesResponse::default());
-    }
+            let clusters = if nodes.len() >= 2 {
+                chinese_whispers_cluster(&nodes, DEFAULT_CW_SIM_THRESHOLD, 2, CW_SEED)
+            } else {
+                Vec::new()
+            };
+            (matched_existing, clusters, vid_to_face_id, vid_to_vec)
+        })
+        .await
+        .map_err(|e| AppError::internal(format!("Face clustering worker panicked: {e}")))?;
 
     let mut prepared_clusters: Vec<(Vec<String>, Vec<u8>)> =
         Vec::with_capacity(cluster_inputs.len());
-    let mut faces_assigned = 0u64;
+    let mut faces_assigned = matched_existing.len() as u64;
 
     for cluster_vids in cluster_inputs {
         let mut face_ids = Vec::with_capacity(cluster_vids.len());
@@ -1049,17 +1114,35 @@ pub async fn run_face_clustering(state: &Arc<AppState>) -> Result<ClusterFacesRe
         prepared_clusters.push((face_ids, blob));
     }
 
-    if prepared_clusters.is_empty() {
+    if matched_existing.is_empty() && prepared_clusters.is_empty() {
         return Ok(ClusterFacesResponse::default());
     }
 
     let clusters_created = prepared_clusters.len() as u64;
     let now_ms = Utc::now().timestamp_millis();
+    let faces_idx_recompute = Arc::clone(state.ai.faces_index());
 
     state
         .db
         .write(move |conn| {
             let tx = conn.transaction()?;
+            let mut touched_people: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for (face_id, person_id) in &matched_existing {
+                tx.execute(
+                    "UPDATE faces SET person_id = ?1 WHERE id = ?2 AND person_id IS NULL",
+                    truongphoto_db::rusqlite::params![person_id, face_id],
+                )?;
+                touched_people.insert(person_id.clone());
+            }
+            for pid in touched_people {
+                let _ = crate::routes::people::recompute_person_centroid(
+                    &tx,
+                    &faces_idx_recompute,
+                    &pid,
+                    now_ms,
+                );
+            }
             for (face_ids, blob) in &prepared_clusters {
                 repo::people::create_person_for_cluster(&tx, face_ids, blob, now_ms)?;
             }

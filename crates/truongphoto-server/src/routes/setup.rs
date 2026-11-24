@@ -51,12 +51,31 @@ pub async fn setup_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SetupStatusResponse>, AppError> {
     let initialized = state.db.read(repo::settings::is_setup_completed).await?;
+    let expose_host_details = !initialized && peer.is_direct_loopback;
 
     Ok(Json(SetupStatusResponse {
         initialized,
         is_direct_loopback: peer.is_direct_loopback,
-        hardware: state.hardware.clone(),
-        default_paths: state.default_paths.to_default_paths_dto(),
+        hardware: if expose_host_details {
+            state.hardware.clone()
+        } else {
+            HardwareInfo {
+                total_ram_bytes: 0,
+                cpu_cores: 0,
+                recommended_vision_tier: truongphoto_core::AiTier::Tier1,
+                recommended_chat_tier: truongphoto_core::AiTier::Tier1,
+            }
+        },
+        default_paths: if expose_host_details {
+            state.default_paths.to_default_paths_dto()
+        } else {
+            DefaultPathsDto {
+                managed_uploads_dir: String::new(),
+                thumbnails_dir: String::new(),
+                cache_dir: String::new(),
+                backup_dir: String::new(),
+            }
+        },
     }))
 }
 

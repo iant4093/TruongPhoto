@@ -149,6 +149,7 @@ export const Lightbox: React.FC = () => {
   const [sheetDragY, setSheetDragY] = useState(0);
   const [sheetDragging, setSheetDragging] = useState(false);
   const [sharing, setSharing] = useState(false);
+  const [trashing, setTrashing] = useState(false);
 
   const [rawDemosaic, setRawDemosaic] = useState(false);
   const [livePlaying, setLivePlaying] = useState(false);
@@ -174,6 +175,10 @@ export const Lightbox: React.FC = () => {
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const infoDrawerRef = useRef<HTMLElement | null>(null);
+  const shareAbortRef = useRef<AbortController | null>(null);
+  const activeAssetIdRef = useRef<string | null>(lightboxAssetId);
+  activeAssetIdRef.current = lightboxAssetId;
   const exitingTimerRef = useRef<number | null>(null);
   const slideSeqRef = useRef(0);
   const prevAssetRef = useRef<{ id: string; previewUrl: string } | null>(null);
@@ -221,6 +226,27 @@ export const Lightbox: React.FC = () => {
     return () => window.clearTimeout(t);
   }, [infoOpen]);
 
+  useEffect(() => {
+    const el = infoDrawerRef.current as (HTMLElement & { inert?: boolean }) | null;
+    if (el) {
+      el.inert = !infoOpen;
+    }
+  }, [infoOpen]);
+
+  // Listen for mobile browser Back button while Info sheet is open so Back closes Info first
+  // (matching Escape behavior) before closing Lightbox.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onPop = (e: Event) => {
+      if (infoOpenRef.current) {
+        e.preventDefault();
+        setInfoOpen(false);
+      }
+    };
+    window.addEventListener('tp:lightbox-popstate', onPop);
+    return () => window.removeEventListener('tp:lightbox-popstate', onPop);
+  }, []);
+
   // Touch & pointer gesture tracking
   const gestureRef = useRef<{
     startX: number;
@@ -231,6 +257,9 @@ export const Lightbox: React.FC = () => {
     pinchStartZoom: number;
     wasPinching: boolean;
     lastTapAt: number;
+    lastTapX: number;
+    lastTapY: number;
+    ignoreTouch: boolean;
     longPressTimer: number | null;
     dragging: boolean;
     didDrag: boolean;
@@ -243,6 +272,9 @@ export const Lightbox: React.FC = () => {
     pinchStartZoom: 1,
     wasPinching: false,
     lastTapAt: 0,
+    lastTapX: 0,
+    lastTapY: 0,
+    ignoreTouch: false,
     longPressTimer: null,
     dragging: false,
     didDrag: false,
@@ -334,6 +366,11 @@ export const Lightbox: React.FC = () => {
 
   useEffect(() => {
     clearLongPress();
+    shareAbortRef.current?.abort();
+    shareAbortRef.current = null;
+    setSharing(false);
+    gestureRef.current.lastTapAt = 0;
+    gestureRef.current.ignoreTouch = false;
     if (!lightboxAssetId) {
       setDetail(null);
       setDetailLoading(false);
@@ -483,8 +520,9 @@ export const Lightbox: React.FC = () => {
   }, [activeDetail, bumpLibraryRevision, canMutate, lightboxAssetId]);
 
   const handleMoveToTrash = useCallback(async () => {
-    if (!canMutate || !lightboxAssetId) return;
+    if (!canMutate || !lightboxAssetId || trashing) return;
     const trashedId = lightboxAssetId;
+    setTrashing(true);
     try {
       await trashAssets([trashedId]);
       detailCache.delete(trashedId);
@@ -493,8 +531,10 @@ export const Lightbox: React.FC = () => {
       removeLightboxAsset(trashedId);
     } catch (err) {
       notifyError(err, 'Could not move item to Trash');
+    } finally {
+      setTrashing(false);
     }
-  }, [bumpLibraryRevision, canMutate, lightboxAssetId, removeLightboxAsset]);
+  }, [bumpLibraryRevision, canMutate, lightboxAssetId, removeLightboxAsset, trashing]);
 
   const togglePixelPeepZoom = useCallback(() => {
     setAnimateZoom(true);
@@ -807,6 +847,15 @@ export const Lightbox: React.FC = () => {
     };
   }, [clampPan, isVideo, lightboxAssetId]);
 
+  // Re-clamp pan if desktop info drawer toggles open/closed while zoomed
+  useEffect(() => {
+    if (!lightboxAssetId || isMobileViewport || zoomRef.current <= 1.02) return;
+    const t = window.setTimeout(() => {
+      setPan((p) => clampPan(p.x, p.y, zoomRef.current));
+    }, INFO_SHEET_EXIT_MS + 20);
+    return () => window.clearTimeout(t);
+  }, [clampPan, infoOpen, isMobileViewport, lightboxAssetId]);
+
   if (!lightboxAssetId) return null;
 
   const titleDetail = activeDetail ?? toolbarDetail;
@@ -853,10 +902,44 @@ export const Lightbox: React.FC = () => {
 
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     lastTouchAtRef.current = Date.now();
-    if (isVideo) return;
     clearLongPress();
+    gestureRef.current.ignoreTouch = false;
+
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl?.closest('button, a, input, select, textarea')) {
+      gestureRef.current.ignoreTouch = true;
+      gestureRef.current.lastTapAt = 0;
+      return;
+    }
+
+    // For videos, allow horizontal swipe-left/right and swipe-down away from the bottom native
+    // transport controls, while skipping pinch/double-tap zoom.
+    if (isVideo) {
+      if (e.touches.length !== 1) {
+        gestureRef.current.ignoreTouch = true;
+        return;
+      }
+      const t = e.touches[0];
+      const videoEl = targetEl?.closest('video');
+      if (videoEl) {
+        const rect = videoEl.getBoundingClientRect();
+        // Bottom 60px hosts native seek scrubber & play/fullscreen controls
+        if (rect.height > 0 && t.clientY > rect.bottom - 60) {
+          gestureRef.current.ignoreTouch = true;
+          return;
+        }
+      }
+      gestureRef.current.startX = t.clientX;
+      gestureRef.current.startY = t.clientY;
+      gestureRef.current.pinchStartDist = null;
+      gestureRef.current.wasPinching = false;
+      gestureRef.current.lastTapAt = 0;
+      return;
+    }
+
     if (e.touches.length === 2) {
       setAnimateZoom(false);
+      gestureRef.current.lastTapAt = 0;
       gestureRef.current.pinchStartDist = touchDistance(e.touches[0], e.touches[1]);
       gestureRef.current.pinchStartZoom = zoom;
       gestureRef.current.wasPinching = true;
@@ -865,7 +948,11 @@ export const Lightbox: React.FC = () => {
     if (e.touches.length === 1) {
       const t = e.touches[0];
       const now = Date.now();
-      if (now - gestureRef.current.lastTapAt < 300) {
+      const tapDist = Math.hypot(
+        t.clientX - gestureRef.current.lastTapX,
+        t.clientY - gestureRef.current.lastTapY,
+      );
+      if (now - gestureRef.current.lastTapAt < 300 && tapDist < 40) {
         gestureRef.current.lastTapAt = 0;
         if (zoom > 1.02) {
           setAnimateZoom(true);
@@ -877,6 +964,8 @@ export const Lightbox: React.FC = () => {
         return;
       }
       gestureRef.current.lastTapAt = now;
+      gestureRef.current.lastTapX = t.clientX;
+      gestureRef.current.lastTapY = t.clientY;
       gestureRef.current.startX = t.clientX;
       gestureRef.current.startY = t.clientY;
       gestureRef.current.startPanX = pan.x;
@@ -893,8 +982,22 @@ export const Lightbox: React.FC = () => {
   };
 
   const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (gestureRef.current.ignoreTouch) return;
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      const moved = Math.hypot(
+        t.clientX - gestureRef.current.startX,
+        t.clientY - gestureRef.current.startY,
+      );
+      if (moved > 10) {
+        clearLongPress();
+        gestureRef.current.lastTapAt = 0;
+      }
+    } else {
+      clearLongPress();
+      gestureRef.current.lastTapAt = 0;
+    }
     if (isVideo) return;
-    clearLongPress();
     if (e.touches.length === 2 && gestureRef.current.pinchStartDist) {
       setAnimateZoom(false);
       const dist = touchDistance(e.touches[0], e.touches[1]);
@@ -919,8 +1022,11 @@ export const Lightbox: React.FC = () => {
 
   const handleTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
     lastTouchAtRef.current = Date.now();
-    if (isVideo) return;
     clearLongPress();
+    if (gestureRef.current.ignoreTouch) {
+      if (e.touches.length === 0) gestureRef.current.ignoreTouch = false;
+      return;
+    }
     if (touchLongPressLiveRef.current) {
       touchLongPressLiveRef.current = false;
       setLivePlaying(false);
@@ -942,14 +1048,17 @@ export const Lightbox: React.FC = () => {
       }
       return;
     }
-    if (zoom <= 1.02 && e.changedTouches.length === 1) {
+    if ((isVideo || zoom <= 1.02) && e.changedTouches.length === 1) {
       const t = e.changedTouches[0];
       const dx = t.clientX - gestureRef.current.startX;
       const dy = t.clientY - gestureRef.current.startY;
-      if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+      const minRatio = isVideo ? 1.4 : 1.2;
+      if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * minRatio) {
+        gestureRef.current.lastTapAt = 0;
         if (dx > 0) goPrev();
         else goNext();
       } else if (!infoOpen && dy > 92 && dy > Math.abs(dx) * 1.4) {
+        gestureRef.current.lastTapAt = 0;
         closeLightbox();
       }
     }
@@ -1022,34 +1131,54 @@ export const Lightbox: React.FC = () => {
 
   const handleNativeShare = async () => {
     if (!lightboxAssetId || sharing) return;
+    const targetAssetId = lightboxAssetId;
+    const knownSize = titlePrimaryFile?.file_size ?? 0;
+    // Avoid buffering huge videos or RAW files (>25 MB) into mobile JS memory / expiring user activation
+    if (isVideo || knownSize > 25 * 1024 * 1024) {
+      triggerAssetDownload(targetAssetId);
+      notifyInfo('Starting download…');
+      return;
+    }
+    const controller = new AbortController();
+    shareAbortRef.current?.abort();
+    shareAbortRef.current = controller;
     setSharing(true);
     try {
-      const url = mediaOriginalUrl(lightboxAssetId);
-      const res = await fetch(url, { credentials: 'include' });
+      const url = mediaOriginalUrl(targetAssetId);
+      const res = await fetch(url, { credentials: 'include', signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
+      if (controller.signal.aborted || activeAssetIdRef.current !== targetAssetId) return;
       const rawName =
         titlePrimaryFile?.rel_path.split(/[\\/]/).pop() ||
-        `${lightboxAssetId}.${primaryExt || (isVideo ? 'mp4' : 'jpg')}`;
-      const file = new File([blob], rawName, { type: blob.type || (isVideo ? 'video/mp4' : 'image/jpeg') });
+        `${targetAssetId}.${primaryExt || 'jpg'}`;
+      const file = new File([blob], rawName, { type: blob.type || 'image/jpeg' });
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
         await navigator.share({ files: [file], title: rawName });
       } else {
-        triggerAssetDownload(lightboxAssetId);
+        triggerAssetDownload(targetAssetId);
         notifyInfo('Starting download…');
       }
     } catch (err) {
-      if ((err as { name?: string })?.name !== 'AbortError') {
-        triggerAssetDownload(lightboxAssetId);
+      if (
+        !controller.signal.aborted &&
+        activeAssetIdRef.current === targetAssetId &&
+        (err as { name?: string })?.name !== 'AbortError'
+      ) {
+        triggerAssetDownload(targetAssetId);
         notifyInfo('Starting download…');
       }
     } finally {
+      if (shareAbortRef.current === controller) {
+        shareAbortRef.current = null;
+      }
       setSharing(false);
     }
   };
 
   const handleSheetTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     if (!isMobileViewport || e.touches.length !== 1) return;
+    if ((e.target as HTMLElement | null)?.closest('button, a, input, select, textarea')) return;
     sheetDragStartYRef.current = e.touches[0].clientY;
     sheetDragAtRef.current = Date.now();
     setSheetDragging(true);
@@ -1306,6 +1435,7 @@ export const Lightbox: React.FC = () => {
                 <button
                   type="button"
                   className="icon-button"
+                  disabled={trashing}
                   aria-label="Move to Trash"
                   title="Move to Trash"
                   onClick={() => void handleMoveToTrash()}
@@ -1527,6 +1657,7 @@ export const Lightbox: React.FC = () => {
         />
 
         <aside
+          ref={infoDrawerRef}
           className={`inspector-drawer lightbox-info-drawer${infoOpen ? ' is-open' : ''}${sheetDragging ? ' is-dragging' : ''}`}
           aria-label="Lightbox asset inspector"
           aria-hidden={!infoOpen}
@@ -1634,6 +1765,7 @@ export const Lightbox: React.FC = () => {
             <button
               type="button"
               className="lightbox-mobile-action is-danger"
+              disabled={trashing}
               aria-label="Move to Trash"
               onClick={() => void handleMoveToTrash()}
             >

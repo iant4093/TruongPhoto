@@ -5,7 +5,7 @@ use crate::ingest::{
 use crate::mdns::MdnsHandle;
 use crate::rate_limit::AuthRateLimiter;
 use crate::tailscale::{SystemTailscaleRunner, TailscaleManager, TailscaleRunner};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::time::Instant;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -24,7 +24,7 @@ pub struct AppState {
     pub default_paths: StoragePaths,
     pub started_at: Instant,
     pub rate_limiter: AuthRateLimiter,
-    pub gate_key: [u8; 32],
+    pub gate_key: RwLock<[u8; 32]>,
     pub desktop_secret: Option<String>,
     pub ws_tx: broadcast::Sender<WsServerEvent>,
     pub power_rx: watch::Receiver<PowerState>,
@@ -73,7 +73,7 @@ impl AppState {
             default_paths,
             started_at: Instant::now(),
             rate_limiter: AuthRateLimiter::new(),
-            gate_key,
+            gate_key: RwLock::new(gate_key),
             desktop_secret,
             ws_tx,
             power_rx,
@@ -91,6 +91,16 @@ impl AppState {
             sys: Mutex::new(sys),
             pid,
         }
+    }
+
+    /// Returns a snapshot of the current process HMAC key used to sign `tp_gate` cookies.
+    pub fn gate_key_snapshot(&self) -> [u8; 32] {
+        *self.gate_key.read()
+    }
+
+    /// Rotates the `tp_gate` HMAC key, immediately invalidating all outstanding server-PIN gate cookies.
+    pub fn rotate_gate_key(&self, next_key: [u8; 32]) {
+        *self.gate_key.write() = next_key;
     }
 
     /// Replaces the AI pipeline (e.g. injecting `AiPipeline::deterministic_test()` for offline tests).

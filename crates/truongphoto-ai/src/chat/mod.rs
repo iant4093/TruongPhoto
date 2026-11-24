@@ -49,6 +49,8 @@ pub struct ChatTurnInput {
     pub known_lenses: Vec<String>,
     pub library: LibraryChatContext,
     pub current_date_utc: DateTime<Utc>,
+    /// Client timezone offset in minutes east of UTC (e.g. `-480` for UTC-8), if supplied.
+    pub tz_offset_minutes: Option<i32>,
 }
 
 /// Candidate thumbnail passed to Tier 3 VLM visual reranking.
@@ -92,6 +94,9 @@ pub trait ChatRouterBackend: Send + Sync {
     fn warmup(&self, _tier: ChatTier) -> bool {
         false
     }
+
+    /// Clears any latched CPU-only fallback flags (e.g. after deleting or re-downloading a model).
+    fn clear_cpu_fallback(&self) {}
 
     /// Permanently shuts down the backend, preventing new sidecar spawns and killing any active runtime.
     fn shutdown(&self) {

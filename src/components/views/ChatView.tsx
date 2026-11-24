@@ -698,7 +698,7 @@ export const ChatView: React.FC = () => {
                         void selectChatSession(session.id).catch((err) =>
                           notifyError(err, 'Could not load conversation'),
                         );
-                        if (window.innerWidth < 960) setThreadsOpen(false);
+                        if (isNarrowViewport) setThreadsOpen(false);
                       }}
                     >
                       <span className="chat-thread-title">{session.title}</span>
@@ -764,7 +764,7 @@ export const ChatView: React.FC = () => {
       )}
 
       <div className="chat-main-pane">
-        <div className="chat-main-topbar" data-tauri-drag-region>
+        <div className="chat-main-topbar" data-tauri-drag-region="deep">
           <div className="row" style={{ gap: 8, minWidth: 0 }}>
             <button
               type="button"

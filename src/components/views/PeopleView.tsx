@@ -90,6 +90,7 @@ const PersonDetail: React.FC<PersonDetailProps> = ({
     if (loadedPersonIdRef.current !== person.id) {
       setLoading(true);
     }
+    setLoadingMore(false);
     setError(null);
     setLoadMoreError(false);
     try {
@@ -257,6 +258,7 @@ const PersonDetail: React.FC<PersonDetailProps> = ({
           assets={assets}
           hasMore={nextCursor !== null && !loadMoreError}
           loadingMore={loadingMore}
+          loadMoreError={loadMoreError}
           onLoadMore={handleLoadMore}
           onAssetUpdated={(assetId, patch) =>
             setAssets((prev) => prev.map((a) => (a.id === assetId ? { ...a, ...patch } : a)))
@@ -290,6 +292,7 @@ export const PeopleView: React.FC = () => {
   const [showHidden, setShowHidden] = useState(false);
 
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
+  const [selectedPersonSnapshot, setSelectedPersonSnapshot] = useState<PersonSummary | null>(null);
 
   // Admin inline card rename state
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -335,12 +338,44 @@ export const PeopleView: React.FC = () => {
     void load(showHidden);
   }, [load, showHidden, libraryRevision]);
 
-  const selectedPerson = selectedPersonId
+  useEffect(() => {
+    const viewport = document.querySelector('.content-viewport');
+    if (viewport) viewport.scrollTop = 0;
+  }, [selectedPersonId]);
+
+  useEffect(() => {
+    if (!mergeMode) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        setMergeMode(false);
+        setMergeSelectedIds([]);
+        setMergeTargetId('');
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [mergeMode]);
+
+  const selectedPersonFromList = selectedPersonId
     ? items.find((p) => p.id === selectedPersonId) ?? null
     : null;
+  const selectedPerson =
+    selectedPersonFromList ??
+    (selectedPersonId && selectedPersonSnapshot?.id === selectedPersonId
+      ? selectedPersonSnapshot
+      : null);
+
+  useEffect(() => {
+    if (selectedPersonFromList) {
+      setSelectedPersonSnapshot(selectedPersonFromList);
+    }
+  }, [selectedPersonFromList]);
 
   const handlePersonUpdated = useCallback((updated: PersonSummary) => {
     setItems((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+    setSelectedPersonSnapshot((prev) => (prev?.id === updated.id ? updated : prev));
   }, []);
 
   if (selectedPerson) {
@@ -348,7 +383,10 @@ export const PeopleView: React.FC = () => {
       <PersonDetail
         person={selectedPerson}
         isAdmin={isAdmin}
-        onBack={() => setSelectedPersonId(null)}
+        onBack={() => {
+          setSelectedPersonId(null);
+          setSelectedPersonSnapshot(null);
+        }}
         onPersonUpdated={handlePersonUpdated}
       />
     );
@@ -510,7 +548,7 @@ export const PeopleView: React.FC = () => {
             </span>
 
             {mergeSelectedIds.length >= 2 && (
-              <div className="row" style={{ gap: 6, fontSize: 12 }}>
+              <div className="row" style={{ gap: 6, fontSize: 12, flexWrap: 'wrap', maxWidth: '100%' }}>
                 <span className="workspace-label">Merge into:</span>
                 <Dropdown
                   label="Target person"
@@ -659,6 +697,13 @@ export const PeopleView: React.FC = () => {
                       value={renameText}
                       autoFocus
                       onChange={(e) => setRenameText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setRenamingId(null);
+                        }
+                      }}
                     />
                     <div className="row" style={{ justifyContent: 'center', gap: 6 }}>
                       <button

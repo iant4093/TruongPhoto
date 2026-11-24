@@ -9,6 +9,7 @@ if (isTauri()) {
   const isMac = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
   if (!isMac) {
     document.body.classList.add('tauri-transparent');
+    document.body.style.background = '';
     document.documentElement.classList.add('tauri-frameless');
   }
   ensureWindowStateWatcher();

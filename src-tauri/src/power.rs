@@ -112,14 +112,34 @@ mod platform {
     use objc2_foundation::NSString;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
+
+    type WakeSignal = Arc<(Mutex<u64>, Condvar)>;
+    static WAKE_SIGNAL: parking_lot::Mutex<Option<WakeSignal>> = parking_lot::Mutex::new(None);
 
     /// # Safety
     /// `center` must be a valid `NSNotificationCenter` (or subclass) instance.
-    unsafe fn observe(center: *mut AnyObject, name: &str, sink: Arc<PowerSink>, event: PowerEvent) {
+    unsafe fn observe(
+        center: *mut AnyObject,
+        name: &str,
+        sink: Arc<PowerSink>,
+        event: PowerEvent,
+        wake_on_fire: bool,
+    ) {
         let name = NSString::from_str(name);
-        let block = RcBlock::new(move |_note: *mut AnyObject| sink.emit(event));
+        let block = RcBlock::new(move |_note: *mut AnyObject| {
+            sink.emit(event);
+            if wake_on_fire {
+                if let Some(sig) = WAKE_SIGNAL.lock().as_ref() {
+                    let (lock, cv) = &**sig;
+                    if let Ok(mut seq) = lock.lock() {
+                        *seq = seq.wrapping_add(1);
+                        cv.notify_all();
+                    }
+                }
+            }
+        });
         let queue: *mut AnyObject = msg_send![class!(NSOperationQueue), mainQueue];
         let nil: *mut AnyObject = std::ptr::null_mut();
         let token: *mut AnyObject = msg_send![
@@ -146,6 +166,9 @@ mod platform {
         // Ensure AppKit is linked so `NSWorkspace` class lookup succeeds.
         let _ = std::mem::size_of::<objc2_app_kit::NSWorkspace>();
 
+        let wake_sig = Arc::new((Mutex::new(0u64), Condvar::new()));
+        *WAKE_SIGNAL.lock() = Some(Arc::clone(&wake_sig));
+
         // SAFETY: Standard AppKit/Foundation notification center calls on valid singleton
         // instances; notification centers retain/copy the block.
         unsafe {
@@ -156,24 +179,28 @@ mod platform {
                 "NSWorkspaceWillSleepNotification",
                 Arc::clone(&sink),
                 PowerEvent::SystemSleep,
+                false,
             );
             observe(
                 center,
                 "NSWorkspaceDidWakeNotification",
                 Arc::clone(&sink),
                 PowerEvent::SystemWake,
+                true,
             );
             observe(
                 center,
                 "NSWorkspaceScreensDidSleepNotification",
                 Arc::clone(&sink),
                 PowerEvent::DisplaySleep,
+                false,
             );
             observe(
                 center,
                 "NSWorkspaceScreensDidWakeNotification",
                 Arc::clone(&sink),
                 PowerEvent::DisplayWake,
+                false,
             );
 
             let distributed: *mut AnyObject =
@@ -183,33 +210,55 @@ mod platform {
                 "com.apple.screenIsLocked",
                 Arc::clone(&sink),
                 PowerEvent::SessionLock,
+                false,
             );
             observe(
                 distributed,
                 "com.apple.screenIsUnlocked",
                 Arc::clone(&sink),
                 PowerEvent::SessionUnlock,
+                false,
             );
         }
 
         let _ = std::thread::Builder::new()
             .name("tp-battery-poll".into())
             .spawn(move || {
+                let (lock, cv) = &*wake_sig;
                 while !stop.load(Ordering::Acquire) {
                     if let Some(on_battery) = query_on_battery() {
                         sink.emit(PowerEvent::BatteryChanged(on_battery));
                     }
-                    for _ in 0..30 {
-                        if stop.load(Ordering::Acquire) {
-                            return;
+                    let Ok(mut guard) = lock.lock() else {
+                        break;
+                    };
+                    let start_seq = *guard;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while !stop.load(Ordering::Acquire) && *guard == start_seq {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            break;
                         }
-                        std::thread::sleep(Duration::from_secs(1));
+                        let (next_guard, _) = match cv.wait_timeout(guard, remaining) {
+                            Ok(res) => res,
+                            Err(_) => return,
+                        };
+                        guard = next_guard;
                     }
                 }
             });
     }
 
-    pub fn stop() {}
+    pub fn stop() {
+        if let Some(sig) = WAKE_SIGNAL.lock().as_ref() {
+            let (lock, cv) = &**sig;
+            if let Ok(mut seq) = lock.lock() {
+                *seq = seq.wrapping_add(1);
+                cv.notify_all();
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -302,7 +351,8 @@ mod platform {
         if raw != 0 {
             let hwnd = HWND(raw as *mut core::ffi::c_void);
             // SAFETY: Posting WM_CLOSE to our hidden watcher window is thread-safe and triggers
-            // DestroyWindow -> PostQuitMessage(0) on the watcher thread.
+            // PostQuitMessage(0) so the watcher thread exits GetMessageW, unregisters notifications
+            // against the live HWND, and then calls DestroyWindow(hwnd).
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
@@ -355,8 +405,14 @@ mod platform {
                                     tracing::warn!("lock/unlock detection unavailable: {err}");
                                     break;
                                 }
-                                std::thread::sleep(delay);
-                                waited += delay;
+                                let chunk = std::time::Duration::from_millis(250);
+                                let mut slept = std::time::Duration::ZERO;
+                                while slept < delay && !stop.load(Ordering::Acquire) {
+                                    let step = (delay - slept).min(chunk);
+                                    std::thread::sleep(step);
+                                    slept += step;
+                                }
+                                waited += slept;
                                 delay = (delay * 2).min(std::time::Duration::from_secs(8));
                             }
                         }
@@ -382,7 +438,9 @@ mod platform {
                     };
                     if !stop.load(Ordering::Acquire) {
                         let mut msg = MSG::default();
-                        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        // GetMessageW returns > 0 for messages, 0 on WM_QUIT, and -1 on error.
+                        // Using `.as_bool()` would treat -1 as true and spin at 100% CPU.
+                        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                             let _ = DispatchMessageW(&msg);
                         }
                     }

@@ -187,6 +187,28 @@ impl AiCoordinator {
         map.len()
     }
 
+    /// Returns how many consecutive decode failures have been recorded for `asset_id`.
+    pub fn decode_failure_count(&self, asset_id: &str) -> u32 {
+        let now = Instant::now();
+        let mut map = self.decode_backoff.lock();
+        if let Some(&(count, until)) = map.get(asset_id) {
+            if now < until {
+                return count;
+            }
+            map.remove(asset_id);
+        }
+        0
+    }
+
+    /// Clears all in-memory AI runtime caches and CPU-fallback latches (e.g. after model delete/install).
+    pub fn clear_runtime_caches(&self) {
+        let _ = self.pipeline.ort.evict_all_sessions();
+        self.pipeline.ort.clear_cpu_fallbacks();
+        self.pipeline.vision.clear_caches();
+        self.pipeline.ocr.clear_caches();
+        self.pipeline.chat.clear_cpu_fallback();
+    }
+
     /// Clears any decode failure backoff entry once an asset decodes successfully.
     pub fn clear_decode_failure(&self, asset_id: &str) {
         self.decode_backoff.lock().remove(asset_id);

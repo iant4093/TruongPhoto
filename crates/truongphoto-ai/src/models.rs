@@ -315,10 +315,12 @@ pub fn model_dir(models_dir: &Path, model_id: &str) -> PathBuf {
     models_dir.join(model_id)
 }
 
-/// Returns `true` when every file in `spec` exists as a regular file on disk.
+/// Returns `true` when every file in `spec` exists as a non-empty regular file on disk.
 pub fn is_model_installed(models_dir: &Path, spec: &ModelSpec) -> bool {
     let base = model_dir(models_dir, spec.id);
-    spec.files.iter().all(|f| base.join(f.filename).is_file())
+    spec.files
+        .iter()
+        .all(|f| std::fs::metadata(base.join(f.filename)).is_ok_and(|m| m.is_file() && m.len() > 0))
 }
 
 fn validate_rel_filename(filename: &str) -> Result<PathBuf, AiError> {
@@ -453,9 +455,23 @@ impl ModelDownloader {
             if let Ok(meta) = tokio::fs::metadata(&final_path).await {
                 if meta.is_file() && meta.len() > 0 {
                     let existing_len = meta.len();
-                    let effective_total = total_hint.max(prior_bytes.saturating_add(existing_len));
-                    on_progress(prior_bytes.saturating_add(existing_len), effective_total);
-                    return Ok((String::new(), existing_len));
+                    // Verify existing file length against remote Content-Length when reachable so
+                    // truncated/corrupt files are re-downloaded instead of permanently stuck.
+                    let remote_len = self
+                        .client
+                        .head(url)
+                        .send()
+                        .await
+                        .ok()
+                        .filter(|r| r.status().is_success())
+                        .and_then(|r| r.content_length());
+                    if remote_len.is_none_or(|len| len == existing_len) {
+                        let effective_total =
+                            total_hint.max(prior_bytes.saturating_add(existing_len));
+                        on_progress(prior_bytes.saturating_add(existing_len), effective_total);
+                        return Ok((String::new(), existing_len));
+                    }
+                    let _ = tokio::fs::remove_file(&final_path).await;
                 }
             }
         }
@@ -504,6 +520,38 @@ impl ModelDownloader {
                 "HTTP {} downloading {url}",
                 resp.status()
             )));
+        }
+
+        // Validate `Content-Range` on 206 Partial Content so a proxy/upstream returning a different
+        // offset never appends corrupt bytes onto a stale `.part` file.
+        let range_matches_offset = existing_part_len > 0
+            && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            && resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|cr| {
+                    cr.trim()
+                        .starts_with(&format!("bytes {existing_part_len}-"))
+                });
+        if existing_part_len > 0
+            && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            && !range_matches_offset
+        {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            existing_part_len = 0;
+            resp = tokio::select! {
+                _ = cancel.cancelled() => return Err(AiError::Cancelled),
+                res = self.client.get(url).send() => {
+                    res.map_err(|e| AiError::ModelDownload(format!("GET {url}: {e}")))?
+                }
+            };
+            if !resp.status().is_success() {
+                return Err(AiError::ModelDownload(format!(
+                    "HTTP {} downloading {url}",
+                    resp.status()
+                )));
+            }
         }
 
         let is_resumed =

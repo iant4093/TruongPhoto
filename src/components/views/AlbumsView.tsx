@@ -146,12 +146,21 @@ export const AlbumsView: React.FC = () => {
     }
   }, [selectedAlbumId, loadDetail, libraryRevision]);
 
+  // Reset scroll position when drilling into or leaving an album
+  useEffect(() => {
+    const viewport = document.querySelector('.content-viewport');
+    if (viewport) viewport.scrollTop = 0;
+  }, [selectedAlbumId]);
+
+  const modalBusyRef = useRef(false);
+  modalBusyRef.current = creating || savingEdit || savingShares;
+
   // Escape key for modals
   useEffect(() => {
     if (!createOpen && !editOpen && !shareOpen) return;
     const layer = pushEscapeLayer();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && isTopEscapeLayer(layer)) {
+      if (event.key === 'Escape' && isTopEscapeLayer(layer) && !modalBusyRef.current) {
         event.preventDefault();
         event.stopPropagation();
         if (shareOpen) setShareOpen(false);
@@ -293,7 +302,8 @@ export const AlbumsView: React.FC = () => {
   const handleRemoveAssetsFromAlbum = async (assetIds: string[], clearSelection: () => void) => {
     if (!detail || assetIds.length === 0) return;
     try {
-      const res = await removeAlbumAssets(detail.album.id, assetIds);
+      const albumId = detail.album.id;
+      const res = await removeAlbumAssets(albumId, assetIds);
       const removedSet = new Set(assetIds);
       setDetail((prev) =>
         prev
@@ -306,6 +316,13 @@ export const AlbumsView: React.FC = () => {
               },
             }
           : prev,
+      );
+      setItems((prev) =>
+        prev.map((a) =>
+          a.id === albumId
+            ? { ...a, asset_count: Math.max(0, a.asset_count - res.removed_count) }
+            : a,
+        ),
       );
       clearSelection();
       notifySuccess(`Removed ${res.removed_count} item${res.removed_count === 1 ? '' : 's'} from album`);
@@ -447,7 +464,7 @@ export const AlbumsView: React.FC = () => {
         ) : null}
 
         {editOpen && (
-          <div className="modal-backdrop" onClick={() => setEditOpen(false)}>
+          <div className="modal-backdrop" onClick={() => { if (!savingEdit) setEditOpen(false); }}>
             <form
               className="panel upload-modal stack"
               role="dialog"
@@ -509,7 +526,7 @@ export const AlbumsView: React.FC = () => {
         )}
 
         {shareOpen && (
-          <div className="modal-backdrop" onClick={() => setShareOpen(false)}>
+          <div className="modal-backdrop" onClick={() => { if (!savingShares) setShareOpen(false); }}>
             <form
               className="panel share-modal stack"
               role="dialog"
@@ -550,13 +567,18 @@ export const AlbumsView: React.FC = () => {
                         className="row"
                         style={{
                           justifyContent: 'space-between',
+                          flexWrap: 'wrap',
+                          gap: 8,
                           padding: '8px 10px',
                           border: '1px solid var(--border)',
                           borderRadius: 6,
                           background: '#1e1e1e',
                         }}
                       >
-                        <label className="row" style={{ cursor: 'pointer', gap: 8 }}>
+                        <label
+                          className="row"
+                          style={{ cursor: 'pointer', gap: 8, minWidth: 0, flex: '1 1 130px' }}
+                        >
                           <input
                             type="checkbox"
                             checked={isShared}
@@ -568,10 +590,12 @@ export const AlbumsView: React.FC = () => {
                               }))
                             }
                           />
-                          <span>{u.display_name}</span>
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {u.display_name}
+                          </span>
                         </label>
                         {isShared && (
-                          <div style={{ minWidth: 145 }}>
+                          <div style={{ minWidth: 135, maxWidth: '100%' }}>
                             <Dropdown
                               label={`Permission for ${u.display_name}`}
                               value={perm}
@@ -759,7 +783,7 @@ export const AlbumsView: React.FC = () => {
       )}
 
       {createOpen && (
-        <div className="modal-backdrop" onClick={() => setCreateOpen(false)}>
+        <div className="modal-backdrop" onClick={() => { if (!creating) setCreateOpen(false); }}>
           <form
             className="panel upload-modal stack"
             role="dialog"

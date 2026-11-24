@@ -171,20 +171,63 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             server_config.host = trimmed.to_string();
         }
     }
+    let mut explicit_port = false;
     if let Ok(port_str) = std::env::var("TP_PORT") {
         if let Ok(port) = port_str.trim().parse::<u16>() {
             server_config.port = port;
+            explicit_port = true;
         }
     }
 
     let (power_tx, power_rx) = tokio::sync::watch::channel(PowerState::default());
     let power_monitor = power::start_power_monitor(power_tx);
 
-    let server_handle = match tauri::async_runtime::block_on(truongphoto_server::start_server(
-        server_config,
-        db.clone(),
-        power_rx.clone(),
-    )) {
+    let requested_port = server_config.port;
+    let start_result = tauri::async_runtime::block_on(async {
+        let mut last_err = None;
+        for attempt in 0..5u32 {
+            match truongphoto_server::start_server(
+                server_config.clone(),
+                db.clone(),
+                power_rx.clone(),
+            )
+            .await
+            {
+                Ok(handle) => return Ok(handle),
+                Err(err) => {
+                    let is_addr_in_use = err
+                        .chain()
+                        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                        .any(|io_err| io_err.kind() == std::io::ErrorKind::AddrInUse);
+                    if is_addr_in_use && attempt < 4 {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        last_err = Some((err, true));
+                        continue;
+                    }
+                    last_err = Some((err, is_addr_in_use));
+                    break;
+                }
+            }
+        }
+        let (err, is_addr_in_use) = last_err.expect("at least one start attempt");
+        if is_addr_in_use && !explicit_port && server_config.port != 0 {
+            tracing::warn!(
+                "port {} is already in use; falling back to an available local port",
+                requested_port
+            );
+            server_config.port = 0;
+            return truongphoto_server::start_server(server_config, db.clone(), power_rx.clone())
+                .await;
+        }
+        if is_addr_in_use {
+            return Err(anyhow::anyhow!(
+                "Port {requested_port} is already in use by another application. Quit the other process or set TP_PORT to a different port."
+            ));
+        }
+        Err(err)
+    });
+
+    let server_handle = match start_result {
         Ok(handle) => handle,
         Err(err) => {
             power_monitor.stop();
@@ -247,11 +290,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let builder = tauri::WebviewWindowBuilder::new(app, "main", main_url)
         .title("TruongPhoto")
         .visible(false)
-        .background_color(tauri::window::Color(0x20, 0x20, 0x20, 0xFF))
         .inner_size(1280.0, 820.0)
         .min_inner_size(980.0, 640.0)
         .decorations(cfg!(target_os = "macos"))
-        .transparent(true)
+        // On Windows, frameless rounded corners require a transparent WebView2 + Win32 window
+        // without an opaque background_color (which fills WM_ERASEBKGND/softbuffer with solid RGB).
+        // On macOS, native AppKit decorations provide rounded corners and #202020 prevents startup flash.
+        .transparent(!cfg!(target_os = "macos"))
         .shadow(true)
         .center()
         .theme(Some(tauri::Theme::Dark))
@@ -306,6 +351,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "macos")]
     let builder = builder
+        .background_color(tauri::window::Color(0x20, 0x20, 0x20, 0xFF))
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
         .traffic_light_position(tauri::LogicalPosition::new(20.0, 18.0));
@@ -459,10 +505,13 @@ fn report_fatal_startup_error(message: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let escaped = message
+        let full_msg = format!(
+            "{message} (Check startup-error.log in your TruongPhoto data folder for details.)"
+        );
+        let escaped = full_msg
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
-            .replace('\n', " ");
+            .replace(['\r', '\n'], " ");
         let script = format!(
             "display alert \"TruongPhoto Failed to Start\" message \"{escaped}\" as critical"
         );

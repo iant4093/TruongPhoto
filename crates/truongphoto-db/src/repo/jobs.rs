@@ -251,3 +251,17 @@ pub fn count_active_jobs(conn: &Connection) -> DbResult<u64> {
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
+
+/// Marks orphaned `queued` or `running` jobs from a previous crashed process as `cancelled`.
+pub fn cancel_stale_inflight_jobs(conn: &Connection, now_ms: i64) -> DbResult<usize> {
+    let affected = conn.execute(
+        "UPDATE jobs
+         SET status = 'cancelled',
+             error_message = COALESCE(error_message, 'Interrupted by server restart'),
+             finished_at_ms = ?1,
+             updated_at_ms = ?1
+         WHERE status IN ('queued', 'running')",
+        params![now_ms],
+    )?;
+    Ok(affected)
+}

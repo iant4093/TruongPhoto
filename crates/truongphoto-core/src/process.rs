@@ -195,6 +195,41 @@ pub fn rename_with_windows_retry(from: &Path, to: &Path) -> std::io::Result<()> 
     }))
 }
 
+/// Atomically writes `bytes` to `dest` via a sibling temporary file and [`rename_with_windows_retry`].
+pub fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let parent = dest
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp_path = parent.join(format!(".{file_name}.tmp-{pid}-{seq}"));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    if let Err(err) = rename_with_windows_retry(&tmp_path, dest) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn strip_windows_verbatim(path: &str) -> String {
     if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
         let candidate = format!(r"\\{unc}");

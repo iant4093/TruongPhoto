@@ -453,6 +453,23 @@ fn merge_string_lists(prior: &[String], next: &[String]) -> Vec<String> {
     merged
 }
 
+/// Shifts calendar-date UTC midnight bounds in `plan` by `-tz_offset_minutes` so they represent
+/// the user's true local-day UTC interval (e.g. UTC-8 `2026-11-23` -> `08:00Z..07:59:59.999Z`).
+pub fn shift_plan_dates_to_utc(plan: &mut RouterPlan, tz_offset_minutes: Option<i32>) {
+    if let Some(offset_min) = tz_offset_minutes {
+        let clamped = offset_min.clamp(-14 * 60, 14 * 60);
+        if clamped != 0 {
+            let offset_ms = i64::from(clamped) * 60_000;
+            if let Some(ms) = plan.date_from_ms {
+                plan.date_from_ms = Some(ms.saturating_sub(offset_ms));
+            }
+            if let Some(ms) = plan.date_to_ms {
+                plan.date_to_ms = Some(ms.saturating_sub(offset_ms));
+            }
+        }
+    }
+}
+
 /// Merges a turn's `RouterPlan` over `prior` active filters.
 ///
 /// When `next.clear_prior_filters` is `true`, prior filters are discarded and `next` is returned

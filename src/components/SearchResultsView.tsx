@@ -109,10 +109,18 @@ export const SearchResultsView: React.FC = () => {
   const searchLoading = useAppStore((s) => s.searchLoading);
   const searchLoadingMore = useAppStore((s) => s.searchLoadingMore);
   const searchError = useAppStore((s) => s.searchError);
+  const libraryRevision = useAppStore((s) => s.libraryRevision);
   const runSearch = useAppStore((s) => s.runSearch);
   const loadMoreSearch = useAppStore((s) => s.loadMoreSearch);
   const clearSearch = useAppStore((s) => s.clearSearch);
   const openLightbox = useAppStore((s) => s.openLightbox);
+
+  const initialRevisionRef = React.useRef(libraryRevision);
+  React.useEffect(() => {
+    if (libraryRevision === initialRevisionRef.current) return;
+    initialRevisionRef.current = libraryRevision;
+    void runSearch({ offset: 0 }).catch(() => {});
+  }, [libraryRevision, runSearch]);
 
   const hits = searchResponse?.items ?? [];
   const totalCount = searchResponse?.total_count ?? 0;

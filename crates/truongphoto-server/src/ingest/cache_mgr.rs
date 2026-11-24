@@ -127,6 +127,12 @@ impl CacheManager {
         let now_ms = Utc::now().timestamp_millis();
         let should_update = {
             let mut map = self.last_touched.lock();
+            if map.len() > 4_096 {
+                map.retain(|_, prev| now_ms.saturating_sub(*prev) < TOUCH_THROTTLE_MS);
+                if map.len() > 4_096 {
+                    map.clear();
+                }
+            }
             match map.get(cache_key) {
                 Some(&prev) if now_ms.saturating_sub(prev) < TOUCH_THROTTLE_MS => false,
                 _ => {
@@ -226,10 +232,9 @@ pub(crate) fn safe_join_no_symlinks(root: &Path, rel: &str) -> Option<PathBuf> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
         }
     }
-    if let Ok(canon_target) = std::fs::canonicalize(&joined) {
-        if !canon_target.starts_with(&canon_root) {
-            return None;
-        }
+    let canon_target = std::fs::canonicalize(&joined).ok()?;
+    if !canon_target.starts_with(&canon_root) {
+        return None;
     }
     Some(joined)
 }

@@ -982,6 +982,7 @@ pub async fn send_message(
         known_lenses: known_lenses.clone(),
         library: library_context,
         current_date_utc: local_now,
+        tz_offset_minutes: clamped_tz_offset_min,
     };
 
     let active_chat_tier = ai_state.active_chat_tier;
@@ -992,24 +993,6 @@ pub async fn send_message(
     .await
     .map_err(|e| AppError::internal(format!("Chat router worker panicked: {e}")))?
     .map_err(|e| AppError::internal(format!("Chat query routing failed: {e}")))?;
-
-    // Convert newly-produced calendar-date UTC midnight bounds into the user's actual local
-    // midnight UTC timestamps (e.g. UTC-8 "today" covers 08:00Z..07:59:59.999Z next day).
-    if let Some(offset_min) = clamped_tz_offset_min {
-        if offset_min != 0 {
-            let offset_ms = i64::from(offset_min) * 60_000;
-            if plan.date_from_ms != session.active_filters.date_from_ms {
-                if let Some(ms) = plan.date_from_ms {
-                    plan.date_from_ms = Some(ms.saturating_sub(offset_ms));
-                }
-            }
-            if plan.date_to_ms != session.active_filters.date_to_ms {
-                if let Some(ms) = plan.date_to_ms {
-                    plan.date_to_ms = Some(ms.saturating_sub(offset_ms));
-                }
-            }
-        }
-    }
 
     let is_answer_only = plan.intent.as_deref() == Some("answer");
     let resolved_people = if is_answer_only {
@@ -1126,7 +1109,24 @@ pub async fn send_message(
             .collect();
 
         let pipeline = Arc::clone(state.ai.pipeline());
-        let query_for_vlm = content.clone();
+        // Pass the effective visual intent (combining active semantic_query with follow-up text
+        // when they differ, e.g. Turn 1 "sunset over mountains" -> Turn 2 "only vertical ones").
+        let query_for_vlm = match plan
+            .semantic_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(sq)
+                if !content
+                    .to_ascii_lowercase()
+                    .contains(&sq.to_ascii_lowercase()) =>
+            {
+                format!("{sq} ({content})")
+            }
+            Some(sq) => sq.to_string(),
+            None => content.clone(),
+        };
 
         let rerank_outcome = tokio::task::spawn_blocking(move || {
             let candidates: Vec<RerankCandidate> = candidate_meta

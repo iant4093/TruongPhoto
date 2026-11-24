@@ -59,21 +59,17 @@ const SearchOmnibar: React.FC<{
         e.preventDefault();
         void runSearch({
           query: searchQuery.trim() || null,
+          // Reset chat-only filters not exposed in SearchFilterBar while preserving
+          // user-selected SearchFilterBar EXIF/orientation/camera/date/person filters.
           ocr_query: undefined,
           exclude_person_ids: undefined,
           has_people: undefined,
           min_faces: undefined,
           max_faces: undefined,
-          lens_model: undefined,
-          focal_length_min_mm: undefined,
-          focal_length_max_mm: undefined,
           aperture_min_f: undefined,
-          aperture_max_f: undefined,
-          iso_min: undefined,
           iso_max: undefined,
           shutter_speed_min_sec: undefined,
           shutter_speed_max_sec: undefined,
-          orientation: undefined,
           sort_by: undefined,
           exclude_geo_query: undefined,
           exclude_kind: undefined,
@@ -91,7 +87,9 @@ const SearchOmnibar: React.FC<{
           onChange={(e) => setSearchQuery(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Escape') {
+              e.preventDefault();
               e.stopPropagation();
+              e.nativeEvent.stopImmediatePropagation();
               if (searchActive || searchQuery) clearSearch();
               else inputRef.current?.blur();
             }
@@ -203,24 +201,34 @@ export const App: React.FC = () => {
     }
   }, [activeNav, searchActive]);
 
-  // Lightweight browser history integration so mobile Back closes Lightbox instead of leaving the app
+  // Lightweight browser history integration so mobile Back closes Lightbox (or its Info sheet first)
+  // instead of leaving the web app, guarded against async window.history.back() close->reopen races.
   const lightboxHistoryPushedRef = useRef(false);
+  const pendingProgrammaticBacksRef = useRef(0);
   useEffect(() => {
     if (isTauri() || typeof window === 'undefined' || typeof window.history === 'undefined') return;
     if (lightboxAssetId !== null && !lightboxHistoryPushedRef.current) {
       lightboxHistoryPushedRef.current = true;
       try {
-        window.history.pushState({ tpLightbox: true }, '');
+        const prevState =
+          window.history.state && typeof window.history.state === 'object'
+            ? (window.history.state as Record<string, unknown>)
+            : {};
+        window.history.pushState({ ...prevState, tpLightbox: true }, '');
       } catch {
         // Ignore restricted history contexts
       }
     } else if (lightboxAssetId === null && lightboxHistoryPushedRef.current) {
       lightboxHistoryPushedRef.current = false;
       if ((window.history.state as { tpLightbox?: boolean } | null)?.tpLightbox) {
+        pendingProgrammaticBacksRef.current += 1;
         try {
           window.history.back();
         } catch {
-          // Ignore
+          pendingProgrammaticBacksRef.current = Math.max(
+            0,
+            pendingProgrammaticBacksRef.current - 1,
+          );
         }
       }
     }
@@ -229,7 +237,44 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (isTauri() || typeof window === 'undefined') return;
     const onPopState = () => {
+      if (pendingProgrammaticBacksRef.current > 0) {
+        pendingProgrammaticBacksRef.current -= 1;
+        // If user reopened Lightbox before our async programmatic history.back() settled,
+        // ensure the Lightbox history entry is present again.
+        if (
+          useAppStore.getState().lightboxAssetId !== null &&
+          !(window.history.state as { tpLightbox?: boolean } | null)?.tpLightbox
+        ) {
+          lightboxHistoryPushedRef.current = true;
+          try {
+            const prevState =
+              window.history.state && typeof window.history.state === 'object'
+                ? (window.history.state as Record<string, unknown>)
+                : {};
+            window.history.pushState({ ...prevState, tpLightbox: true }, '');
+          } catch {
+            // Ignore
+          }
+        }
+        return;
+      }
       if (useAppStore.getState().lightboxAssetId !== null) {
+        const ev = new CustomEvent('tp:lightbox-popstate', { cancelable: true });
+        window.dispatchEvent(ev);
+        if (ev.defaultPrevented) {
+          // Lightbox handled Back (e.g. closed its Info sheet); re-arm the history entry.
+          try {
+            const prevState =
+              window.history.state && typeof window.history.state === 'object'
+                ? (window.history.state as Record<string, unknown>)
+                : {};
+            window.history.pushState({ ...prevState, tpLightbox: true }, '');
+            lightboxHistoryPushedRef.current = true;
+          } catch {
+            // Ignore
+          }
+          return;
+        }
         lightboxHistoryPushedRef.current = false;
         useAppStore.getState().closeLightbox();
       }

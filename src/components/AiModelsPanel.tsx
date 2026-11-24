@@ -572,7 +572,7 @@ export const AiModelsPanel: React.FC = () => {
           )}
 
           {(visionStatus.status === 'not_installed' || visionStatus.status === 'error') && (
-            <div className="row" style={{ justifyContent: 'space-between', paddingTop: 4 }}>
+            <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, paddingTop: 4 }}>
               <span className="view-subtitle" style={{ marginTop: 0 }}>
                 Download required ({formatBytes(visionStatus.bytesTotal)})
               </span>
@@ -620,7 +620,7 @@ export const AiModelsPanel: React.FC = () => {
             </div>
           )}
 
-          <div className="row" style={{ justifyContent: 'space-between', marginTop: 'auto', paddingTop: 4 }}>
+          <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginTop: 'auto', paddingTop: 4 }}>
             <span className="view-subtitle" style={{ marginTop: 0 }}>
               {faceStatus.status === 'installed'
                 ? 'Face detector & recognizer installed'
@@ -669,7 +669,7 @@ export const AiModelsPanel: React.FC = () => {
             </div>
           )}
 
-          <div className="row" style={{ justifyContent: 'space-between', marginTop: 'auto', paddingTop: 4 }}>
+          <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginTop: 'auto', paddingTop: 4 }}>
             <span className="view-subtitle" style={{ marginTop: 0 }}>
               {ocrStatus.status === 'installed'
                 ? 'Text detector & reader installed'
@@ -770,7 +770,7 @@ export const AiModelsPanel: React.FC = () => {
                     {activeChatModel.error_message}
                   </div>
                 )}
-                <div className="row" style={{ justifyContent: 'space-between' }}>
+                <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
                   <span className="view-subtitle" style={{ marginTop: 0 }}>
                     Model download required ({formatBytes(activeChatModel.approx_bytes)})
                   </span>
@@ -930,6 +930,7 @@ export const AiModelsPanel: React.FC = () => {
                 <SegmentedControl
                   value={activeChatTier}
                   options={CHAT_TIER_OPTIONS}
+                  disabled={busyControl !== null}
                   onChange={(tier) => {
                     if (tier !== activeChatTier) {
                       void handleSetChatTier(tier);

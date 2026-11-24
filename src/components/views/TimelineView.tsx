@@ -31,6 +31,7 @@ export const TimelineView: React.FC = () => {
     if (!hasLoadedOnceRef.current) {
       setLoading(true);
     }
+    setLoadingMore(false);
     setError(null);
     setLoadMoreError(false);
     try {
@@ -126,6 +127,7 @@ export const TimelineView: React.FC = () => {
           assets={items}
           hasMore={nextCursor !== null && !loadMoreError}
           loadingMore={loadingMore}
+          loadMoreError={loadMoreError}
           onLoadMore={handleLoadMore}
           onAssetUpdated={handleAssetUpdated}
           onAssetsTrashed={handleAssetsTrashed}

@@ -328,16 +328,7 @@ pub fn encode_webp_resized(
 }
 
 fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> Result<(), MediaError> {
-    let parent = dest.parent().ok_or_else(|| {
-        MediaError::Decode("destination path has no parent directory".to_string())
-    })?;
-    std::fs::create_dir_all(parent)?;
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut tmp, bytes)?;
-    std::io::Write::flush(&mut tmp)?;
-    tmp.persist(dest).map_err(|e| MediaError::Io(e.error))?;
-    Ok(())
+    truongphoto_core::process::atomic_write_bytes(dest, bytes).map_err(MediaError::Io)
 }
 
 /// Generates a persistent 400px lossy WebP (Q80) thumbnail atomically and computes the 256-bin RGB+Luma histogram.

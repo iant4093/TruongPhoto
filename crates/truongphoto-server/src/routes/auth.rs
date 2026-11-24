@@ -78,9 +78,10 @@ pub async fn auth_status(
     let session_hash = raw_session.as_deref().map(hash_session_token);
     let now_ms = Utc::now().timestamp_millis();
 
+    let gate_key = state.gate_key_snapshot();
     let gate_passed = jar
         .get(GATE_COOKIE_NAME)
-        .map(|c| verify_gate_cookie(&state.gate_key, &peer.rate_key, c.value()))
+        .map(|c| verify_gate_cookie(&gate_key, &peer.rate_key, c.value()))
         .unwrap_or(false);
 
     let (initialized, desktop_pin_lock, auth_user, profiles) = state
@@ -177,7 +178,8 @@ pub async fn server_pin(
         .rate_limiter
         .record_success_scoped("server_pin", &peer.rate_key);
     let profiles = state.db.read(repo::users::list_active_profiles).await?;
-    let gate_cookie = issue_gate_cookie(&state.gate_key, &peer.rate_key, peer.is_https);
+    let gate_key = state.gate_key_snapshot();
+    let gate_cookie = issue_gate_cookie(&gate_key, &peer.rate_key, peer.is_https);
 
     Ok((jar.add(gate_cookie), Json(ServerPinResponse { profiles })))
 }
@@ -205,9 +207,10 @@ pub async fn login(
         return Err(AppError::rate_limited(retry_after_secs));
     }
 
+    let gate_key = state.gate_key_snapshot();
     let has_valid_gate = jar
         .get(GATE_COOKIE_NAME)
-        .map(|c| verify_gate_cookie(&state.gate_key, &peer.rate_key, c.value()))
+        .map(|c| verify_gate_cookie(&gate_key, &peer.rate_key, c.value()))
         .unwrap_or(false);
 
     let target_user_id_db = target_user_id.clone();

@@ -1,5 +1,5 @@
 // Toast stack and confirm dialog. Mount <FeedbackHost /> once per window.
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import { X } from 'lucide-react';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
 import { TOAST_ERROR_MS, TOAST_MS, useFeedback, type Toast } from '../store/feedback';
@@ -137,15 +137,18 @@ const STATUS_MS = 2500;
  */
 export const StatusBanner: React.FC = () => {
   const latest = useFeedback((s) => s.toasts[s.toasts.length - 1]);
-  const dismiss = useFeedback((s) => s.dismiss);
+  const clearAll = useCallback(() => {
+    const { toasts, dismiss } = useFeedback.getState();
+    for (const t of toasts) dismiss(t.id);
+  }, []);
   useEffect(() => {
     if (!latest) return;
     const timer = window.setTimeout(
-      () => dismiss(latest.id),
+      clearAll,
       latest.tone === 'error' ? TOAST_ERROR_MS : latest.undo ? TOAST_MS : STATUS_MS,
     );
     return () => window.clearTimeout(timer);
-  }, [latest, dismiss]);
+  }, [latest, clearAll]);
   return (
     <div className="status-banner-slot" aria-live="polite">
       {latest && (
@@ -162,7 +165,7 @@ export const StatusBanner: React.FC = () => {
               className="status-banner-undo"
               onClick={() => {
                 const undo = latest.undo;
-                dismiss(latest.id);
+                clearAll();
                 void Promise.resolve(undo?.()).catch(() => {});
               }}
             >
@@ -173,7 +176,7 @@ export const StatusBanner: React.FC = () => {
             type="button"
             className="status-banner-close"
             aria-label="Dismiss message"
-            onClick={() => dismiss(latest.id)}
+            onClick={clearAll}
           >
             <X size={12} />
           </button>

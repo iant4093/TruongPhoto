@@ -24,6 +24,7 @@ fn turn_input(msg: &str, prior: RouterPlan, people: &[&str]) -> ChatTurnInput {
         known_lenses: Vec::new(),
         library: Default::default(),
         current_date_utc: fixed_date(),
+        tz_offset_minutes: None,
     }
 }
 
@@ -434,6 +435,7 @@ fn deterministic_test_router_tier3_rerank_and_idle_eviction() {
         known_lenses: Vec::new(),
         library: Default::default(),
         current_date_utc: fixed_date(),
+        tz_offset_minutes: None,
     };
     let t0_plan = pipeline.chat.route_turn(ChatTier::Tier0, &input).unwrap();
     assert_eq!(t0_plan.semantic_query.as_deref(), Some("sunset beach"));

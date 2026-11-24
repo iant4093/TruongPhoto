@@ -196,9 +196,19 @@ pub async fn update_user(
         .map(str::to_string);
 
     let actor_id = auth.user.id.clone();
+    let actor_session_id = auth.session.id.clone();
     let ip_addr = Some(auth.peer.ip_string());
     let role_patch = req.role;
     let disabled_patch = req.disabled;
+    if req
+        .allowed_folder_ids
+        .as_ref()
+        .is_some_and(|ids| ids.len() > 500)
+    {
+        return Err(AppError::validation(
+            "allowed_folder_ids cannot exceed 500 entries.",
+        ));
+    }
     let acl_patch = req.allowed_folder_ids;
 
     let user_view = state
@@ -240,6 +250,14 @@ pub async fn update_user(
             if disabled_patch == Some(true) || (pin_changed && target_id != actor_id) {
                 let now_ms = Utc::now().timestamp_millis();
                 repo::sessions::revoke_sessions_for_user(&tx, &target_id, now_ms)?;
+            } else if pin_changed && target_id == actor_id {
+                let now_ms = Utc::now().timestamp_millis();
+                repo::sessions::revoke_other_sessions_for_user(
+                    &tx,
+                    &target_id,
+                    &actor_session_id,
+                    now_ms,
+                )?;
             }
 
             if let Some(ref folder_ids) = acl_patch {
@@ -387,6 +405,9 @@ pub async fn update_server_pin(
             Ok(())
         })
         .await?;
+
+    let next_gate_key = crate::auth::generate_process_key()?;
+    state.rotate_gate_key(next_gate_key);
 
     Ok(StatusCode::NO_CONTENT)
 }

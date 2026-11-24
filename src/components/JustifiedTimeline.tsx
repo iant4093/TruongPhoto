@@ -50,6 +50,7 @@ export interface JustifiedTimelineProps {
   assets: AssetSummary[];
   hasMore?: boolean;
   loadingMore?: boolean;
+  loadMoreError?: boolean;
   onLoadMore?: () => void;
   onAssetUpdated?: (assetId: string, patch: Partial<AssetSummary>) => void;
   onAssetsTrashed?: (assetIds: string[]) => void;
@@ -60,6 +61,7 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
   assets,
   hasMore = false,
   loadingMore = false,
+  loadMoreError = false,
   onLoadMore,
   onAssetUpdated,
   onAssetsTrashed,
@@ -188,16 +190,27 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
   const clearSelectionRef = useRef(clearSelection);
   clearSelectionRef.current = clearSelection;
   const touchLongPressTimerRef = useRef<number | null>(null);
+  const touchLongPressStartRef = useRef<{ x: number; y: number } | null>(null);
   const suppressNextClickIdRef = useRef<string | null>(null);
+  const suppressClearTimerRef = useRef<number | null>(null);
 
   const clearTileLongPress = useCallback(() => {
     if (touchLongPressTimerRef.current !== null) {
       window.clearTimeout(touchLongPressTimerRef.current);
       touchLongPressTimerRef.current = null;
     }
+    touchLongPressStartRef.current = null;
   }, []);
 
-  useEffect(() => clearTileLongPress, [clearTileLongPress]);
+  useEffect(() => {
+    return () => {
+      clearTileLongPress();
+      if (suppressClearTimerRef.current !== null) {
+        window.clearTimeout(suppressClearTimerRef.current);
+        suppressClearTimerRef.current = null;
+      }
+    };
+  }, [clearTileLongPress]);
 
   // Pressing Escape clears active multi-selection cleanly when no modal/lightbox/menu is on top.
   // Keyed strictly on `hasSelection` boolean so selecting more items or toggling albumPicker never
@@ -388,18 +401,43 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
               onTouchStart={(e) => {
                 if (!(canMutate || Boolean(extraBulkActions)) || e.touches.length !== 1) return;
                 clearTileLongPress();
+                const touch = e.touches[0];
+                touchLongPressStartRef.current = { x: touch.clientX, y: touch.clientY };
                 touchLongPressTimerRef.current = window.setTimeout(() => {
                   touchLongPressTimerRef.current = null;
                   suppressNextClickIdRef.current = asset.id;
+                  if (suppressClearTimerRef.current !== null) {
+                    window.clearTimeout(suppressClearTimerRef.current);
+                  }
+                  suppressClearTimerRef.current = window.setTimeout(() => {
+                    if (suppressNextClickIdRef.current === asset.id) {
+                      suppressNextClickIdRef.current = null;
+                    }
+                    suppressClearTimerRef.current = null;
+                  }, 700);
                   toggleSelect(asset.id, false);
                 }, 420);
               }}
-              onTouchMove={clearTileLongPress}
+              onTouchMove={(e) => {
+                const start = touchLongPressStartRef.current;
+                if (!start || e.touches.length !== 1) {
+                  clearTileLongPress();
+                  return;
+                }
+                const touch = e.touches[0];
+                if (Math.hypot(touch.clientX - start.x, touch.clientY - start.y) > 10) {
+                  clearTileLongPress();
+                }
+              }}
               onTouchEnd={clearTileLongPress}
               onTouchCancel={clearTileLongPress}
               onClick={(e) => {
                 if (suppressNextClickIdRef.current === asset.id) {
                   suppressNextClickIdRef.current = null;
+                  if (suppressClearTimerRef.current !== null) {
+                    window.clearTimeout(suppressClearTimerRef.current);
+                    suppressClearTimerRef.current = null;
+                  }
                   return;
                 }
                 if (
@@ -414,6 +452,16 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                 openLightbox(asset.id, allAssetIds);
               }}
               onContextMenu={(e) => {
+                // On coarse-pointer touch browsers (Android Chrome / mobile Safari), prevent the
+                // desktop context menu from colliding with our long-press multi-select gesture.
+                if (
+                  typeof window !== 'undefined' &&
+                  typeof window.matchMedia === 'function' &&
+                  window.matchMedia('(pointer: coarse)').matches
+                ) {
+                  e.preventDefault();
+                  return;
+                }
                 openContextMenu(e, [
                   {
                     id: 'tile-open',
@@ -595,8 +643,28 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
         </div>
       )}
 
+      {!loadingMore && loadMoreError && onLoadMore && (
+        <div
+          className="row"
+          style={{ justifyContent: 'center', gap: 10, padding: '14px 0' }}
+          role="alert"
+        >
+          <span className="view-subtitle" style={{ marginTop: 0 }}>
+            Couldn&apos;t load more items.
+          </span>
+          <button type="button" className="button" onClick={onLoadMore}>
+            Retry
+          </button>
+        </div>
+      )}
+
       {selectedIds.size > 0 && (
-        <div className="bulk-action-bar" role="region" aria-label="Bulk selection actions">
+        <div
+          className="bulk-action-bar"
+          role="region"
+          aria-label="Bulk selection actions"
+          style={{ position: 'fixed' }}
+        >
           <span style={{ fontSize: 12, fontWeight: 500, padding: '0 6px' }}>
             {selectedIds.size} selected
           </span>
@@ -613,7 +681,7 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                 Favorite
               </button>
 
-              <div ref={albumPickerRef} style={{ position: 'relative' }}>
+              <div ref={albumPickerRef}>
                 <button
                   type="button"
                   className="button"
@@ -634,8 +702,9 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                     style={{
                       position: 'absolute',
                       bottom: 'calc(100% + 8px)',
-                      left: 0,
-                      width: 240,
+                      left: '50%',
+                      transform: 'translateX(-50%)',
+                      width: 'min(260px, calc(100vw - 32px))',
                       maxHeight: 240,
                       overflowY: 'auto',
                       padding: 8,
@@ -679,19 +748,21 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                   </div>
                 )}
               </div>
-
-              {extraBulkActions?.(Array.from(selectedIds), clearSelection)}
-
-              <button
-                type="button"
-                className="button button-danger-quiet"
-                disabled={bulkBusy}
-                onClick={() => void handleBulkTrash()}
-              >
-                <Trash2 size={13} />
-                Move to Trash
-              </button>
             </>
+          )}
+
+          {extraBulkActions?.(Array.from(selectedIds), clearSelection)}
+
+          {canMutate && (
+            <button
+              type="button"
+              className="button button-danger-quiet"
+              disabled={bulkBusy}
+              onClick={() => void handleBulkTrash()}
+            >
+              <Trash2 size={13} />
+              Move to Trash
+            </button>
           )}
 
           <button type="button" className="button button-quiet" onClick={clearSelection}>

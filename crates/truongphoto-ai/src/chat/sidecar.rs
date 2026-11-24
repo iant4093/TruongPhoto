@@ -1,5 +1,6 @@
 use crate::chat::schema::{
-    merge_router_plan, parse_and_validate_router_plan, ROUTER_PLAN_JSON_SCHEMA,
+    merge_router_plan, parse_and_validate_router_plan, shift_plan_dates_to_utc,
+    ROUTER_PLAN_JSON_SCHEMA,
 };
 use crate::chat::{
     ChatRouterBackend, ChatTurnInput, ClassicChatRouter, RerankCandidate, RerankResult,
@@ -477,12 +478,13 @@ impl ChatRouterBackend for SidecarLlamaRouter {
                         {
                             self.touch_last_used();
                             if let Ok(mut parsed) = parse_and_validate_router_plan(&c) {
-                                sanitize_sidecar_plan(
+                                sanitize_sidecar_plan_with_tz(
                                     &input.user_message,
                                     &input.prior_filters,
                                     &input.library.known_folders,
                                     &input.known_person_names,
                                     input.current_date_utc,
+                                    input.tz_offset_minutes,
                                     &mut parsed,
                                 );
                                 return Ok(merge_router_plan(&input.prior_filters, &parsed));
@@ -498,12 +500,13 @@ impl ChatRouterBackend for SidecarLlamaRouter {
 
         match parse_and_validate_router_plan(&content) {
             Ok(mut parsed) => {
-                sanitize_sidecar_plan(
+                sanitize_sidecar_plan_with_tz(
                     &input.user_message,
                     &input.prior_filters,
                     &input.library.known_folders,
                     &input.known_person_names,
                     input.current_date_utc,
+                    input.tz_offset_minutes,
                     &mut parsed,
                 );
                 Ok(merge_router_plan(&input.prior_filters, &parsed))
@@ -731,6 +734,10 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         matches!(self.ensure_server_port(tier), Ok(Some(_)))
     }
 
+    fn clear_cpu_fallback(&self) {
+        self.cpu_fallback_tiers.lock().clear();
+    }
+
     fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.loaded.store(false, Ordering::Release);
@@ -908,7 +915,7 @@ fn shift_calendar_month(year: i32, month: u32, delta_months: i32) -> (i32, u32) 
     (y, m)
 }
 
-fn compact_prior_filters_json(prior: &RouterPlan) -> String {
+fn compact_prior_filters_json(prior: &RouterPlan, tz_offset_minutes: Option<i32>) -> String {
     let mut map = serde_json::Map::new();
     if let Some(v) = &prior.semantic_query {
         map.insert("semantic_query".into(), json!(v));
@@ -988,13 +995,16 @@ fn compact_prior_filters_json(prior: &RouterPlan) -> String {
     if let Some(v) = prior.favorite {
         map.insert("favorite".into(), json!(v));
     }
+    let tz_offset_ms = tz_offset_minutes
+        .map(|m| i64::from(m.clamp(-14 * 60, 14 * 60)) * 60_000)
+        .unwrap_or(0);
     if let Some(ms) = prior.date_from_ms {
-        if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
+        if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms.saturating_add(tz_offset_ms)) {
             map.insert("date_from".into(), json!(dt.format("%Y-%m-%d").to_string()));
         }
     }
     if let Some(ms) = prior.date_to_ms {
-        if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
+        if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms.saturating_add(tz_offset_ms)) {
             map.insert("date_to".into(), json!(dt.format("%Y-%m-%d").to_string()));
         }
     }
@@ -1002,7 +1012,7 @@ fn compact_prior_filters_json(prior: &RouterPlan) -> String {
 }
 
 fn build_router_system_prompt(tier: ChatTier, input: &ChatTurnInput) -> String {
-    let prior_json = compact_prior_filters_json(&input.prior_filters);
+    let prior_json = compact_prior_filters_json(&input.prior_filters, input.tz_offset_minutes);
     let today = input.current_date_utc.date_naive();
     let cur_y = today.year();
     let cur_m = today.month();
@@ -1505,28 +1515,92 @@ pub(crate) fn try_apply_filter_removal(
         updated.semantic_query = None;
         removed_any = true;
     }
-    if has_word(target_clause, "location")
-        || has_word(target_clause, "place")
-        || has_word(target_clause, "folder")
-    {
-        updated.location_query = None;
+    // Check exclusion removal FIRST so `"remove the exclude location filter"` / `"remove the exclude person filter"`
+    // only clears the exclusion without wiping the positive `location_query` or `person_names` filter.
+    let is_exclusion_removal = has_word(target_clause, "exclude")
+        || has_word(target_clause, "excluding")
+        || has_word(target_clause, "exclusion")
+        || has_word(target_clause, "without")
+        || has_word(target_clause, "not");
+    if is_exclusion_removal {
+        let targets_loc = has_word(target_clause, "location")
+            || has_word(target_clause, "place")
+            || has_word(target_clause, "folder");
+        let targets_person = has_word(target_clause, "person") || has_word(target_clause, "people");
+        let targets_kind = has_word(target_clause, "kind")
+            || has_word(target_clause, "video")
+            || has_word(target_clause, "videos")
+            || has_word(target_clause, "raw");
+        if targets_loc || targets_person || targets_kind {
+            if targets_loc {
+                updated.exclude_location_query = None;
+            }
+            if targets_person {
+                if let Some(val) = target_val {
+                    updated
+                        .exclude_person_names
+                        .retain(|p| p.trim().to_ascii_lowercase() != val);
+                } else {
+                    updated.exclude_person_names.clear();
+                }
+            }
+            if targets_kind {
+                updated.exclude_kind = None;
+            }
+        } else if let Some(val) = target_val {
+            let before_people = updated.exclude_person_names.len();
+            updated
+                .exclude_person_names
+                .retain(|p| p.trim().to_ascii_lowercase() != val);
+            let removed_person = updated.exclude_person_names.len() < before_people;
+            let removed_loc = updated
+                .exclude_location_query
+                .as_deref()
+                .is_some_and(|l| l.trim().to_ascii_lowercase() == val);
+            if removed_loc {
+                updated.exclude_location_query = None;
+            }
+            let removed_kind = updated
+                .exclude_kind
+                .is_some_and(|k| val.contains(k.as_str()));
+            if removed_kind {
+                updated.exclude_kind = None;
+            }
+            if !removed_person && !removed_loc && !removed_kind {
+                updated.exclude_person_names.clear();
+                updated.exclude_location_query = None;
+                updated.exclude_kind = None;
+            }
+        } else {
+            updated.exclude_person_names.clear();
+            updated.exclude_location_query = None;
+            updated.exclude_kind = None;
+        }
         removed_any = true;
-    }
-    if has_word(target_clause, "person") || has_word(target_clause, "people") {
-        if let Some(val) = target_val {
-            if !matches!(val, "present" | "none" | "any") && !updated.person_names.is_empty() {
-                updated
-                    .person_names
-                    .retain(|p| p.trim().to_ascii_lowercase() != val);
+    } else {
+        if has_word(target_clause, "location")
+            || has_word(target_clause, "place")
+            || has_word(target_clause, "folder")
+        {
+            updated.location_query = None;
+            removed_any = true;
+        }
+        if has_word(target_clause, "person") || has_word(target_clause, "people") {
+            if let Some(val) = target_val {
+                if !matches!(val, "present" | "none" | "any") && !updated.person_names.is_empty() {
+                    updated
+                        .person_names
+                        .retain(|p| p.trim().to_ascii_lowercase() != val);
+                } else {
+                    updated.person_names.clear();
+                    updated.has_people = None;
+                }
             } else {
                 updated.person_names.clear();
                 updated.has_people = None;
             }
-        } else {
-            updated.person_names.clear();
-            updated.has_people = None;
+            removed_any = true;
         }
-        removed_any = true;
     }
     if has_word(target_clause, "date")
         || has_word(target_clause, "month")
@@ -1588,43 +1662,6 @@ pub(crate) fn try_apply_filter_removal(
         updated.max_faces = None;
         removed_any = true;
     }
-    if has_word(target_clause, "exclude")
-        || has_word(target_clause, "excluding")
-        || has_word(target_clause, "exclusion")
-        || has_word(target_clause, "without")
-        || has_word(target_clause, "not")
-    {
-        if let Some(val) = target_val {
-            let before_people = updated.exclude_person_names.len();
-            updated
-                .exclude_person_names
-                .retain(|p| p.trim().to_ascii_lowercase() != val);
-            let removed_person = updated.exclude_person_names.len() < before_people;
-            let removed_loc = updated
-                .exclude_location_query
-                .as_deref()
-                .is_some_and(|l| l.trim().to_ascii_lowercase() == val);
-            if removed_loc {
-                updated.exclude_location_query = None;
-            }
-            let removed_kind = updated
-                .exclude_kind
-                .is_some_and(|k| val.contains(k.as_str()));
-            if removed_kind {
-                updated.exclude_kind = None;
-            }
-            if !removed_person && !removed_loc && !removed_kind {
-                updated.exclude_person_names.clear();
-                updated.exclude_location_query = None;
-                updated.exclude_kind = None;
-            }
-        } else {
-            updated.exclude_person_names.clear();
-            updated.exclude_location_query = None;
-            updated.exclude_kind = None;
-        }
-        removed_any = true;
-    }
     if has_word(target_clause, "sort") {
         updated.sort_by = None;
         removed_any = true;
@@ -1640,12 +1677,16 @@ pub(crate) fn try_apply_filter_removal(
         }
         removed_any = true;
     }
-    if has_word(target_clause, "kind")
-        || has_word(target_clause, "video")
-        || has_word(target_clause, "videos")
-        || has_word(target_clause, "photo")
-        || has_word(target_clause, "photos")
-        || has_word(target_clause, "raw")
+    if !is_exclusion_removal
+        && (has_word(target_clause, "kind")
+            || has_word(target_clause, "video")
+            || has_word(target_clause, "videos")
+            || has_word(target_clause, "still")
+            || has_word(target_clause, "stills")
+            || target_clause.contains("only photo")
+            || has_word(target_clause, "raw")
+            || (!removed_any
+                && (has_word(target_clause, "photo") || has_word(target_clause, "photos"))))
     {
         updated.kind = None;
         updated.exclude_kind = None;
@@ -1905,6 +1946,7 @@ pub(crate) fn is_meta_library_question(lower: &str) -> bool {
         .any(|kw| lower.contains(kw))
 }
 
+#[allow(dead_code)]
 fn sanitize_sidecar_plan(
     user_message: &str,
     prior: &RouterPlan,
@@ -1913,12 +1955,37 @@ fn sanitize_sidecar_plan(
     now_utc: DateTime<Utc>,
     plan: &mut RouterPlan,
 ) {
+    sanitize_sidecar_plan_with_tz(
+        user_message,
+        prior,
+        known_folders,
+        known_people,
+        now_utc,
+        None,
+        plan,
+    );
+}
+
+fn sanitize_sidecar_plan_with_tz(
+    user_message: &str,
+    prior: &RouterPlan,
+    known_folders: &[String],
+    known_people: &[String],
+    now_utc: DateTime<Utc>,
+    tz_offset_minutes: Option<i32>,
+    plan: &mut RouterPlan,
+) {
     let lower = user_message.trim().to_ascii_lowercase();
 
     // 0. Deterministic single-filter removal ("remove the location filter", clickable chip removal).
+    // Preserves `prior` UTC timestamps directly without re-shifting.
     if try_apply_filter_removal(&lower, prior, plan) {
         return;
     }
+
+    // Shift newly parsed LLM calendar-date UTC midnights to true local-day UTC timestamps BEFORE
+    // any downstream merge/entity-swap logic compares them against `prior.date_*_ms`.
+    shift_plan_dates_to_utc(plan, tz_offset_minutes);
 
     // 1. Broad informational / meta-question guard.
     let is_explicit_show_search = [
@@ -1943,12 +2010,7 @@ fn sanitize_sidecar_plan(
 
     let is_meta_info_question = is_meta_library_question(&lower);
 
-    let has_specific_count_filter = (!plan.person_names.is_empty()
-        || plan.date_from_ms.is_some()
-        || plan.date_to_ms.is_some()
-        || plan.location_query.is_some()
-        || plan.kind.is_some()
-        || plan.favorite.is_some()
+    let has_specific_count_filter = (plan_has_any_criteria(plan)
         || lower.contains("how many video")
         || lower.contains("how many favorite")
         || lower.contains("how many favourite")
@@ -1968,12 +2030,12 @@ fn sanitize_sidecar_plan(
 
     plan.intent = Some("search".to_string());
 
-    // 1b. Follow-up entity swap ("what about AJ?", "how about Sebastian?"): when prior had a
-    // person filter and the user swaps to another person without naming the prior person, replace
-    // `person_names` cleanly while carrying over the remaining non-person prior filters.
-    let is_what_about = lower.starts_with("what about ")
-        || lower.starts_with("how about ")
-        || lower.contains("instead of ");
+    // 1b. Follow-up entity swap ("what about AJ?", "how about Sebastian?", "show AJ instead of Sebastian"):
+    // when prior had a person filter and the user swaps to another person, replace `person_names`
+    // cleanly while carrying over the remaining non-person prior filters.
+    let is_instead_of = lower.contains("instead of ");
+    let is_what_about =
+        lower.starts_with("what about ") || lower.starts_with("how about ") || is_instead_of;
     if is_what_about && !prior.person_names.is_empty() && !plan.person_names.is_empty() {
         let prior_low: HashSet<String> = prior
             .person_names
@@ -1992,7 +2054,7 @@ fn sanitize_sidecar_plan(
                 .to_ascii_lowercase();
             !first.is_empty() && has_word(&lower, &first)
         });
-        if has_new_person && !mentions_prior {
+        if has_new_person && (!mentions_prior || is_instead_of) {
             let new_people: Vec<String> = plan
                 .person_names
                 .iter()
@@ -2650,23 +2712,40 @@ fn sanitize_sidecar_plan(
             let e = Utc.from_utc_datetime(&e_d.and_hms_milli_opt(23, 59, 59, 999).expect("valid"));
             Some(((s.timestamp_millis(), e.timestamp_millis()), "Christmas"))
         } else {
-            season_date_range_ms(&lower, now_utc).map(|r| {
-                let name = if has_word(&lower, "summer") {
-                    "summer"
-                } else if has_word(&lower, "spring") {
-                    "spring"
-                } else if has_word(&lower, "fall") || has_word(&lower, "autumn") {
-                    "fall"
-                } else {
-                    "winter"
-                };
-                (r, name)
-            })
+            let is_non_season_compound = [
+                "hot spring",
+                "hot springs",
+                "spring water",
+                "bed spring",
+                "coil spring",
+                "free fall",
+                "water fall",
+                "waterfall",
+            ]
+            .iter()
+            .any(|p| lower.contains(p));
+            if is_non_season_compound {
+                None
+            } else {
+                season_date_range_ms(&lower, now_utc).map(|r| {
+                    let name = if has_word(&lower, "summer") {
+                        "summer"
+                    } else if has_word(&lower, "spring") {
+                        "spring"
+                    } else if has_word(&lower, "fall") || has_word(&lower, "autumn") {
+                        "fall"
+                    } else {
+                        "winter"
+                    };
+                    (r, name)
+                })
+            }
         };
 
         if let Some(((from_ms, to_ms), label)) = rescue_range {
             plan.date_from_ms = Some(from_ms);
             plan.date_to_ms = Some(to_ms);
+            shift_plan_dates_to_utc(plan, tz_offset_minutes);
             if plan.location_query.as_deref().is_some_and(|l| {
                 matches!(
                     l.trim().to_ascii_lowercase().as_str(),
@@ -2717,7 +2796,16 @@ fn sanitize_sidecar_plan(
             .or_else(|| loc_trimmed.strip_prefix("a "))
             .or_else(|| loc_trimmed.strip_prefix("my "))
             .unwrap_or(&loc_trimmed);
-        if GENERIC_SCENE_LOCATIONS.contains(&loc_low) {
+        let matches_known_folder = known_folders.iter().any(|f| {
+            let base = f
+                .rsplit_once(" (")
+                .map(|(head, _)| head)
+                .unwrap_or(f)
+                .trim()
+                .to_ascii_lowercase();
+            !base.is_empty() && (base == loc_low || base.contains(loc_low))
+        });
+        if GENERIC_SCENE_LOCATIONS.contains(&loc_low) && !matches_known_folder {
             let moved = plan.location_query.take();
             if plan.semantic_query.is_none() {
                 plan.semantic_query = match loc_low {

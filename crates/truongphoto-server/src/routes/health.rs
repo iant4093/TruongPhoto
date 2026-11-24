@@ -84,33 +84,69 @@ pub async fn system_info(
         None
     };
 
-    let (mdns_enabled, mdns_active, mdns_url) = {
+    let (mdns_enabled, mdns_active, mdns_url) = if is_admin {
         let mdns = state.mdns.lock();
         (mdns.is_enabled(), mdns.is_active(), mdns.mdns_url())
+    } else {
+        (false, false, None)
     };
 
-    let hostname = System::host_name().unwrap_or_else(|| "localhost".to_string());
-    let lan_urls = collect_lan_urls(state.bound_port);
-    let power = *state.power_rx.borrow();
-    let throttle = state.throttle_rx.borrow().clone();
-    let tailscale_url = state
-        .tailscale
-        .cached_or_refresh_status(state.bound_port)
-        .await
-        .https_url;
+    let hostname = if is_admin {
+        System::host_name().unwrap_or_else(|| "localhost".to_string())
+    } else {
+        String::new()
+    };
+    let lan_urls = if is_admin {
+        collect_lan_urls(state.bound_port)
+    } else {
+        Vec::new()
+    };
+    let power = if is_admin {
+        *state.power_rx.borrow()
+    } else {
+        PowerState::default()
+    };
+    let throttle = if is_admin {
+        state.throttle_rx.borrow().clone()
+    } else {
+        ThrottleStatus::default()
+    };
+    let tailscale_url = if is_admin {
+        state
+            .tailscale
+            .cached_or_refresh_status(state.bound_port)
+            .await
+            .https_url
+    } else {
+        None
+    };
+    let hardware = if is_admin {
+        state.hardware.clone()
+    } else {
+        HardwareInfo {
+            total_ram_bytes: 0,
+            cpu_cores: 0,
+            recommended_vision_tier: truongphoto_core::AiTier::Tier1,
+            recommended_chat_tier: truongphoto_core::AiTier::Tier1,
+        }
+    };
 
     Ok(Json(SystemInfoResponse {
         version: APP_VERSION,
         platform: std::env::consts::OS,
         arch: std::env::consts::ARCH,
         hostname,
-        port: state.bound_port,
+        port: if is_admin { state.bound_port } else { 0 },
         lan_urls,
         mdns_enabled,
         mdns_active,
         mdns_url,
-        desktop_pin_lock: settings.desktop_pin_lock,
-        hardware: state.hardware.clone(),
+        desktop_pin_lock: if is_admin {
+            settings.desktop_pin_lock
+        } else {
+            false
+        },
+        hardware,
         stats: LibraryStats {
             asset_count,
             folder_count,
