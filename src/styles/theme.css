@@ -3326,9 +3326,14 @@ input[type='number'].text-input { width: 90px; }
 }
 
 .lightbox-zoom-btn {
-  min-width: 78px;
+  width: 76px;
+  flex-shrink: 0;
   justify-content: center;
   font-variant-numeric: tabular-nums;
+}
+
+.lightbox-zoom-btn.is-loading-hd {
+  opacity: 0.85;
 }
 
 .lightbox-media-frame {

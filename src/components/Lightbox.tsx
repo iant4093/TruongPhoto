@@ -1499,7 +1499,6 @@ export const Lightbox: React.FC = () => {
       : '\u00A0';
 
   const isFav = Boolean(activeDetail?.summary.is_favorite);
-  const hdLabel = hiResLoading ? 'HD…' : usingHiRes ? 'HD' : null;
   const nativeShareAvailable = canUseNativeWebShare();
 
   return (
@@ -1582,7 +1581,7 @@ export const Lightbox: React.FC = () => {
             </div>
           )}
 
-          {hasRaw && !isVideo && (
+          {stackMembers.length <= 1 && hasRaw && !isVideo && (
             <div className="row" style={{ gap: 4 }} role="group" aria-label="RAW tier toggle">
               <button
                 type="button"
@@ -1625,14 +1624,19 @@ export const Lightbox: React.FC = () => {
               {!isVideo && (
                 <button
                   type="button"
-                  className={`lightbox-pill-btn lightbox-zoom-btn${effectiveZoom > 1.02 ? ' is-active' : ''}`}
+                  className={`lightbox-pill-btn lightbox-zoom-btn${effectiveZoom > 1.02 ? ' is-active' : ''}${hiResLoading ? ' is-loading-hd' : ''}`}
                   aria-pressed={effectiveZoom > 1.02}
-                  title={usingHiRes ? 'Viewing full original resolution' : 'Click photo or button to zoom'}
+                  title={
+                    hiResLoading
+                      ? 'Loading full original resolution…'
+                      : usingHiRes
+                        ? 'Viewing full original resolution'
+                        : 'Click photo or button to zoom'
+                  }
                   onClick={togglePixelPeepZoom}
                 >
                   <ZoomIn size={13} />
                   <span>{effectiveZoom > 1.02 ? `${effectiveZoom.toFixed(1)}×` : '100%'}</span>
-                  {hdLabel && <span className="lightbox-hd-tag">{hdLabel}</span>}
                 </button>
               )}
 

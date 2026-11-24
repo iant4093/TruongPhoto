@@ -282,10 +282,13 @@ describe('Timeline Folder Picker & Lightbox Stack Version Switcher', () => {
     expect(rawBtn.getAttribute('aria-pressed')).toBe('false');
 
     // Click RAW -> switches displayed version in-place without changing timeline slot
+    // and without popping extra Preview / RAW 100% pills that shift the toolbar
     fireEvent.click(rawBtn);
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'RAW' }).getAttribute('aria-pressed')).toBe('true');
     });
+    expect(screen.queryByRole('button', { name: 'Preview' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'RAW 100%' })).toBeNull();
     expect(useAppStore.getState().lightboxAssetId).toBe('a-edited');
 
     // Press backslash `\` -> instant Before/After back to Edited cover!
