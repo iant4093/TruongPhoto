@@ -223,6 +223,12 @@ pub(crate) fn exif_orientation_from_file(path: &Path) -> Option<image::metadata:
         nom_exif::EntryValue::U16(v) => *v as u8,
         nom_exif::EntryValue::U8(v) => *v,
         nom_exif::EntryValue::U32(v) => u8::try_from(*v).ok()?,
+        nom_exif::EntryValue::U16Array(arr) => {
+            arr.first().copied().and_then(|v| u8::try_from(v).ok())?
+        }
+        nom_exif::EntryValue::U32Array(arr) => {
+            arr.first().copied().and_then(|v| u8::try_from(v).ok())?
+        }
         _ => return None,
     };
     image::metadata::Orientation::from_exif(raw_val)
@@ -427,5 +433,25 @@ mod tests {
         // Without fallback orientation, landscape stays 40x20
         let decoded_no_fb = decode_jpeg_bytes_with_exif_and_icc(&jpeg, None).expect("decode jpeg");
         assert_eq!(decoded_no_fb.dimensions(), (40, 20));
+    }
+
+    #[test]
+    #[ignore = "real CR3 file check via TP_TEST_CR3"]
+    fn real_cr3_decode_respects_orientation() {
+        let p = std::env::var("TP_TEST_CR3").expect("set TP_TEST_CR3");
+        let path = Path::new(&p);
+        let orient = exif_orientation_from_file(path);
+        let embedded = raw::extract_embedded_raw_jpeg(path);
+        let rgb = decode_image_to_srgb(path).expect("decode cr3");
+        eprintln!(
+            "REAL CR3: orient={orient:?}, embedded_len={:?}, decoded_dims={:?}",
+            embedded.as_ref().map(|b| b.len()),
+            rgb.dimensions()
+        );
+        assert!(
+            rgb.height() > rgb.width(),
+            "expected portrait dims, got {:?}",
+            rgb.dimensions()
+        );
     }
 }

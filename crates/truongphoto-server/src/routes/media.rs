@@ -455,7 +455,13 @@ pub async fn get_thumb(
     let meta = tokio::fs::metadata(&thumb_path)
         .await
         .map_err(|e| AppError::internal(format!("Failed to stat thumb: {e}")))?;
-    let etag = format!("\"{asset_id}-thumb-{}\"", meta.len());
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let etag = format!("\"{asset_id}-thumb-{}-{mtime_ms}\"", meta.len());
     serve_file_slice_with_range(
         ServeSliceOptions {
             path: &thumb_path,
@@ -463,7 +469,7 @@ pub async fn get_thumb(
             slice_len: meta.len(),
             content_type: "image/webp",
             etag: &etag,
-            cache_control: Some("private, max-age=86400"),
+            cache_control: Some("private, no-cache"),
             download_filename: None,
             extra_header: None,
         },
@@ -550,7 +556,13 @@ pub async fn get_preview(
     let meta = tokio::fs::metadata(&dest_path)
         .await
         .map_err(|e| AppError::internal(format!("Failed to stat preview: {e}")))?;
-    let etag = format!("\"{asset_id}-preview-{}\"", meta.len());
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let etag = format!("\"{asset_id}-preview-{}-{mtime_ms}\"", meta.len());
     serve_file_slice_with_range(
         ServeSliceOptions {
             path: &dest_path,
@@ -558,7 +570,7 @@ pub async fn get_preview(
             slice_len: meta.len(),
             content_type: "image/webp",
             etag: &etag,
-            cache_control: Some("private, max-age=86400"),
+            cache_control: Some("private, no-cache"),
             download_filename: None,
             extra_header: None,
         },
