@@ -251,16 +251,21 @@ pub fn relink_moved_file(
     };
 
     with_savepoint(conn, "relink_moved_file", || {
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE asset_files
              SET folder_id = ?1,
                  rel_path = ?2,
                  mtime_ms = ?3,
                  is_missing = 0,
                  updated_at_ms = ?4
-             WHERE id = ?5",
+             WHERE id = ?5 AND is_missing = 1",
             params![new_folder_id, new_rel_path, new_mtime_ms, now_ms, file_id],
         )?;
+        if updated == 0 {
+            return Err(DbError::NotFound(format!(
+                "asset_file already relinked: {file_id}"
+            )));
+        }
 
         if old_folder_id != new_folder_id {
             conn.execute(

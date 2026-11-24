@@ -195,6 +195,7 @@ async fn verify_volume_online(
     if !is_dir || uuid_mismatch {
         let fid = folder.id.clone();
         let now_ms = Utc::now().timestamp_millis();
+        state.watcher.unwatch_folder(&folder.id);
         state
             .db
             .write(move |conn| repo::folders::set_folder_offline(conn, &fid, true, now_ms))

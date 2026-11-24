@@ -5,6 +5,7 @@ import {
   Download,
   Info,
   Play,
+  Share2,
   Star,
   Trash2,
   X,
@@ -23,15 +24,30 @@ import {
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
 import { formatDateTime } from '../lib/format';
 import { isTauri } from '../lib/tauri';
-import { notifyError, notifySuccess } from '../store/feedback';
+import { notifyError, notifyInfo, notifySuccess, useFeedback } from '../store/feedback';
 import { errorMessage, useAppStore } from '../store/useAppStore';
 import type { AssetDetail } from '../types/api';
 import { AssetInspector } from './AssetInspector';
-import { openContextMenu } from './ContextMenu';
+import { openContextMenu, useContextMenuStore } from './ContextMenu';
 import { VideoPlayer } from './VideoPlayer';
 import { WindowsCaptionButtons, isWindowsPlatform } from './WindowControls';
 
 const showWindowsCaption = isTauri() && isWindowsPlatform();
+const ZERO_PAN = { x: 0, y: 0 };
+const INFO_SHEET_EXIT_MS = 220;
+
+function readIsMobileViewport(): boolean {
+  if (typeof window === 'undefined') return false;
+  if (typeof window.matchMedia === 'function') {
+    return window.matchMedia('(max-width: 767px)').matches;
+  }
+  return window.innerWidth <= 767;
+}
+
+function canUseNativeWebShare(): boolean {
+  if (isTauri() || typeof navigator === 'undefined') return false;
+  return typeof navigator.share === 'function' && typeof navigator.canShare === 'function';
+}
 
 const MAX_DETAIL_CACHE = 80;
 const MAX_PRELOAD_IMAGES = 24;
@@ -128,11 +144,18 @@ export const Lightbox: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
 
   const [infoOpen, setInfoOpen] = useState(false);
+  const [infoRendered, setInfoRendered] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(readIsMobileViewport);
+  const [sheetDragY, setSheetDragY] = useState(0);
+  const [sheetDragging, setSheetDragging] = useState(false);
+  const [sharing, setSharing] = useState(false);
+
   const [rawDemosaic, setRawDemosaic] = useState(false);
   const [livePlaying, setLivePlaying] = useState(false);
   const [liveVideoReady, setLiveVideoReady] = useState(false);
   const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [pan, setPan] = useState(ZERO_PAN);
+  const [mediaStateAssetId, setMediaStateAssetId] = useState<string | null>(lightboxAssetId);
   const [isDragging, setIsDragging] = useState(false);
   const [animateZoom, setAnimateZoom] = useState(false);
 
@@ -140,6 +163,7 @@ export const Lightbox: React.FC = () => {
   const [previewLoadedUrl, setPreviewLoadedUrl] = useState<string | null>(null);
   const [underlayDismissedUrl, setUnderlayDismissedUrl] = useState<string | null>(null);
   const [readyOverlayUrl, setReadyOverlayUrl] = useState<string | null>(null);
+  const [readyOverlayAssetId, setReadyOverlayAssetId] = useState<string | null>(null);
   const [overlayVisible, setOverlayVisible] = useState(false);
   const [hiResLoading, setHiResLoading] = useState(false);
 
@@ -155,17 +179,47 @@ export const Lightbox: React.FC = () => {
   const prevAssetRef = useRef<{ id: string; previewUrl: string } | null>(null);
   const wasOpenRef = useRef(false);
   const zoomRef = useRef(1);
-  const panRef = useRef({ x: 0, y: 0 });
+  const panRef = useRef(ZERO_PAN);
   const readyOverlayUrlRef = useRef<string | null>(null);
   const infoOpenRef = useRef(false);
   const closeLightboxRef = useRef(closeLightbox);
-  const lastTouchDoubleTapAtRef = useRef(0);
+  const lastTouchAtRef = useRef(0);
   const touchLongPressLiveRef = useRef(false);
+  const sheetDragStartYRef = useRef<number | null>(null);
+  const sheetDragAtRef = useRef(0);
   zoomRef.current = zoom;
   panRef.current = pan;
   readyOverlayUrlRef.current = readyOverlayUrl;
   infoOpenRef.current = infoOpen;
   closeLightboxRef.current = closeLightbox;
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 767px)');
+    const onChange = () => setIsMobileViewport(mq.matches);
+    onChange();
+    if (typeof mq.addEventListener === 'function') {
+      mq.addEventListener('change', onChange);
+      return () => mq.removeEventListener('change', onChange);
+    }
+    mq.addListener(onChange);
+    return () => mq.removeListener(onChange);
+  }, []);
+
+  useEffect(() => {
+    if (infoOpen) {
+      setInfoRendered(true);
+      setSheetDragY(0);
+      setSheetDragging(false);
+      return;
+    }
+    const t = window.setTimeout(() => {
+      setInfoRendered(false);
+      setSheetDragY(0);
+      setSheetDragging(false);
+    }, INFO_SHEET_EXIT_MS);
+    return () => window.clearTimeout(t);
+  }, [infoOpen]);
 
   // Touch & pointer gesture tracking
   const gestureRef = useRef<{
@@ -249,6 +303,19 @@ export const Lightbox: React.FC = () => {
           exitingTimerRef.current = null;
         }, SLIDE_TRANSITION_MS + 30);
       }
+      // Reset zoom/pan/overlay immediately on navigation so the next slide never renders a 1-frame flash
+      // of the previous photo's zoom/pan or hi-res layer before effects run.
+      setAnimateZoom(false);
+      setZoom(1);
+      setPan(ZERO_PAN);
+      setRawDemosaic(false);
+      setLivePlaying(false);
+      setLiveVideoReady(false);
+      setReadyOverlayUrl(null);
+      setReadyOverlayAssetId(null);
+      setOverlayVisible(false);
+      setHiResLoading(false);
+      setMediaStateAssetId(targetId);
       setNavDir(dir);
       setLightboxAsset(targetId);
     },
@@ -271,6 +338,11 @@ export const Lightbox: React.FC = () => {
       setDetail(null);
       setDetailLoading(false);
       setInfoOpen(false);
+      setInfoRendered(false);
+      setMediaStateAssetId(null);
+      setReadyOverlayUrl(null);
+      setReadyOverlayAssetId(null);
+      setOverlayVisible(false);
       setNavDir('fade');
       setExitingSlide(null);
       prevAssetRef.current = null;
@@ -287,13 +359,15 @@ export const Lightbox: React.FC = () => {
 
     let active = true;
     setError(null);
+    setMediaStateAssetId(lightboxAssetId);
     setRawDemosaic(false);
     setLivePlaying(false);
     setLiveVideoReady(false);
     setAnimateZoom(false);
     setZoom(1);
-    setPan({ x: 0, y: 0 });
+    setPan(ZERO_PAN);
     setReadyOverlayUrl(null);
+    setReadyOverlayAssetId(null);
     setOverlayVisible(false);
     setHiResLoading(false);
     const alreadyDecoded = decodedUrlSet.has(nextPreview);
@@ -470,6 +544,11 @@ export const Lightbox: React.FC = () => {
         return;
       }
 
+      // Never steal shortcuts while a context menu or confirmation modal is open above Lightbox
+      if (useContextMenuStore.getState().open || useFeedback.getState().confirm) {
+        return;
+      }
+
       const target = event.target as HTMLElement | null;
       if (
         target &&
@@ -524,7 +603,7 @@ export const Lightbox: React.FC = () => {
           setZoom((prev) => {
             const next = Math.max(1, Number((prev - 0.5).toFixed(2)));
             if (next <= 1.02) {
-              setPan({ x: 0, y: 0 });
+              setPan(ZERO_PAN);
               return 1;
             }
             setPan((p) => clampPan(p.x, p.y, next));
@@ -535,9 +614,16 @@ export const Lightbox: React.FC = () => {
           event.preventDefault();
           setAnimateZoom(true);
           setZoom(1);
-          setPan({ x: 0, y: 0 });
+          setPan(ZERO_PAN);
           break;
         case ' ': {
+          // Let focused buttons, links, and native <video controls> handle Space natively without double-toggling
+          if (
+            target &&
+            (target.tagName === 'BUTTON' || target.tagName === 'A' || target.tagName === 'VIDEO')
+          ) {
+            break;
+          }
           const isLivePhoto = Boolean(
             activeDetail?.playback.live_video_url ||
               activeDetail?.summary.kind === 'live_photo' ||
@@ -628,16 +714,22 @@ export const Lightbox: React.FC = () => {
   useEffect(() => {
     if (!lightboxAssetId || isVideo || !fullResUrl) return;
     if (!wantsOverlay) {
-      // When toggling RAW 100% back to Preview at 1x, smoothly fade out RAW overlay while preview stays painted.
-      if (!rawDemosaic && readyOverlayUrl?.includes('mode=raw_demosaic')) {
+      // Only fade out RAW 100% overlay when explicitly toggling a RAW+JPG stack back to Preview at 1x
+      // (keep decoded hi-res overlay mounted for standalone HEIC/TIFF/RAW zoomed back out to 1x).
+      if (
+        !rawDemosaic &&
+        activeDetail?.summary.kind === 'raw_jpg_stack' &&
+        readyOverlayUrl?.includes('mode=raw_demosaic')
+      ) {
         setOverlayVisible(false);
       }
       setHiResLoading(false);
       return;
     }
 
-    if (readyOverlayUrl !== fullResUrl) {
+    if (readyOverlayUrl !== fullResUrl || readyOverlayAssetId !== lightboxAssetId) {
       setReadyOverlayUrl(fullResUrl);
+      setReadyOverlayAssetId(lightboxAssetId);
     }
     if (decodedUrlSet.has(fullResUrl)) {
       setOverlayVisible(true);
@@ -646,7 +738,35 @@ export const Lightbox: React.FC = () => {
       setOverlayVisible(false);
       setHiResLoading(true);
     }
-  }, [fullResUrl, isVideo, lightboxAssetId, rawDemosaic, readyOverlayUrl, wantsOverlay]);
+  }, [
+    activeDetail?.summary.kind,
+    fullResUrl,
+    isVideo,
+    lightboxAssetId,
+    rawDemosaic,
+    readyOverlayAssetId,
+    readyOverlayUrl,
+    wantsOverlay,
+  ]);
+
+  // Dismiss thumbnail underlay after preview fade completes, even if onTransitionEnd doesn't fire
+  // (e.g., prefers-reduced-motion or synchronous HTTP cache hits).
+  const activePreviewUrl = lightboxAssetId
+    ? activeDetail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId)
+    : null;
+  const activePreviewReady = Boolean(
+    activePreviewUrl &&
+      (previewLoadedUrl === activePreviewUrl || decodedUrlSet.has(activePreviewUrl)),
+  );
+  useEffect(() => {
+    if (!activePreviewUrl || !activePreviewReady || underlayDismissedUrl === activePreviewUrl) {
+      return;
+    }
+    const t = window.setTimeout(() => {
+      setUnderlayDismissedUrl(activePreviewUrl);
+    }, 220);
+    return () => window.clearTimeout(t);
+  }, [activePreviewReady, activePreviewUrl, underlayDismissedUrl]);
 
   // Native non-passive wheel zoom listener with pointer focal-point anchoring & zero CSS transition jitter.
   useEffect(() => {
@@ -702,10 +822,38 @@ export const Lightbox: React.FC = () => {
   const thumbUrl = mediaThumbUrl(lightboxAssetId);
   const previewIsReady = previewLoadedUrl === previewUrl || decodedUrlSet.has(previewUrl);
   const showUnderlay = !previewIsReady || underlayDismissedUrl !== previewUrl;
-  const usingHiRes = Boolean(readyOverlayUrl && overlayVisible && (rawDemosaic || zoom > 1.02));
+  const effectiveZoom = mediaStateAssetId === lightboxAssetId ? zoom : 1;
+  const effectivePan = mediaStateAssetId === lightboxAssetId ? pan : ZERO_PAN;
+  const activeOverlayUrl = readyOverlayAssetId === lightboxAssetId ? readyOverlayUrl : null;
+  const usingHiRes = Boolean(
+    activeOverlayUrl && overlayVisible && (rawDemosaic || effectiveZoom > 1.02),
+  );
   const liveVideoUrl = activeDetail?.playback.live_video_url ?? mediaLiveVideoUrl(lightboxAssetId);
 
+  const zoomAtPoint = (clientX: number, clientY: number, targetZoom: number) => {
+    setAnimateZoom(true);
+    const rect = imgRef.current?.getBoundingClientRect();
+    if (rect && rect.width > 0 && rect.height > 0) {
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const offsetX = clientX - cx;
+      const offsetY = clientY - cy;
+      setPan(
+        clampPan(
+          Math.round(-offsetX * (targetZoom - 1) * 0.75),
+          Math.round(-offsetY * (targetZoom - 1) * 0.75),
+          targetZoom,
+        ),
+      );
+    } else {
+      setPan(ZERO_PAN);
+    }
+    setZoom(targetZoom);
+  };
+
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    lastTouchAtRef.current = Date.now();
+    if (isVideo) return;
     clearLongPress();
     if (e.touches.length === 2) {
       setAnimateZoom(false);
@@ -719,8 +867,13 @@ export const Lightbox: React.FC = () => {
       const now = Date.now();
       if (now - gestureRef.current.lastTapAt < 300) {
         gestureRef.current.lastTapAt = 0;
-        lastTouchDoubleTapAtRef.current = now;
-        togglePixelPeepZoom();
+        if (zoom > 1.02) {
+          setAnimateZoom(true);
+          setZoom(1);
+          setPan(ZERO_PAN);
+        } else {
+          zoomAtPoint(t.clientX, t.clientY, 2.25);
+        }
         return;
       }
       gestureRef.current.lastTapAt = now;
@@ -740,6 +893,7 @@ export const Lightbox: React.FC = () => {
   };
 
   const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (isVideo) return;
     clearLongPress();
     if (e.touches.length === 2 && gestureRef.current.pinchStartDist) {
       setAnimateZoom(false);
@@ -748,13 +902,13 @@ export const Lightbox: React.FC = () => {
       const nextZoom = Math.min(4, Math.max(1, gestureRef.current.pinchStartZoom * scaleFactor));
       setZoom(nextZoom);
       if (nextZoom <= 1.02) {
-        setPan({ x: 0, y: 0 });
+        setPan(ZERO_PAN);
       } else {
         setPan((p) => clampPan(p.x, p.y, nextZoom));
       }
       return;
     }
-    if (e.touches.length === 1 && zoom > 1.02) {
+    if (e.touches.length === 1 && zoom > 1.02 && !gestureRef.current.wasPinching) {
       setAnimateZoom(false);
       const t = e.touches[0];
       const dx = t.clientX - gestureRef.current.startX;
@@ -764,6 +918,8 @@ export const Lightbox: React.FC = () => {
   };
 
   const handleTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    lastTouchAtRef.current = Date.now();
+    if (isVideo) return;
     clearLongPress();
     if (touchLongPressLiveRef.current) {
       touchLongPressLiveRef.current = false;
@@ -773,6 +929,14 @@ export const Lightbox: React.FC = () => {
     }
     if (gestureRef.current.pinchStartDist !== null || gestureRef.current.wasPinching) {
       gestureRef.current.pinchStartDist = null;
+      if (e.touches.length === 1) {
+        // Re-anchor remaining finger so lifting 1 finger after pinch never jumps pan
+        const remaining = e.touches[0];
+        gestureRef.current.startX = remaining.clientX;
+        gestureRef.current.startY = remaining.clientY;
+        gestureRef.current.startPanX = panRef.current.x;
+        gestureRef.current.startPanY = panRef.current.y;
+      }
       if (e.touches.length === 0) {
         gestureRef.current.wasPinching = false;
       }
@@ -785,6 +949,8 @@ export const Lightbox: React.FC = () => {
       if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * 1.2) {
         if (dx > 0) goPrev();
         else goNext();
+      } else if (!infoOpen && dy > 92 && dy > Math.abs(dx) * 1.4) {
+        closeLightbox();
       }
     }
   };
@@ -831,7 +997,8 @@ export const Lightbox: React.FC = () => {
 
   const handleImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
     if (isVideo) return;
-    if (Date.now() - lastTouchDoubleTapAtRef.current < 380) {
+    // On touch devices, ignore synthetic click events after taps so single-tap never fights double-tap zoom
+    if (Date.now() - lastTouchAtRef.current < 550) {
       return;
     }
     if (gestureRef.current.didDrag) {
@@ -841,27 +1008,70 @@ export const Lightbox: React.FC = () => {
     setAnimateZoom(true);
     if (zoom > 1.02) {
       setZoom(1);
-      setPan({ x: 0, y: 0 });
+      setPan(ZERO_PAN);
       return;
     }
-    const targetZoom = 2.25;
-    const rect = imgRef.current?.getBoundingClientRect();
-    if (rect && rect.width > 0 && rect.height > 0) {
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
-      const offsetX = e.clientX - cx;
-      const offsetY = e.clientY - cy;
-      setPan(
-        clampPan(
-          Math.round(-offsetX * (targetZoom - 1) * 0.75),
-          Math.round(-offsetY * (targetZoom - 1) * 0.75),
-          targetZoom,
-        ),
-      );
-    } else {
-      setPan({ x: 0, y: 0 });
+    zoomAtPoint(e.clientX, e.clientY, 2.25);
+  };
+
+  const handleWebDownloadClick = () => {
+    if (!isTauri()) {
+      notifyInfo('Starting download…');
     }
-    setZoom(targetZoom);
+  };
+
+  const handleNativeShare = async () => {
+    if (!lightboxAssetId || sharing) return;
+    setSharing(true);
+    try {
+      const url = mediaOriginalUrl(lightboxAssetId);
+      const res = await fetch(url, { credentials: 'include' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const rawName =
+        titlePrimaryFile?.rel_path.split(/[\\/]/).pop() ||
+        `${lightboxAssetId}.${primaryExt || (isVideo ? 'mp4' : 'jpg')}`;
+      const file = new File([blob], rawName, { type: blob.type || (isVideo ? 'video/mp4' : 'image/jpeg') });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: rawName });
+      } else {
+        triggerAssetDownload(lightboxAssetId);
+        notifyInfo('Starting download…');
+      }
+    } catch (err) {
+      if ((err as { name?: string })?.name !== 'AbortError') {
+        triggerAssetDownload(lightboxAssetId);
+        notifyInfo('Starting download…');
+      }
+    } finally {
+      setSharing(false);
+    }
+  };
+
+  const handleSheetTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (!isMobileViewport || e.touches.length !== 1) return;
+    sheetDragStartYRef.current = e.touches[0].clientY;
+    sheetDragAtRef.current = Date.now();
+    setSheetDragging(true);
+  };
+
+  const handleSheetTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (sheetDragStartYRef.current === null || e.touches.length !== 1) return;
+    const dy = Math.max(0, e.touches[0].clientY - sheetDragStartYRef.current);
+    setSheetDragY(dy);
+  };
+
+  const handleSheetTouchEnd = () => {
+    if (sheetDragStartYRef.current === null) return;
+    const elapsed = Math.max(1, Date.now() - sheetDragAtRef.current);
+    const velocity = sheetDragY / elapsed;
+    const shouldClose = sheetDragY > 72 || (sheetDragY > 28 && velocity > 0.45);
+    sheetDragStartYRef.current = null;
+    setSheetDragging(false);
+    setSheetDragY(0);
+    if (shouldClose) {
+      setInfoOpen(false);
+    }
   };
 
   const handleMediaContextMenu = (e: React.MouseEvent) => {
@@ -957,6 +1167,7 @@ export const Lightbox: React.FC = () => {
 
   const isFav = Boolean(activeDetail?.summary.is_favorite);
   const hdLabel = hiResLoading ? 'HD…' : usingHiRes ? 'HD' : null;
+  const nativeShareAvailable = canUseNativeWebShare();
 
   return (
     <div
@@ -970,7 +1181,7 @@ export const Lightbox: React.FC = () => {
       <header className="lightbox-toolbar" data-tauri-drag-region="deep">
         <div
           className="row lightbox-toolbar-left"
-          style={{ gap: 10, minWidth: 0, flex: '1 1 180px' }}
+          style={{ gap: 10, minWidth: 0, flex: '1 1 0%' }}
         >
           <button
             type="button"
@@ -1011,7 +1222,7 @@ export const Lightbox: React.FC = () => {
           </div>
         </div>
 
-        <div className="row" style={{ gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', flexShrink: 0 }}>
+        <div className="row lightbox-toolbar-actions">
           {hasRaw && !isVideo && (
             <div className="row" style={{ gap: 4 }} role="group" aria-label="RAW tier toggle">
               <button
@@ -1020,7 +1231,7 @@ export const Lightbox: React.FC = () => {
                 aria-pressed={!rawDemosaic}
                 onClick={() => setRawDemosaic(false)}
               >
-                Preview
+                {isMobileViewport ? 'JPG' : 'Preview'}
               </button>
               <button
                 type="button"
@@ -1028,7 +1239,7 @@ export const Lightbox: React.FC = () => {
                 aria-pressed={rawDemosaic}
                 onClick={() => setRawDemosaic(true)}
               >
-                RAW 100%
+                {isMobileViewport ? 'RAW' : 'RAW 100%'}
               </button>
             </div>
           )}
@@ -1050,66 +1261,71 @@ export const Lightbox: React.FC = () => {
             </button>
           )}
 
-          {!isVideo && (
-            <button
-              type="button"
-              className={`lightbox-pill-btn lightbox-zoom-btn${zoom > 1 ? ' is-active' : ''}`}
-              aria-pressed={zoom > 1}
-              title={usingHiRes ? 'Viewing full original resolution' : 'Click photo or button to zoom'}
-              onClick={togglePixelPeepZoom}
-            >
-              <ZoomIn size={13} />
-              <span>{zoom > 1 ? `${zoom.toFixed(1)}×` : '100%'}</span>
-              {hdLabel && <span className="lightbox-hd-tag">{hdLabel}</span>}
-            </button>
+          {!isMobileViewport && (
+            <>
+              {!isVideo && (
+                <button
+                  type="button"
+                  className={`lightbox-pill-btn lightbox-zoom-btn${effectiveZoom > 1.02 ? ' is-active' : ''}`}
+                  aria-pressed={effectiveZoom > 1.02}
+                  title={usingHiRes ? 'Viewing full original resolution' : 'Click photo or button to zoom'}
+                  onClick={togglePixelPeepZoom}
+                >
+                  <ZoomIn size={13} />
+                  <span>{effectiveZoom > 1.02 ? `${effectiveZoom.toFixed(1)}×` : '100%'}</span>
+                  {hdLabel && <span className="lightbox-hd-tag">{hdLabel}</span>}
+                </button>
+              )}
+
+              {canMutate && (
+                <button
+                  type="button"
+                  className="icon-button"
+                  disabled={!activeDetail}
+                  aria-label={isFav ? 'Remove favorite' : 'Favorite'}
+                  aria-pressed={isFav}
+                  style={isFav ? { color: '#f2cf6b' } : undefined}
+                  onClick={() => void handleToggleFavorite()}
+                >
+                  <Star size={16} fill={isFav ? 'currentColor' : 'none'} />
+                </button>
+              )}
+
+              <a
+                className="icon-button"
+                href={mediaOriginalUrl(lightboxAssetId, { download: true })}
+                download
+                aria-label="Download original"
+                title="Download original"
+                onClick={handleWebDownloadClick}
+              >
+                <Download size={16} />
+              </a>
+
+              {canMutate && (
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label="Move to Trash"
+                  title="Move to Trash"
+                  onClick={() => void handleMoveToTrash()}
+                >
+                  <Trash2 size={16} />
+                </button>
+              )}
+
+              <button
+                type="button"
+                className={`lightbox-pill-btn${infoOpen ? ' is-active' : ''}`}
+                aria-label="Toggle info"
+                aria-pressed={infoOpen}
+                onClick={() => setInfoOpen((prev) => !prev)}
+              >
+                <Info size={14} />
+                <span>Info</span>
+              </button>
+            </>
           )}
-
-          {canMutate && (
-            <button
-              type="button"
-              className="icon-button"
-              disabled={!activeDetail}
-              aria-label={isFav ? 'Remove favorite' : 'Favorite'}
-              aria-pressed={isFav}
-              style={isFav ? { color: '#f2cf6b' } : undefined}
-              onClick={() => void handleToggleFavorite()}
-            >
-              <Star size={16} fill={isFav ? 'currentColor' : 'none'} />
-            </button>
-          )}
-
-          <a
-            className="icon-button"
-            href={mediaOriginalUrl(lightboxAssetId, { download: true })}
-            download
-            aria-label="Download original"
-            title="Download original"
-          >
-            <Download size={16} />
-          </a>
-
-          {canMutate && (
-            <button
-              type="button"
-              className="icon-button"
-              aria-label="Move to Trash"
-              title="Move to Trash"
-              onClick={() => void handleMoveToTrash()}
-            >
-              <Trash2 size={16} />
-            </button>
-          )}
-
-          <button
-            type="button"
-            className={`lightbox-pill-btn${infoOpen ? ' is-active' : ''}`}
-            aria-label="Toggle info"
-            aria-pressed={infoOpen}
-            onClick={() => setInfoOpen((prev) => !prev)}
-          >
-            <Info size={14} />
-            <span>Info</span>
-          </button>
         </div>
         {showWindowsCaption && <WindowsCaptionButtons />}
       </header>
@@ -1117,7 +1333,7 @@ export const Lightbox: React.FC = () => {
       <div className="lightbox-body">
         <div
           ref={stageRef}
-          className="lightbox-stage"
+          className={`lightbox-stage${isVideo ? ' is-video' : ''}`}
           onTouchStart={handleTouchStart}
           onTouchMove={handleTouchMove}
           onTouchEnd={handleTouchEnd}
@@ -1181,7 +1397,7 @@ export const Lightbox: React.FC = () => {
               <div
                 className="lightbox-zoom-surface"
                 style={{
-                  transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+                  transform: `translate3d(${effectivePan.x}px, ${effectivePan.y}px, 0) scale(${effectiveZoom})`,
                   transition: animateZoom
                     ? 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1)'
                     : 'none',
@@ -1220,31 +1436,35 @@ export const Lightbox: React.FC = () => {
                       reveal();
                     }
                   }}
+                  onError={() => {
+                    // Keep the cached thumbnail underlay visible rather than hiding everything on preview error
+                    setPreviewLoadedUrl(null);
+                  }}
                   onTransitionEnd={(e) => {
                     if (e.propertyName === 'opacity' && previewIsReady) {
                       setUnderlayDismissedUrl(previewUrl);
                     }
                   }}
                   style={{
-                    cursor: zoom > 1.02 ? (isDragging ? 'grabbing' : 'grab') : 'zoom-in',
+                    cursor: effectiveZoom > 1.02 ? (isDragging ? 'grabbing' : 'grab') : 'zoom-in',
                     opacity: previewIsReady ? 1 : 0,
                     transition: 'opacity 140ms ease-out',
                   }}
                 />
 
                 {/* Stacked decoded full-resolution / RAW 100% overlay: fades in seamlessly with zero flash */}
-                {readyOverlayUrl && (
+                {activeOverlayUrl && (
                   <img
                     data-testid="lightbox-hires-layer"
                     className="lightbox-media lightbox-media-overlay"
-                    src={readyOverlayUrl}
+                    src={activeOverlayUrl}
                     alt=""
                     aria-hidden="true"
                     draggable={false}
                     decoding="async"
                     onLoad={(e) => {
                       const el = e.currentTarget;
-                      const url = readyOverlayUrl;
+                      const url = activeOverlayUrl;
                       const reveal = () => {
                         decodedUrlSet.add(url);
                         if (readyOverlayUrlRef.current === url) {
@@ -1299,34 +1519,130 @@ export const Lightbox: React.FC = () => {
           )}
         </div>
 
-        {infoOpen && (
-          <aside
-            className="inspector-drawer lightbox-info-drawer"
-            aria-label="Lightbox asset inspector"
+        {/* Dimmed backdrop scrim for tablet right-drawer & mobile bottom sheet */}
+        <div
+          className={`lightbox-info-scrim${infoOpen ? ' is-open' : ''}`}
+          aria-hidden="true"
+          onClick={() => setInfoOpen(false)}
+        />
+
+        <aside
+          className={`inspector-drawer lightbox-info-drawer${infoOpen ? ' is-open' : ''}${sheetDragging ? ' is-dragging' : ''}`}
+          aria-label="Lightbox asset inspector"
+          aria-hidden={!infoOpen}
+          style={
+            isMobileViewport && infoOpen && sheetDragY > 0
+              ? { transform: `translate3d(0, ${sheetDragY}px, 0)` }
+              : undefined
+          }
+        >
+          <div
+            className="lightbox-sheet-handle"
+            onTouchStart={handleSheetTouchStart}
+            onTouchMove={handleSheetTouchMove}
+            onTouchEnd={handleSheetTouchEnd}
+            onTouchCancel={handleSheetTouchEnd}
           >
-            <div className="inspector-heading">
-              <span>Details</span>
-              <button
-                type="button"
-                className="icon-button"
-                aria-label="Close info drawer"
-                onClick={() => setInfoOpen(false)}
-              >
-                <X size={15} />
-              </button>
-            </div>
-            <AssetInspector
-              assetId={lightboxAssetId}
-              initialDetail={activeDetail}
-              loadingInitialDetail={detailLoading}
-              onAssetUpdated={(updated) => {
-                setCachedDetail(updated.summary.id, updated);
-                setDetail(updated);
-              }}
-            />
-          </aside>
-        )}
+            <span className="lightbox-sheet-grabber" />
+          </div>
+          <div
+            className="inspector-heading"
+            onTouchStart={handleSheetTouchStart}
+            onTouchMove={handleSheetTouchMove}
+            onTouchEnd={handleSheetTouchEnd}
+            onTouchCancel={handleSheetTouchEnd}
+          >
+            <span>Details</span>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Close info drawer"
+              onClick={() => setInfoOpen(false)}
+            >
+              <X size={15} />
+            </button>
+          </div>
+          <div className="lightbox-info-scroll">
+            {infoRendered && (
+              <AssetInspector
+                assetId={lightboxAssetId}
+                initialDetail={activeDetail}
+                loadingInitialDetail={detailLoading}
+                onAssetUpdated={(updated) => {
+                  setCachedDetail(updated.summary.id, updated);
+                  setDetail(updated);
+                }}
+              />
+            )}
+          </div>
+        </aside>
       </div>
+
+      {/* Dedicated mobile bottom action bar with 44x44px touch targets & safe-area inset */}
+      {isMobileViewport && (
+        <nav className="lightbox-mobile-bar" aria-label="Photo actions">
+          {canMutate && (
+            <button
+              type="button"
+              className={`lightbox-mobile-action${isFav ? ' is-fav' : ''}`}
+              disabled={!activeDetail}
+              aria-label={isFav ? 'Remove favorite' : 'Favorite'}
+              aria-pressed={isFav}
+              onClick={() => void handleToggleFavorite()}
+            >
+              <Star size={19} fill={isFav ? 'currentColor' : 'none'} />
+              <span>Favorite</span>
+            </button>
+          )}
+
+          {nativeShareAvailable ? (
+            <button
+              type="button"
+              className="lightbox-mobile-action"
+              disabled={sharing}
+              aria-label="Share"
+              onClick={() => void handleNativeShare()}
+            >
+              <Share2 size={19} />
+              <span>{sharing ? 'Preparing…' : 'Share'}</span>
+            </button>
+          ) : (
+            <a
+              className="lightbox-mobile-action"
+              href={mediaOriginalUrl(lightboxAssetId, { download: true })}
+              download
+              aria-label="Download original"
+              onClick={handleWebDownloadClick}
+            >
+              <Download size={19} />
+              <span>Save</span>
+            </a>
+          )}
+
+          <button
+            type="button"
+            className={`lightbox-mobile-action${infoOpen ? ' is-active' : ''}`}
+            aria-label="Toggle info"
+            aria-pressed={infoOpen}
+            onClick={() => setInfoOpen((prev) => !prev)}
+          >
+            <Info size={19} />
+            <span>Info</span>
+          </button>
+
+          {canMutate && (
+            <button
+              type="button"
+              className="lightbox-mobile-action is-danger"
+              aria-label="Move to Trash"
+              onClick={() => void handleMoveToTrash()}
+            >
+              <Trash2 size={19} />
+              <span>Trash</span>
+            </button>
+          )}
+        </nav>
+      )}
     </div>
   );
 };

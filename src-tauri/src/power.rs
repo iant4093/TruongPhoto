@@ -257,7 +257,9 @@ mod platform {
     ) -> LRESULT {
         match msg {
             WM_CLOSE => {
-                let _ = DestroyWindow(hwnd);
+                // Exit the GetMessageW loop first so WTS/power notifications unregister against a live HWND
+                // before DestroyWindow(hwnd) runs after the loop.
+                PostQuitMessage(0);
                 return LRESULT(0);
             }
             WM_DESTROY => {
@@ -271,7 +273,10 @@ mod platform {
             },
             WM_POWERBROADCAST => match wparam.0 as u32 {
                 PBT_APMSUSPEND => emit(PowerEvent::SystemSleep),
-                PBT_APMRESUMEAUTOMATIC => emit(PowerEvent::SystemWake),
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                    emit(PowerEvent::SystemWake);
+                    query_and_emit_battery();
+                }
                 PBT_APMPOWERSTATUSCHANGE => query_and_emit_battery(),
                 PBT_POWERSETTINGCHANGE if lparam.0 != 0 => {
                     let setting = &*(lparam.0 as *const POWERBROADCAST_SETTING);

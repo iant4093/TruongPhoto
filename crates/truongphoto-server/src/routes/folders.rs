@@ -357,7 +357,12 @@ pub async fn delete_folder(
         }
         for rel in cleanup.cache_rel_paths {
             if let Some(p) = safe_join_relative(&cleanup.cache_dir, &rel) {
-                let _ = std::fs::remove_file(p);
+                // Cache entries include directories (hls/, raw/, live/) as well as files.
+                if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(&p);
+                } else {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
         }
     })

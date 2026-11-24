@@ -836,15 +836,21 @@ export const SettingsView: React.FC = () => {
                         {folder.root_path}
                       </div>
                     </div>
-                    <div className="row" style={{ gap: 12 }}>
+                    <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
                       <button
                         type="button"
                         className="button"
-                        disabled={isScanning || folder.is_offline}
+                        disabled={isScanning}
                         onClick={() => void handleScanFolder(folder)}
                       >
                         <RefreshCw size={14} />
-                        <span>{isScanning ? 'Scanning…' : 'Scan Now'}</span>
+                        <span>
+                          {isScanning
+                            ? 'Scanning…'
+                            : folder.is_offline
+                              ? 'Check & Scan'
+                              : 'Scan Now'}
+                        </span>
                       </button>
                       <label className="row" style={{ fontSize: 12, cursor: 'pointer' }}>
                         <span>Allow Disk Deletion</span>
@@ -891,7 +897,7 @@ export const SettingsView: React.FC = () => {
                     className="text-input"
                     type="text"
                     placeholder={
-                      typeof navigator !== 'undefined' && /Win/i.test(navigator.platform || navigator.userAgent)
+                      systemInfo?.platform?.toLowerCase().includes('win')
                         ? 'D:\\Photos'
                         : '/Volumes/Photos'
                     }
@@ -1457,10 +1463,11 @@ export const SettingsView: React.FC = () => {
               )}
 
               {tailscaleStatus?.serve_active && tailscaleStatus.https_url && (
-                <div className="row" style={{ justifyContent: 'space-between' }}>
+                <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
                   <button
                     type="button"
                     className="button button-quiet"
+                    style={{ minWidth: 0, overflowWrap: 'anywhere', textAlign: 'left' }}
                     onClick={() => void openExternalUrl(tailscaleStatus.https_url!)}
                   >
                     {tailscaleStatus.https_url}

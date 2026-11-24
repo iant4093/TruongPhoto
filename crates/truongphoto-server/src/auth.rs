@@ -94,9 +94,11 @@ pub fn hash_session_token(raw_token: &str) -> String {
 }
 
 pub fn build_session_cookie(raw_token: &str, secure: bool) -> Cookie<'static> {
+    // Use SameSite::Lax (paired with Origin/Sec-Fetch-Site CSRF validation on mutations & WS)
+    // so mobile QR code scans, deep links, and external bookmarks preserve the user's session.
     Cookie::build((SESSION_COOKIE_NAME, raw_token.to_string()))
         .http_only(true)
-        .same_site(SameSite::Strict)
+        .same_site(SameSite::Lax)
         .path("/")
         .max_age(CookieDuration::seconds(SESSION_TTL_SECS))
         .secure(secure)
@@ -106,7 +108,7 @@ pub fn build_session_cookie(raw_token: &str, secure: bool) -> Cookie<'static> {
 pub fn clear_session_cookie(secure: bool) -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE_NAME, String::new()))
         .http_only(true)
-        .same_site(SameSite::Strict)
+        .same_site(SameSite::Lax)
         .path("/")
         .max_age(CookieDuration::seconds(0))
         .secure(secure)

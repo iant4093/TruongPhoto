@@ -63,7 +63,20 @@ fn decode_jxl_to_srgb(path: &Path) -> Result<RgbImage, MediaError> {
     let height = stream.height();
     let channels = stream.channels() as usize;
 
-    let mut raw_samples = vec![0u8; (width as usize) * (height as usize) * channels];
+    const MAX_DECODE_PIXELS: usize = 150_000_000;
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| MediaError::Decode("JXL dimensions overflow".to_string()))?;
+    if pixel_count == 0 || pixel_count > MAX_DECODE_PIXELS {
+        return Err(MediaError::Decode(format!(
+            "JXL dimensions {width}x{height} exceed safety limit"
+        )));
+    }
+    let sample_len = pixel_count
+        .checked_mul(channels)
+        .ok_or_else(|| MediaError::Decode("JXL buffer length overflow".to_string()))?;
+
+    let mut raw_samples = vec![0u8; sample_len];
     stream.write_to_buffer(&mut raw_samples);
 
     let mut rgb_bytes = if channels == 3 {
@@ -145,8 +158,8 @@ fn decode_jpeg_bytes_with_exif_and_icc(
     let mut dyn_img = DynamicImage::from_decoder(decoder)
         .map_err(|e| MediaError::Decode(format!("JPEG pixel decode failed: {e}")))?;
     let effective_orient = match embedded_orient {
-        Some(o) if o != image::metadata::Orientation::NoTransforms => Some(o),
-        _ => fallback_orientation.or(embedded_orient),
+        Some(o) => Some(o),
+        None => fallback_orientation,
     };
     if let Some(orient) = effective_orient {
         dyn_img.apply_orientation(orient);

@@ -189,7 +189,11 @@ export const TrashView: React.FC = () => {
     <div>
       <ViewHeader
         title="Trash"
-        subtitle={`${plural(totalCount, 'trashed item')} in your allowed folders · Auto-purged after 30 days`}
+        subtitle={
+          loading && items.length === 0
+            ? '\u00A0'
+            : `${plural(totalCount, 'trashed item')} in your allowed folders · Auto-purged after 30 days`
+        }
         actions={
           items.length > 0 ? (
             <>

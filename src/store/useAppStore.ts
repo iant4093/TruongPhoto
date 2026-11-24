@@ -653,7 +653,7 @@ export const useAppStore = create<AppState>((set, get) => {
         let sessionId = get().activeChatSessionId;
         if (!sessionId) {
           const derivedTitle = content.trim().slice(0, 48) || undefined;
-          const created = await createChatSession(derivedTitle);
+          const created = await createChatSession(derivedTitle, controller?.signal);
           if (seq !== chatSeq) {
             throw new Error('Chat session reset while sending message');
           }
@@ -866,9 +866,16 @@ export const useAppStore = create<AppState>((set, get) => {
 
     applyWsEvent: (event) => {
       switch (event.type) {
-        case 'connected':
+        case 'connected': {
+          const wasConnected = get().wsConnected;
           set({ wsConnected: true });
+          // When recovering after sleep/disconnect, refresh system info & folders so power/drive state isn't stale
+          if (!wasConnected && get().authenticated && get().systemInfo !== null) {
+            void get().refreshSystemInfo().catch(() => {});
+            void get().refreshFolders().catch(() => {});
+          }
           break;
+        }
         case 'heartbeat':
           set((state) => ({
             liveMetrics: {

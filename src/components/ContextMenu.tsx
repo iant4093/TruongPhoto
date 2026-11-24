@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { create } from 'zustand';
 import { RefreshCw, Settings, Sparkles, Upload } from 'lucide-react';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
+import { isTauri } from '../lib/tauri';
 import { useAppStore } from '../store/useAppStore';
 
 export type ContextMenuEntry =
@@ -92,11 +93,23 @@ export const ContextMenuHost: React.FC = () => {
   const coords =
     measuredCoords && measuredCoords.key === openKey ? measuredCoords : clampEstimate();
 
-  // Global right-click interceptor: replace raw browser context menu on all non-input surfaces.
+  // Global right-click interceptor: replace raw browser context menu on desktop surfaces
+  // while preserving native copy/image menus on touch devices and when text is selected.
   useEffect(() => {
     const onGlobalContextMenu = (event: MouseEvent) => {
       if (event.defaultPrevented) return;
       if (isEditableTarget(event.target)) return;
+      if (
+        !isTauri() &&
+        typeof window !== 'undefined' &&
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(pointer: coarse)').matches
+      ) {
+        return;
+      }
+      if (typeof window !== 'undefined' && (window.getSelection?.()?.toString().trim().length ?? 0) > 0) {
+        return;
+      }
 
       event.preventDefault();
       const store = useAppStore.getState();

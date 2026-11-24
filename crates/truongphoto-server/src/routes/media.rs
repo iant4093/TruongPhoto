@@ -96,12 +96,21 @@ fn select_preview_source_file<'a>(
     }
 }
 
-fn sanitize_download_filename(rel_path: &str) -> String {
-    let raw = Path::new(rel_path)
+fn build_content_disposition_attachment(raw_rel_path: &str) -> String {
+    let base = Path::new(raw_rel_path)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("download.bin");
-    let cleaned: String = raw
+    let clean_utf8: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '"'))
+        .collect();
+    let utf8_name = if clean_utf8.trim().is_empty() {
+        "download.bin".to_string()
+    } else {
+        clean_utf8
+    };
+    let ascii_fallback: String = utf8_name
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
@@ -111,7 +120,39 @@ fn sanitize_download_filename(rel_path: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    let ascii_fallback = if ascii_fallback.trim().is_empty() {
+        "download.bin".to_string()
+    } else {
+        ascii_fallback
+    };
+    // RFC 5987 percent-encoding for UTF-8 filename*
+    let mut encoded = String::with_capacity(utf8_name.len() * 2);
+    for &b in utf8_name.as_bytes() {
+        let is_attr_char = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            );
+        if is_attr_char {
+            encoded.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut encoded, "%{b:02X}");
+        }
+    }
+    format!("attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+fn sanitize_download_filename(rel_path: &str) -> String {
+    let raw = Path::new(rel_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("download.bin");
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '"'))
+        .collect();
+    if cleaned.trim().is_empty() {
         "download.bin".to_string()
     } else {
         cleaned
@@ -178,7 +219,24 @@ pub(crate) async fn serve_file_slice_with_range(
             .map_err(|e| AppError::internal(format!("Failed to build 304 response: {e}")));
     }
 
-    let range_header = req_headers.get(RANGE).and_then(|v| v.to_str().ok());
+    // RFC 9110 §13.1.5: validate `If-Range` against strong ETag so iOS Safari / AppleCoreMedia
+    // receives `200 OK` full content instead of corrupt `206` chunks if the media file changed.
+    let if_range_allows_partial = match req_headers
+        .get(axum::http::header::IF_RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            !trimmed.starts_with("W/") && trimmed == etag
+        }
+        None => true,
+    };
+
+    let range_header = if if_range_allows_partial {
+        req_headers.get(RANGE).and_then(|v| v.to_str().ok())
+    } else {
+        None
+    };
 
     let (status, start, end, content_range_val) = if let Some(raw_range) = range_header {
         if slice_len == 0 {
@@ -263,7 +321,7 @@ pub(crate) async fn serve_file_slice_with_range(
     if let Some(fname) = download_filename {
         builder = builder.header(
             CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{fname}\""),
+            build_content_disposition_attachment(fname),
         );
     }
     if let Some((hk, hv)) = extra_header {
@@ -423,6 +481,7 @@ pub async fn get_preview(
     AxumPath(asset_id): AxumPath<String>,
     req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let include_trashed = rbac.auth.user.role.can_contribute();
     let scope = rbac.scope.clone();
     let aid_lookup = asset_id.clone();
     let default_paths = state.default_paths.clone();
@@ -430,7 +489,12 @@ pub async fn get_preview(
     let (asset_opt, settings) = state
         .db
         .read(move |conn| {
-            let asset = repo::assets::get_asset_with_files(conn, &scope, &aid_lookup)?;
+            let asset = repo::assets::get_asset_with_files_filtered(
+                conn,
+                &scope,
+                &aid_lookup,
+                include_trashed,
+            )?;
             let settings = repo::settings::load_app_settings(conn, &default_paths)?;
             Ok((asset, settings))
         })
@@ -513,6 +577,7 @@ pub async fn get_original(
     Query(query): Query<OriginalQuery>,
     req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let include_trashed = rbac.auth.user.role.can_contribute();
     let scope = rbac.scope.clone();
     let aid_lookup = asset_id.clone();
     let default_paths = state.default_paths.clone();
@@ -520,7 +585,12 @@ pub async fn get_original(
     let (asset_opt, settings) = state
         .db
         .read(move |conn| {
-            let asset = repo::assets::get_asset_with_files(conn, &scope, &aid_lookup)?;
+            let asset = repo::assets::get_asset_with_files_filtered(
+                conn,
+                &scope,
+                &aid_lookup,
+                include_trashed,
+            )?;
             let settings = repo::settings::load_app_settings(conn, &default_paths)?;
             Ok((asset, settings))
         })
@@ -693,6 +763,7 @@ pub async fn get_live_video(
     AxumPath(asset_id): AxumPath<String>,
     req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let include_trashed = rbac.auth.user.role.can_contribute();
     let scope = rbac.scope.clone();
     let aid_lookup = asset_id.clone();
     let default_paths = state.default_paths.clone();
@@ -700,7 +771,12 @@ pub async fn get_live_video(
     let (asset_opt, settings) = state
         .db
         .read(move |conn| {
-            let asset = repo::assets::get_asset_with_files(conn, &scope, &aid_lookup)?;
+            let asset = repo::assets::get_asset_with_files_filtered(
+                conn,
+                &scope,
+                &aid_lookup,
+                include_trashed,
+            )?;
             let settings = repo::settings::load_app_settings(conn, &default_paths)?;
             Ok((asset, settings))
         })
@@ -877,15 +953,22 @@ pub async fn get_hls_playlist(
     rbac: RbacContext,
     State(state): State<Arc<AppState>>,
     AxumPath(asset_id): AxumPath<String>,
+    req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let scope = rbac.scope.clone();
+    let include_trashed = rbac.auth.user.role.can_contribute();
     let aid_lookup = asset_id.clone();
     let default_paths = state.default_paths.clone();
 
     let (asset_opt, settings) = state
         .db
         .read(move |conn| {
-            let asset = repo::assets::get_asset_with_files(conn, &scope, &aid_lookup)?;
+            let asset = repo::assets::get_asset_with_files_filtered(
+                conn,
+                &scope,
+                &aid_lookup,
+                include_trashed,
+            )?;
             let settings = repo::settings::load_app_settings(conn, &default_paths)?;
             Ok((asset, settings))
         })
@@ -958,16 +1041,33 @@ pub async fn get_hls_playlist(
     let bytes = tokio::fs::read(&playlist_path)
         .await
         .map_err(|e| AppError::internal(format!("Failed to read HLS playlist: {e}")))?;
+    let mtime_secs = tokio::fs::metadata(&playlist_path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let etag = format!("\"hls-{asset_id}-{}-{mtime_secs}\"", bytes.len());
+    if check_etag_match(&req_headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(ETAG, etag)
+            .header(CACHE_CONTROL, "private, max-age=3600")
+            .body(Body::empty())
+            .map_err(|e| AppError::internal(format!("Failed to build 304 HLS response: {e}")));
+    }
 
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/vnd.apple.mpegurl")
+        .header(ETAG, etag)
         .header(CACHE_CONTROL, "private, max-age=3600")
         .body(Body::from(bytes))
         .map_err(|e| AppError::internal(format!("Failed to build HLS playlist response: {e}")))
 }
 
-/// Strictly validates HLS segment filenames (`seg_DDDD.ts` or `seg_DDDD.m4s`, 4 ASCII digits ONLY).
+/// Strictly validates HLS segment filenames (`seg_DDDD.ts` or `seg_DDDD.m4s`, 4–6 ASCII digits).
 fn is_valid_hls_segment(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("seg_") else {
         return false;
@@ -975,7 +1075,9 @@ fn is_valid_hls_segment(name: &str) -> bool {
     let Some((digits, ext)) = rest.split_once('.') else {
         return false;
     };
-    digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()) && matches!(ext, "ts" | "m4s")
+    (4..=6).contains(&digits.len())
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && matches!(ext, "ts" | "m4s")
 }
 
 /// `GET /api/media/{id}/hls/{segment}` (Authenticated + RbacContext; strict segment filename validation).
@@ -990,13 +1092,19 @@ pub async fn get_hls_segment(
     }
 
     let scope = rbac.scope.clone();
+    let include_trashed = rbac.auth.user.role.can_contribute();
     let aid_lookup = asset_id.clone();
     let default_paths = state.default_paths.clone();
 
     let (asset_opt, settings) = state
         .db
         .read(move |conn| {
-            let asset = repo::assets::get_asset_with_files(conn, &scope, &aid_lookup)?;
+            let asset = repo::assets::get_asset_with_files_filtered(
+                conn,
+                &scope,
+                &aid_lookup,
+                include_trashed,
+            )?;
             let settings = repo::settings::load_app_settings(conn, &default_paths)?;
             Ok((asset, settings))
         })

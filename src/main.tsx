@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import { ensureWindowStateWatcher } from './components/WindowControls';
 import { isTauri } from './lib/tauri';
 import './styles/theme.css';
 
@@ -8,17 +9,9 @@ if (isTauri()) {
   const isMac = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
   if (!isMac) {
     document.body.classList.add('tauri-transparent');
+    document.documentElement.classList.add('tauri-frameless');
   }
-  document.addEventListener('contextmenu', (event) => {
-    const target = event.target as HTMLElement | null;
-    if (
-      target &&
-      (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
-    ) {
-      return;
-    }
-    event.preventDefault();
-  });
+  ensureWindowStateWatcher();
 }
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(

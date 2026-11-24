@@ -19,6 +19,7 @@ pub mod ws;
 use axum::{
     extract::DefaultBodyLimit,
     http::{header, Extensions, HeaderMap, HeaderName, HeaderValue, StatusCode, Version},
+    response::IntoResponse,
     Router,
 };
 use mdns::MdnsHandle;
@@ -109,21 +110,40 @@ impl ServerHandle {
     }
 }
 
+/// Rejects cross-origin state-changing HTTP requests (`POST`/`PUT`/`PATCH`/`DELETE`) using
+/// `Origin` and `Sec-Fetch-Site` headers so `SameSite=Lax` cookies remain protected against CSRF.
+async fn csrf_origin_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_safe = matches!(
+        *req.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    if !is_safe && !ws::is_same_origin_request(req.headers()) {
+        return (StatusCode::FORBIDDEN, "Cross-origin request rejected.").into_response();
+    }
+    next.run(req).await
+}
+
 /// Builds the complete TruongPhoto Axum router (`/api/*` + embedded SPA fallback).
 pub fn build_router(state: Arc<AppState>) -> Router {
     let compression_predicate = DefaultPredicate::new()
         .and(NotForContentType::const_new("video/"))
         .and(NotForContentType::const_new("application/octet-stream"))
+        .and(NotForContentType::const_new("application/zip"))
         .and(
             |status: StatusCode, _ver: Version, headers: &HeaderMap, _ext: &Extensions| {
                 status != StatusCode::PARTIAL_CONTENT
                     && !headers.contains_key(header::CONTENT_RANGE)
+                    && !headers.contains_key(header::CONTENT_DISPOSITION)
             },
         );
 
     Router::new()
         .nest("/api", routes::api_router())
         .fallback(assets_embed::spa_fallback)
+        .layer(axum::middleware::from_fn(csrf_origin_middleware))
         .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
         .layer(CompressionLayer::new().compress_when(compression_predicate))
         .layer(SetResponseHeaderLayer::overriding(

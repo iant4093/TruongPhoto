@@ -149,6 +149,7 @@ export const PinGateView: React.FC = () => {
                 className="pin-input"
                 type="password"
                 inputMode="numeric"
+                pattern="[0-9]*"
                 autoComplete="off"
                 maxLength={6}
                 placeholder="••••••"
@@ -211,6 +212,7 @@ export const PinGateView: React.FC = () => {
                 className="pin-input"
                 type="password"
                 inputMode="numeric"
+                pattern="[0-9]*"
                 autoComplete="off"
                 maxLength={4}
                 placeholder="••••"

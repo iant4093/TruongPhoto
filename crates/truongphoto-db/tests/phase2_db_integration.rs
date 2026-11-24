@@ -118,6 +118,7 @@ async fn migration_0003_idempotency_and_ai_index_state_defaults() {
             (2, "0002_phase1_media".to_string()),
             (3, "0003_phase2_ai".to_string()),
             (4, "0004_phase3_chat_map".to_string()),
+            (5, "0005_r5_perf_indexes".to_string()),
         ]
     );
     assert_eq!(state.active_vision_tier, AiTier::Tier2);

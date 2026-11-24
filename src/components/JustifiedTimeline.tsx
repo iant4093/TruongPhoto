@@ -182,27 +182,46 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
     setAlbumPickerOpen(false);
   }, []);
 
+  const hasSelection = selectedIds.size > 0;
+  const albumPickerOpenRef = useRef(albumPickerOpen);
+  albumPickerOpenRef.current = albumPickerOpen;
+  const clearSelectionRef = useRef(clearSelection);
+  clearSelectionRef.current = clearSelection;
+  const touchLongPressTimerRef = useRef<number | null>(null);
+  const suppressNextClickIdRef = useRef<string | null>(null);
+
+  const clearTileLongPress = useCallback(() => {
+    if (touchLongPressTimerRef.current !== null) {
+      window.clearTimeout(touchLongPressTimerRef.current);
+      touchLongPressTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearTileLongPress, [clearTileLongPress]);
+
   // Pressing Escape clears active multi-selection cleanly when no modal/lightbox/menu is on top.
+  // Keyed strictly on `hasSelection` boolean so selecting more items or toggling albumPicker never
+  // re-pushes this layer above open modals/drawers.
   useEffect(() => {
-    if (selectedIds.size === 0) return;
+    if (!hasSelection) return;
     const layer = pushEscapeLayer();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || !isTopEscapeLayer(layer)) return;
       if (useAppStore.getState().lightboxAssetId) return;
       event.preventDefault();
       event.stopPropagation();
-      if (albumPickerOpen) {
+      if (albumPickerOpenRef.current) {
         setAlbumPickerOpen(false);
         return;
       }
-      clearSelection();
+      clearSelectionRef.current();
     };
     document.addEventListener('keydown', onKeyDown);
     return () => {
       document.removeEventListener('keydown', onKeyDown);
       popEscapeLayer(layer);
     };
-  }, [albumPickerOpen, clearSelection, selectedIds.size]);
+  }, [hasSelection]);
 
   const toggleSelect = useCallback(
     (assetId: string, shiftKey: boolean) => {
@@ -300,14 +319,14 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
 
   useEffect(() => {
     if (!albumPickerOpen) return;
-    const onPointerDown = (event: MouseEvent) => {
+    const onPointerDown = (event: Event) => {
       const target = event.target as Node | null;
       if (albumPickerRef.current && target && !albumPickerRef.current.contains(target)) {
         setAlbumPickerOpen(false);
       }
     };
-    document.addEventListener('mousedown', onPointerDown);
-    return () => document.removeEventListener('mousedown', onPointerDown);
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
   }, [albumPickerOpen]);
 
   const handleOpenAlbumPicker = async () => {
@@ -366,8 +385,27 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
               className={`timeline-tile${isSelected ? ' is-selected' : ''}`}
               style={{ width, height }}
               aria-label={asset.title || `${asset.kind} item`}
+              onTouchStart={(e) => {
+                if (!(canMutate || Boolean(extraBulkActions)) || e.touches.length !== 1) return;
+                clearTileLongPress();
+                touchLongPressTimerRef.current = window.setTimeout(() => {
+                  touchLongPressTimerRef.current = null;
+                  suppressNextClickIdRef.current = asset.id;
+                  toggleSelect(asset.id, false);
+                }, 420);
+              }}
+              onTouchMove={clearTileLongPress}
+              onTouchEnd={clearTileLongPress}
+              onTouchCancel={clearTileLongPress}
               onClick={(e) => {
-                if (canMutate && (e.metaKey || e.ctrlKey || e.shiftKey)) {
+                if (suppressNextClickIdRef.current === asset.id) {
+                  suppressNextClickIdRef.current = null;
+                  return;
+                }
+                if (
+                  (canMutate || Boolean(extraBulkActions)) &&
+                  (e.metaKey || e.ctrlKey || e.shiftKey || selectedIds.size > 0)
+                ) {
                   e.preventDefault();
                   toggleSelect(asset.id, e.shiftKey);
                   return;

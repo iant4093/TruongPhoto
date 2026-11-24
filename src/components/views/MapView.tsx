@@ -257,9 +257,13 @@ export const MapView: React.FC = () => {
     void loadInitialMap();
   }, [loadInitialMap, libraryRevision]);
 
-  // Refresh open cluster photo strip when libraryRevision changes (e.g. item trashed or favorited in Lightbox).
+  // Refresh open cluster photo strip ONLY when libraryRevision actually increments
+  // (avoid clobbering handleSelectCluster's pointsSeqRef and leaving loadingStrip stuck true).
+  const prevLibraryRevisionRef = useRef(libraryRevision);
   useEffect(() => {
-    if (!selectedCluster || libraryRevision === 0) return;
+    if (libraryRevision === prevLibraryRevisionRef.current) return;
+    prevLibraryRevisionRef.current = libraryRevision;
+    if (!selectedCluster) return;
     const seq = ++pointsSeqRef.current;
     void getMapPoints({
       min_lat: selectedCluster.min_lat,
@@ -273,7 +277,12 @@ export const MapView: React.FC = () => {
           setStripAssets(res.items);
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        if (seq === pointsSeqRef.current) {
+          setLoadingStrip(false);
+        }
+      });
   }, [libraryRevision, selectedCluster]);
 
   const handleSelectCluster = useCallback(async (cluster: MapCluster) => {

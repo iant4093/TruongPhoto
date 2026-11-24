@@ -340,28 +340,32 @@ pub fn build_playback_info(
             .iter()
             .find(|f| f.file_role == FileRole::Primary)
             .or_else(|| files.first());
+        // Only MP4/M4V with 8-bit SDR H.264 video and browser-safe audio (AAC/MP3/none) are universally
+        // playable across desktop browsers AND iOS Safari/Mobile WebKit; route WebM & exotic audio to HLS.
         let container_ok = primary
             .map(|f| {
                 matches!(
                     f.extension.trim().to_ascii_lowercase().as_str(),
-                    "mp4" | "m4v" | "webm"
+                    "mp4" | "m4v"
                 )
             })
             .unwrap_or(false);
         let codec_ok = video_meta
             .and_then(|vm| vm.video_codec.as_deref())
-            .map(|c| {
-                matches!(
-                    c.trim().to_ascii_lowercase().as_str(),
-                    "h264" | "avc1" | "vp8" | "vp9"
-                )
-            })
+            .map(|c| matches!(c.trim().to_ascii_lowercase().as_str(), "h264" | "avc1"))
             .unwrap_or(false);
+        let audio_ok = video_meta
+            .and_then(|vm| vm.audio_codec.as_deref())
+            .map(|a| {
+                let low = a.trim().to_ascii_lowercase();
+                low.is_empty() || matches!(low.as_str(), "aac" | "mp3" | "mp4a")
+            })
+            .unwrap_or(true);
         let sdr_8bit = video_meta
             .map(|vm| !vm.is_hdr && vm.bit_depth.unwrap_or(8) <= 8)
             .unwrap_or(false);
 
-        if container_ok && codec_ok && sdr_8bit {
+        if container_ok && codec_ok && audio_ok && sdr_8bit {
             (
                 PlaybackMode::Direct,
                 Some(format!("/api/media/{asset_id}/original")),

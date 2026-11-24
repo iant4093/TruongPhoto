@@ -77,7 +77,9 @@ export const SearchFilterBar: React.FC = () => {
   const runSearch = useAppStore((s) => s.runSearch);
   const clearSearch = useAppStore((s) => s.clearSearch);
 
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 768 : true,
+  );
   const [people, setPeople] = useState<PersonSummary[]>([]);
 
   const [cameraInput, setCameraInput] = useState(searchRequest.camera_model ?? '');

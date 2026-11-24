@@ -91,6 +91,7 @@ const SearchOmnibar: React.FC<{
           onChange={(e) => setSearchQuery(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Escape') {
+              e.stopPropagation();
               if (searchActive || searchQuery) clearSearch();
               else inputRef.current?.blur();
             }
@@ -179,6 +180,63 @@ export const App: React.FC = () => {
   useEffect(() => {
     void bootstrap();
   }, [bootstrap]);
+
+  // Reset stuck file-drag overlay if OS drag is cancelled outside the window
+  useEffect(() => {
+    const clearDrag = () => {
+      dragDepthRef.current = 0;
+      setWindowDragActive(false);
+    };
+    window.addEventListener('dragend', clearDrag);
+    window.addEventListener('blur', clearDrag);
+    return () => {
+      window.removeEventListener('dragend', clearDrag);
+      window.removeEventListener('blur', clearDrag);
+    };
+  }, []);
+
+  // Reset shared content-viewport scroll position when switching top-level views or search mode
+  const viewportRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (viewportRef.current) {
+      viewportRef.current.scrollTop = 0;
+    }
+  }, [activeNav, searchActive]);
+
+  // Lightweight browser history integration so mobile Back closes Lightbox instead of leaving the app
+  const lightboxHistoryPushedRef = useRef(false);
+  useEffect(() => {
+    if (isTauri() || typeof window === 'undefined' || typeof window.history === 'undefined') return;
+    if (lightboxAssetId !== null && !lightboxHistoryPushedRef.current) {
+      lightboxHistoryPushedRef.current = true;
+      try {
+        window.history.pushState({ tpLightbox: true }, '');
+      } catch {
+        // Ignore restricted history contexts
+      }
+    } else if (lightboxAssetId === null && lightboxHistoryPushedRef.current) {
+      lightboxHistoryPushedRef.current = false;
+      if ((window.history.state as { tpLightbox?: boolean } | null)?.tpLightbox) {
+        try {
+          window.history.back();
+        } catch {
+          // Ignore
+        }
+      }
+    }
+  }, [lightboxAssetId]);
+
+  useEffect(() => {
+    if (isTauri() || typeof window === 'undefined') return;
+    const onPopState = () => {
+      if (useAppStore.getState().lightboxAssetId !== null) {
+        lightboxHistoryPushedRef.current = false;
+        useAppStore.getState().closeLightbox();
+      }
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
 
   // Clear local UI state (dropped files, context menus) when signed out or session expires.
   useEffect(() => {
@@ -438,7 +496,7 @@ export const App: React.FC = () => {
 
       <div className="workspace">
         {!hideWorkspaceHeader && (
-          <header className="workspace-header" data-tauri-drag-region>
+          <header className="workspace-header" data-tauri-drag-region="deep">
             {showSearchOmnibar ? (
               <SearchOmnibar inputRef={searchInputRef} />
             ) : (
@@ -506,7 +564,7 @@ export const App: React.FC = () => {
         )}
 
         <div className="workspace-body">
-          <main className="content-viewport">
+          <main ref={viewportRef} className="content-viewport">
             {searchActive ? (
               <div key="search" className="view-content is-full-bleed">
                 <SearchResultsView />

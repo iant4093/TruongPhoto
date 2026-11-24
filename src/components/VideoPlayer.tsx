@@ -43,6 +43,17 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       }
     };
 
+    const releaseVideoMedia = () => {
+      if (typeof navigator !== 'undefined' && /jsdom/i.test(navigator.userAgent)) return;
+      try {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+      } catch {
+        // Ignore cleanup errors on detached media elements
+      }
+    };
+
     const onLoadedMetadata = () => {
       seekToInitial();
     };
@@ -57,6 +68,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       }
       return () => {
         video.removeEventListener('loadedmetadata', onLoadedMetadata);
+        releaseVideoMedia();
       };
     }
 
@@ -121,6 +133,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         } else if (targetTimestampSec !== null) {
           try {
             video.currentTime = targetTimestampSec;
+            didSeek = true;
           } catch {
             // Will seek on loadedmetadata once init segment parses
           }
@@ -132,6 +145,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       return () => {
         video.removeEventListener('loadedmetadata', onLoadedMetadata);
         hls.destroy();
+        releaseVideoMedia();
       };
     }
 

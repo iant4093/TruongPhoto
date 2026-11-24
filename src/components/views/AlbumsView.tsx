@@ -616,7 +616,11 @@ export const AlbumsView: React.FC = () => {
     <div>
       <ViewHeader
         title="Albums"
-        subtitle={`${plural(items.length, 'album')} owned or shared with you`}
+        subtitle={
+          loading && items.length === 0
+            ? '\u00A0'
+            : `${plural(items.length, 'album')} owned or shared with you`
+        }
         actions={
           canCreate ? (
             <button

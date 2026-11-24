@@ -303,14 +303,16 @@ fn classic_router_dates_cameras_tags_ocr_and_media_kinds() {
     assert_eq!(cam.location_query.as_deref(), Some("Kyoto"));
     assert_eq!(cam.tags, vec!["sunset".to_string()]);
 
-    // OCR
+    // Bare "receipt in 2024" flows through Hybrid semantic+OCR search rather than strict OCR-only,
+    // while explicit "with text saying ..." routes to `ocr_terms`.
     let receipt = router
         .route_turn(
             ChatTier::Tier0,
             &turn_input("receipt in 2024", RouterPlan::default(), &[]),
         )
         .unwrap();
-    assert_eq!(receipt.ocr_terms.as_deref(), Some("receipt"));
+    assert_eq!(receipt.semantic_query.as_deref(), Some("receipt"));
+    assert_eq!(receipt.ocr_terms, None);
     assert!(receipt.date_from_ms.is_some());
 
     let text_saying = router

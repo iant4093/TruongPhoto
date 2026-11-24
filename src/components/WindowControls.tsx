@@ -82,6 +82,7 @@ const Glyph: React.FC<{ kind: 'minimize' | 'maximize' | 'restore' | 'close' }> =
 let sharedMaximized = false;
 const maximizedListeners = new Set<(m: boolean) => void>();
 let maximizedWatcherInitialized = false;
+let windowStateSyncSeq = 0;
 
 function broadcastMaximized(next: boolean): void {
   sharedMaximized = next;
@@ -93,15 +94,27 @@ function broadcastMaximized(next: boolean): void {
   }
 }
 
-function ensureMaximizedWatcher(): void {
+function broadcastFullscreen(next: boolean): void {
+  if (typeof document !== 'undefined') {
+    document.documentElement.classList.toggle('is-fullscreen', next);
+  }
+}
+
+export function ensureWindowStateWatcher(): void {
   if (maximizedWatcherInitialized || !isTauri()) return;
   maximizedWatcherInitialized = true;
   const sync = () => {
+    const seq = ++windowStateSyncSeq;
     try {
-      void getCurrentWindow()
-        .isMaximized()
-        .then((m) => broadcastMaximized(m))
-        .catch(() => {});
+      const win = getCurrentWindow();
+      void Promise.all([
+        win.isMaximized().catch(() => false),
+        win.isFullscreen().catch(() => false),
+      ]).then(([m, fs]) => {
+        if (seq !== windowStateSyncSeq) return;
+        broadcastMaximized(m);
+        broadcastFullscreen(fs);
+      });
     } catch {
       // Ignore outside Tauri runtime
     }
@@ -121,7 +134,7 @@ export const WindowsCaptionButtons: React.FC = () => {
   const [maximized, setMaximized] = useState(sharedMaximized);
   useEffect(() => {
     if (!isTauri()) return;
-    ensureMaximizedWatcher();
+    ensureWindowStateWatcher();
     setMaximized(sharedMaximized);
     maximizedListeners.add(setMaximized);
     return () => {

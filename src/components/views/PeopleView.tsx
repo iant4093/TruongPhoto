@@ -459,7 +459,11 @@ export const PeopleView: React.FC = () => {
     <div>
       <ViewHeader
         title="People"
-        subtitle={`${plural(items.length, 'person', 'people')} visible in your allowed folders`}
+        subtitle={
+          loading && items.length === 0
+            ? '\u00A0'
+            : `${plural(items.length, 'person', 'people')} visible in your allowed folders`
+        }
         actions={
           isAdmin ? (
             <>

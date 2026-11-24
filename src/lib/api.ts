@@ -731,10 +731,14 @@ export const listChatSessions = async (): Promise<ChatSessionSummary[]> => {
   return data.items;
 };
 
-export const createChatSession = async (title?: string): Promise<ChatSessionSummary> => {
+export const createChatSession = async (
+  title?: string,
+  signal?: AbortSignal,
+): Promise<ChatSessionSummary> => {
   const data = await request<{ session: ChatSessionSummary }>('/api/chat/sessions', {
     method: 'POST',
     body: JSON.stringify(title !== undefined ? { title } : {}),
+    signal,
   });
   return data.session;
 };
@@ -865,13 +869,45 @@ export class WsClient {
   private socket: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private pongWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private attempt = 0;
   private closedManually = false;
+  private lifecycleAttached = false;
 
   constructor(options: WsClientOptions) {
     this.urlOverride = options.url;
     this.onEvent = options.onEvent;
     this.onConnectionChange = options.onConnectionChange;
+  }
+
+  private readonly handleWakeOrOnline = (): void => {
+    if (this.closedManually) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (!this.socket || this.socket.readyState === WebSocket.CLOSED) {
+      this.attempt = 0;
+      this.clearReconnectTimer();
+      this.connect();
+    } else if (this.socket.readyState === WebSocket.OPEN) {
+      this.sendPing();
+    }
+  };
+
+  private attachLifecycleListeners(): void {
+    if (this.lifecycleAttached || typeof window === 'undefined') return;
+    this.lifecycleAttached = true;
+    window.addEventListener('online', this.handleWakeOrOnline);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleWakeOrOnline);
+    }
+  }
+
+  private detachLifecycleListeners(): void {
+    if (!this.lifecycleAttached || typeof window === 'undefined') return;
+    this.lifecycleAttached = false;
+    window.removeEventListener('online', this.handleWakeOrOnline);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleWakeOrOnline);
+    }
   }
 
   private resolveUrl(): string {
@@ -886,6 +922,7 @@ export class WsClient {
   connect(): void {
     this.closedManually = false;
     this.clearReconnectTimer();
+    this.attachLifecycleListeners();
     if (typeof WebSocket === 'undefined') return;
     if (
       this.socket &&
@@ -901,12 +938,14 @@ export class WsClient {
     ws.onopen = () => {
       if (this.socket !== ws) return;
       this.attempt = 0;
+      this.clearPongWatchdog();
       this.onConnectionChange?.(true);
       this.startPing();
     };
 
     ws.onmessage = (event) => {
       if (this.socket !== ws || typeof event.data !== 'string') return;
+      this.clearPongWatchdog();
       try {
         const parsed = JSON.parse(event.data) as WsServerEvent;
         if (parsed && typeof parsed.type === 'string') {
@@ -927,6 +966,7 @@ export class WsClient {
       }
       this.socket = null;
       this.stopPing();
+      this.clearPongWatchdog();
       this.onConnectionChange?.(false);
       if (!this.closedManually) {
         this.scheduleReconnect();
@@ -936,8 +976,10 @@ export class WsClient {
 
   disconnect(): void {
     this.closedManually = true;
+    this.detachLifecycleListeners();
     this.clearReconnectTimer();
     this.stopPing();
+    this.clearPongWatchdog();
     const ws = this.socket;
     this.socket = null;
     if (ws) {
@@ -958,6 +1000,26 @@ export class WsClient {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       const msg: WsClientMessage = { type: 'ping' };
       this.socket.send(JSON.stringify(msg));
+      if (this.pongWatchdogTimer === null) {
+        const ws = this.socket;
+        this.pongWatchdogTimer = setTimeout(() => {
+          this.pongWatchdogTimer = null;
+          if (this.socket === ws && !this.closedManually) {
+            try {
+              ws.close();
+            } catch {
+              // Ignore close errors on half-open socket
+            }
+          }
+        }, 10_000);
+      }
+    }
+  }
+
+  private clearPongWatchdog(): void {
+    if (this.pongWatchdogTimer !== null) {
+      clearTimeout(this.pongWatchdogTimer);
+      this.pongWatchdogTimer = null;
     }
   }
 

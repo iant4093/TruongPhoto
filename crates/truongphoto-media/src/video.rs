@@ -219,13 +219,14 @@ pub fn video_capabilities() -> &'static VideoCapabilities {
     })
 }
 
-/// Chooses `Direct` HTTP Range vs. `Hls` transcoding based on container, codec, bit depth, and HDR status.
+/// Chooses `Direct` HTTP Range vs. `Hls` transcoding based on container, codec, audio, bit depth, and HDR status.
 pub fn decide_playback_mode(extension: &str, video_meta: Option<&VideoMetaView>) -> PlaybackMode {
     let ext = extension
         .trim()
         .trim_start_matches('.')
         .to_ascii_lowercase();
-    let direct_container = matches!(ext.as_str(), "mp4" | "m4v" | "webm");
+    // WebM fails on iOS Safari; require MP4/M4V + 8-bit SDR H.264 + AAC/MP3 audio for universal Direct playback.
+    let direct_container = matches!(ext.as_str(), "mp4" | "m4v");
     if !direct_container {
         return PlaybackMode::Hls;
     }
@@ -238,13 +239,25 @@ pub fn decide_playback_mode(extension: &str, video_meta: Option<&VideoMetaView>)
         return PlaybackMode::Hls;
     }
 
+    let audio_ok = meta
+        .audio_codec
+        .as_deref()
+        .map(|a| {
+            let low = a.trim().to_ascii_lowercase();
+            low.is_empty() || matches!(low.as_str(), "aac" | "mp3" | "mp4a")
+        })
+        .unwrap_or(true);
+    if !audio_ok {
+        return PlaybackMode::Hls;
+    }
+
     let codec = meta
         .video_codec
         .as_deref()
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    if matches!(codec.as_str(), "h264" | "avc1" | "vp8" | "vp9") {
+    if matches!(codec.as_str(), "h264" | "avc1") {
         PlaybackMode::Direct
     } else {
         PlaybackMode::Hls
@@ -329,8 +342,10 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
     }
     std::fs::create_dir_all(&tmp_dir)?;
 
-    const VF_SDR: &str = "scale=w='trunc(min(1920\\,iw)/2)*2':h=-2,format=yuv420p";
-    const VF_HDR_TONEMAP: &str = "scale=w='trunc(min(1920\\,iw)/2)*2':h=-2,zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+    // Cap the LONGEST edge to 1920 (even dimensions) so vertical 4K smartphone videos (2160x3840)
+    // scale to 1080x1920 instead of 1920x3414, staying within H.264 Level 4.1 mobile decoder limits.
+    const VF_SDR: &str = "scale='if(gte(iw\\,ih)\\,trunc(min(1920\\,iw)/2)*2\\,-2)':'if(gte(iw\\,ih)\\,-2\\,trunc(min(1920\\,ih)/2)*2)',format=yuv420p";
+    const VF_HDR_TONEMAP: &str = "scale='if(gte(iw\\,ih)\\,trunc(min(1920\\,iw)/2)*2\\,-2)':'if(gte(iw\\,ih)\\,-2\\,trunc(min(1920\\,ih)/2)*2)',zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
 
     let use_hdr_vf = is_hdr && caps.has_zscale_tonemap;
     let initial_vf = if use_hdr_vf { VF_HDR_TONEMAP } else { VF_SDR };
@@ -346,10 +361,20 @@ pub fn transcode_to_hls(src: &Path, output_dir: &Path, is_hdr: bool) -> Result<u
         cmd.args(["-y", "-v", "error", "-i"])
             .arg(src)
             .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-sn",
+                "-dn",
                 "-vf",
                 filter,
                 "-c:v",
                 encoder,
+                "-profile:v",
+                "high",
+                "-level:v",
+                "4.1",
                 "-b:v",
                 "6M",
                 "-maxrate",
@@ -497,9 +522,17 @@ mod tests {
             decide_playback_mode("mp4", Some(&sample_meta("h264", 8, false))),
             PlaybackMode::Direct
         );
+        // WebM fails in iOS Safari <video>, so route it through HLS transcoding for universal playback.
         assert_eq!(
             decide_playback_mode("webm", Some(&sample_meta("vp9", 8, false))),
-            PlaybackMode::Direct
+            PlaybackMode::Hls
+        );
+        // MP4 with non-browser audio (e.g. AC-3) also routes through HLS for audio transcoding.
+        let mut ac3_meta = sample_meta("h264", 8, false);
+        ac3_meta.audio_codec = Some("ac3".to_string());
+        assert_eq!(
+            decide_playback_mode("mp4", Some(&ac3_meta)),
+            PlaybackMode::Hls
         );
         assert_eq!(
             decide_playback_mode("mov", Some(&sample_meta("h264", 8, false))),

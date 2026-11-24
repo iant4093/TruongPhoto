@@ -420,9 +420,16 @@ pub async fn set_ai_tier(
     let now_ms = Utc::now().timestamp_millis();
     let target_tier = req.tier;
 
+    let current_state = state.db.read(repo::ai::get_ai_index_state).await?;
+    let next_staging = if target_tier == current_state.active_vision_tier {
+        None
+    } else {
+        Some(target_tier)
+    };
+
     let ai_state = state
         .db
-        .write(move |conn| repo::ai::set_staging_vision_tier(conn, Some(target_tier), now_ms))
+        .write(move |conn| repo::ai::set_staging_vision_tier(conn, next_staging, now_ms))
         .await?;
 
     state.ai.notify_work();
@@ -445,10 +452,21 @@ pub async fn set_chat_tier(
     let tier = req.tier;
     let vlm_rerank_enabled = req.vlm_rerank_enabled;
 
+    let prev_state = state.db.read(repo::ai::get_ai_index_state).await?;
     let ai_state = state
         .db
         .write(move |conn| repo::ai::set_chat_tier(conn, tier, vlm_rerank_enabled, now_ms))
         .await?;
+
+    // Evict any previously running llama-server sidecar when switching chat tiers so
+    // switching Tier 3 -> Tier 0 (or Tier 2) doesn't strand a 4–15 GB model in memory.
+    if prev_state.active_chat_tier != tier {
+        let pipeline = Arc::clone(state.ai.pipeline());
+        let _ = tokio::task::spawn_blocking(move || {
+            pipeline.chat.evict_idle(std::time::Duration::ZERO)
+        })
+        .await;
+    }
 
     let _ = state.ws_tx.send(WsServerEvent::AiStateChanged {
         active_vision_tier: ai_state.active_vision_tier,

@@ -457,8 +457,25 @@ async fn two_step_login_and_dynamic_secure_cookie_flags() {
     assert_eq!(login_body["user"]["id"], admin_id);
     let session_set = find_set_cookie(&headers, "tp_session").expect("tp_session Set-Cookie");
     assert!(session_set.contains("HttpOnly"));
-    assert!(session_set.contains("SameSite=Strict"));
+    assert!(session_set.contains("SameSite=Lax"));
     assert!(!session_set.contains("; Secure"));
+
+    // Cross-origin state-changing POST is rejected by Origin/Sec-Fetch-Site CSRF guard.
+    let session_cookie = extract_cookie_pair(&headers, "tp_session").unwrap();
+    let (csrf_status, _, _) = app
+        .send(TestHarness::req_json(
+            Method::POST,
+            "/api/auth/logout",
+            TestHarness::loopback_addr(),
+            &[&session_cookie],
+            &[
+                ("Host", "127.0.0.1:38420"),
+                ("Origin", "https://evil.example"),
+            ],
+            None,
+        ))
+        .await;
+    assert_eq!(csrf_status, StatusCode::FORBIDDEN);
 
     // Step 1 + Step 2 on loopback with X-Forwarded-Proto: https (Tailscale Serve) -> Secure MUST be present
     let (status, headers, _) = app
@@ -498,7 +515,7 @@ async fn two_step_login_and_dynamic_secure_cookie_flags() {
     assert_eq!(status, StatusCode::OK);
     let ts_session_set = find_set_cookie(&headers, "tp_session").unwrap();
     assert!(ts_session_set.contains("HttpOnly"));
-    assert!(ts_session_set.contains("SameSite=Strict"));
+    assert!(ts_session_set.contains("SameSite=Lax"));
     assert!(ts_session_set.contains("Secure"));
 
     // Logout revokes session

@@ -65,19 +65,35 @@ pub fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
-    let stdout_handle = std::thread::spawn(move || {
+    fn read_capped<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
         let mut buf = Vec::new();
-        if let Some(mut r) = stdout_pipe {
-            let _ = r.read_to_end(&mut buf);
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let remaining = max_bytes.saturating_sub(buf.len());
+                    if remaining > 0 {
+                        buf.extend_from_slice(&chunk[..n.min(remaining)]);
+                    }
+                }
+            }
         }
         buf
+    }
+
+    const MAX_STDOUT_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_STDERR_BYTES: usize = 16 * 1024 * 1024;
+
+    let stdout_handle = std::thread::spawn(move || {
+        stdout_pipe
+            .map(|r| read_capped(r, MAX_STDOUT_BYTES))
+            .unwrap_or_default()
     });
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut r) = stderr_pipe {
-            let _ = r.read_to_end(&mut buf);
-        }
-        buf
+        stderr_pipe
+            .map(|r| read_capped(r, MAX_STDERR_BYTES))
+            .unwrap_or_default()
     });
 
     let deadline = Instant::now() + timeout;

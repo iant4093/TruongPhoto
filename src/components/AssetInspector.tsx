@@ -143,17 +143,19 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     };
   }, [assetId, initialDetail, loadingInitialDetail, syncFormFromDetail]);
 
+  const activeDetail = detail && detail.summary.id === assetId ? detail : null;
+
   const activeTags = useMemo<MediaTagView[]>(() => {
-    if (!detail) return [];
-    return detail.tags.filter((t) => t.state === 'active');
-  }, [detail]);
+    if (!activeDetail) return [];
+    return activeDetail.tags.filter((t) => t.state === 'active');
+  }, [activeDetail]);
 
   const activeAssetIdRef = React.useRef(assetId);
   activeAssetIdRef.current = assetId;
 
   const handleSaveOverrides = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!canEdit || !detail) return;
+    if (!canEdit || !activeDetail) return;
     const targetAssetId = assetId;
 
     let captureAtMs: number | null | undefined = undefined;
@@ -164,7 +166,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
         return;
       }
       captureAtMs = parsed;
-    } else if (detail.overrides?.capture_at_ms !== null) {
+    } else if (activeDetail.overrides?.capture_at_ms !== null) {
       captureAtMs = null;
     }
 
@@ -197,17 +199,19 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
   const handleAddTag = async (event: React.FormEvent) => {
     event.preventDefault();
     const cleaned = tagInput.trim();
-    if (!canEdit || !cleaned || !detail) return;
+    if (!canEdit || !cleaned || !activeDetail) return;
     const targetAssetId = assetId;
-    const snapshotDetail = detail;
     setTagBusy(true);
     try {
       const nextTags = await addAssetTag(targetAssetId, cleaned);
       if (activeAssetIdRef.current === targetAssetId) {
-        const updated = { ...snapshotDetail, tags: nextTags };
-        setDetail(updated);
+        setDetail((prev) => {
+          if (!prev || prev.summary.id !== targetAssetId) return prev;
+          const updated = { ...prev, tags: nextTags };
+          onAssetUpdated?.(updated);
+          return updated;
+        });
         setTagInput('');
-        onAssetUpdated?.(updated);
       }
       notifySuccess(`Added tag "${cleaned}"`);
     } catch (err) {
@@ -220,16 +224,18 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
   };
 
   const handleRemoveTag = async (tag: string) => {
-    if (!canEdit || !detail) return;
+    if (!canEdit || !activeDetail) return;
     const targetAssetId = assetId;
-    const snapshotDetail = detail;
     setTagBusy(true);
     try {
       const nextTags = await removeAssetTag(targetAssetId, tag);
       if (activeAssetIdRef.current === targetAssetId) {
-        const updated = { ...snapshotDetail, tags: nextTags };
-        setDetail(updated);
-        onAssetUpdated?.(updated);
+        setDetail((prev) => {
+          if (!prev || prev.summary.id !== targetAssetId) return prev;
+          const updated = { ...prev, tags: nextTags };
+          onAssetUpdated?.(updated);
+          return updated;
+        });
       }
       notifySuccess(`Removed tag "${tag}"`);
     } catch (err) {
@@ -241,7 +247,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     }
   };
 
-  if (loading && !detail) {
+  if (loading && !activeDetail) {
     return (
       <div className="asset-inspector">
         <div className="view-loading" role="status">
@@ -251,7 +257,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     );
   }
 
-  if (!detail) {
+  if (!activeDetail) {
     return (
       <div className="asset-inspector">
         <div className="error-banner" role="alert">
@@ -261,7 +267,7 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
     );
   }
 
-  const { summary, photo_meta, video_meta, files, histogram } = detail;
+  const { summary, photo_meta, video_meta, files, histogram } = activeDetail;
   const primaryFile = files.find((f) => f.file_role === 'primary') ?? files[0];
   const cameraMake = photo_meta?.camera_make?.trim() ?? '';
   const cameraModel = (photo_meta?.camera_model ?? summary.camera_model)?.trim() ?? '';
@@ -274,8 +280,8 @@ export const AssetInspector: React.FC<AssetInspectorProps> = ({
   const shutterLabel = formatShutterSpeed(photo_meta?.shutter_speed_sec ?? null);
   const locationLabel =
     [
-      detail.overrides?.geo_city ?? photo_meta?.geo_city ?? video_meta?.geo_city ?? summary.geo_city,
-      detail.overrides?.geo_country ??
+      activeDetail.overrides?.geo_city ?? photo_meta?.geo_city ?? video_meta?.geo_city ?? summary.geo_city,
+      activeDetail.overrides?.geo_country ??
         photo_meta?.geo_country ??
         video_meta?.geo_country ??
         summary.geo_country,

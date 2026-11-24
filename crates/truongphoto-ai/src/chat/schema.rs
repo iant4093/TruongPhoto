@@ -590,9 +590,13 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
     }
 
     let mut merged_has_people = next.has_people.or(prior.has_people);
-    // Avoid contradictory SQL when switching between "photos of X" and "without people".
+    let mut merged_min_faces = min_faces;
+    let mut merged_max_faces = max_faces;
+    // Avoid contradictory SQL when switching between "photos of X" / "group shots" and "without people".
     if next.has_people == Some(false) {
         merged_people.clear();
+        merged_min_faces = None;
+        merged_max_faces = None;
         merged_has_people = Some(false);
     } else if (!next.person_names.is_empty()
         || next.has_people == Some(true)
@@ -606,12 +610,35 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         };
     }
 
-    let merged_kind = next.kind.or(prior.kind);
+    // Reconcile `kind` vs `exclude_kind` two-way so "only videos" -> "no videos" never produces 0 hits.
+    let mut merged_kind = next.kind.or(prior.kind);
     let merged_exclude_kind = if next.kind.is_some() && next.exclude_kind.is_none() {
         None
     } else {
         next.exclude_kind.or(prior.exclude_kind)
     };
+    if next.kind.is_none() && merged_exclude_kind.is_some() && merged_kind == merged_exclude_kind {
+        merged_kind = None;
+    }
+
+    // Reconcile `location_query` vs `exclude_location_query` two-way.
+    let next_loc = normalize_entity_opt_string(next.location_query.clone());
+    let prior_loc = normalize_entity_opt_string(prior.location_query.clone());
+    let next_exc_loc = normalize_entity_opt_string(next.exclude_location_query.clone());
+    let prior_exc_loc = normalize_entity_opt_string(prior.exclude_location_query.clone());
+    let mut merged_loc = next_loc.clone().or(prior_loc);
+    let mut merged_exc_loc = next_exc_loc.clone().or(prior_exc_loc);
+    if let (Some(loc), Some(exc)) = (merged_loc.as_deref(), merged_exc_loc.as_deref()) {
+        let loc_l = loc.to_ascii_lowercase();
+        let exc_l = exc.to_ascii_lowercase();
+        if loc_l == exc_l || loc_l.contains(&exc_l) || exc_l.contains(&loc_l) {
+            if next_loc.is_some() && next_exc_loc.is_none() {
+                merged_exc_loc = None;
+            } else if next_exc_loc.is_some() && next_loc.is_none() {
+                merged_loc = None;
+            }
+        }
+    }
 
     RouterPlan {
         intent: next_intent,
@@ -621,10 +648,8 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
             .or_else(|| normalize_opt_string(prior.ocr_terms.clone())),
         person_names: merged_people,
         exclude_person_names: merged_exclude_people,
-        location_query: normalize_entity_opt_string(next.location_query.clone())
-            .or_else(|| normalize_entity_opt_string(prior.location_query.clone())),
-        exclude_location_query: normalize_entity_opt_string(next.exclude_location_query.clone())
-            .or_else(|| normalize_entity_opt_string(prior.exclude_location_query.clone())),
+        location_query: merged_loc,
+        exclude_location_query: merged_exc_loc,
         camera_model: normalize_entity_opt_string(next.camera_model.clone())
             .or_else(|| normalize_entity_opt_string(prior.camera_model.clone())),
         lens_model: normalize_entity_opt_string(next.lens_model.clone())
@@ -640,8 +665,8 @@ pub fn merge_router_plan(prior: &RouterPlan, next: &RouterPlan) -> RouterPlan {
         orientation: normalize_opt_string(next.orientation.clone())
             .or_else(|| normalize_opt_string(prior.orientation.clone())),
         has_people: merged_has_people,
-        min_faces,
-        max_faces,
+        min_faces: merged_min_faces,
+        max_faces: merged_max_faces,
         sort_by: normalize_opt_string(next.sort_by.clone())
             .or_else(|| normalize_opt_string(prior.sort_by.clone())),
         tags: merge_string_lists(&prior.tags, &next.tags),

@@ -372,8 +372,18 @@ fn apply_vlm_rerank_order(hits: &mut Vec<SearchHit>, ordered_ids: &[(String, f32
 }
 
 fn should_trigger_vlm_rerank(prompt: &str, plan: &RouterPlan) -> bool {
+    // Never overwrite explicit deterministic sorts ("newest photos of dogs", "highest ISO", etc.).
+    if let Some(sort_key) = plan.sort_by.as_deref() {
+        if sort_key != "best" {
+            return false;
+        }
+    }
     if plan.semantic_query.is_some() {
         return true;
+    }
+    // Pure "show me my favorites" has no visual prompt to rerank.
+    if plan.favorite == Some(true) {
+        return false;
     }
     let lower = prompt.to_ascii_lowercase();
     [
@@ -381,8 +391,6 @@ fn should_trigger_vlm_rerank(prompt: &str, plan: &RouterPlan) -> bool {
         "cool",
         "standout",
         "highlight",
-        "favorite",
-        "favourite",
         "funniest",
         "funny",
         "smiling",
@@ -959,11 +967,9 @@ pub async fn send_message(
 
     // Apply client's timezone offset (minutes east of UTC, clamped to valid ±14h) so relative date
     // cues like "today", "yesterday", and "last weekend" match the user's local calendar date.
-    let local_now = match req.tz_offset_minutes {
-        Some(offset_min) => {
-            let clamped = offset_min.clamp(-14 * 60, 14 * 60);
-            Utc::now() + chrono::Duration::minutes(i64::from(clamped))
-        }
+    let clamped_tz_offset_min = req.tz_offset_minutes.map(|m| m.clamp(-14 * 60, 14 * 60));
+    let local_now = match clamped_tz_offset_min {
+        Some(offset_min) => Utc::now() + chrono::Duration::minutes(i64::from(offset_min)),
         None => Utc::now(),
     };
 
@@ -986,6 +992,24 @@ pub async fn send_message(
     .await
     .map_err(|e| AppError::internal(format!("Chat router worker panicked: {e}")))?
     .map_err(|e| AppError::internal(format!("Chat query routing failed: {e}")))?;
+
+    // Convert newly-produced calendar-date UTC midnight bounds into the user's actual local
+    // midnight UTC timestamps (e.g. UTC-8 "today" covers 08:00Z..07:59:59.999Z next day).
+    if let Some(offset_min) = clamped_tz_offset_min {
+        if offset_min != 0 {
+            let offset_ms = i64::from(offset_min) * 60_000;
+            if plan.date_from_ms != session.active_filters.date_from_ms {
+                if let Some(ms) = plan.date_from_ms {
+                    plan.date_from_ms = Some(ms.saturating_sub(offset_ms));
+                }
+            }
+            if plan.date_to_ms != session.active_filters.date_to_ms {
+                if let Some(ms) = plan.date_to_ms {
+                    plan.date_to_ms = Some(ms.saturating_sub(offset_ms));
+                }
+            }
+        }
+    }
 
     let is_answer_only = plan.intent.as_deref() == Some("answer");
     let resolved_people = if is_answer_only {
@@ -1231,8 +1255,12 @@ pub async fn send_message(
         if lp.contains("how many") || lp.starts_with("do i have") || lp.starts_with("are there any")
         {
             let count_str = search_resp.total_count.to_string();
-            if !plan.assistant_reply.contains(&count_str) {
-                plan.assistant_reply = format!(
+            let has_exact_count_token = plan
+                .assistant_reply
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|tok| tok == count_str);
+            if !has_exact_count_token {
+                let prefix = format!(
                     "Found {} matching {}.",
                     search_resp.total_count,
                     if search_resp.total_count == 1 {
@@ -1241,6 +1269,11 @@ pub async fn send_message(
                         "items"
                     }
                 );
+                if plan.assistant_reply.trim().is_empty() {
+                    plan.assistant_reply = prefix;
+                } else {
+                    plan.assistant_reply = format!("{prefix} {}", plan.assistant_reply.trim());
+                }
             }
         }
     }
@@ -1270,8 +1303,12 @@ pub async fn send_message(
         "clear filter",
         "clear all",
         "clear the",
-        "clear ",
+        "clear search",
         "new search",
+        "nevermind",
+        "never mind",
+        "forget that",
+        "scratch that",
         "remove the",
         "remove filter",
         "drop the",
@@ -1415,7 +1452,7 @@ pub async fn warmup_chat(
     let ai_state = state.db.read(repo::ai::get_ai_index_state).await?;
     let active_tier = ai_state.active_chat_tier;
     let pipeline = Arc::clone(state.ai.pipeline());
-    let already_loaded = pipeline.chat.is_loaded();
+    let already_loaded = pipeline.chat.is_loaded_for_tier(active_tier);
 
     if active_tier != ChatTier::Tier0 && !already_loaded {
         let pipe_bg = Arc::clone(&pipeline);

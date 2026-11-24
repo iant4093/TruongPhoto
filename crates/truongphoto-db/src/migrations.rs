@@ -30,6 +30,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0004_phase3_chat_map",
         sql: include_str!("../migrations/0004_phase3_chat_map.sql"),
     },
+    Migration {
+        version: 5,
+        name: "0005_r5_perf_indexes",
+        sql: include_str!("../migrations/0005_r5_perf_indexes.sql"),
+    },
 ];
 
 /// Creates `schema_migrations` if missing and applies all pending migrations atomically.

@@ -72,12 +72,30 @@ fn compare_sort_keys(
 
     let primary = match sort_by {
         "best" => match (ka, kb) {
-            (Some(a), Some(b)) => b
-                .is_favorite
-                .cmp(&a.is_favorite)
-                .then_with(|| b.rating.cmp(&a.rating))
-                .then_with(|| cmp_opt_f64(a.aperture_f, b.aperture_f, true))
-                .then_with(|| b.capture_at_ms.cmp(&a.capture_at_ms)),
+            (Some(a), Some(b)) => {
+                // When scores differ significantly (e.g. Hybrid semantic search "best sunset photos"),
+                // blend favorite/rating boost with semantic relevance instead of letting a low-scoring
+                // f/1.4 photo outrank a strong visual match.
+                let has_semantic_diff = (a_score - b_score).abs() > 1e-4;
+                if has_semantic_diff {
+                    let a_eff = a_score
+                        + if a.is_favorite { 0.06 } else { 0.0 }
+                        + (a.rating as f32) * 0.015;
+                    let b_eff = b_score
+                        + if b.is_favorite { 0.06 } else { 0.0 }
+                        + (b.rating as f32) * 0.015;
+                    b_eff
+                        .total_cmp(&a_eff)
+                        .then_with(|| cmp_opt_f64(a.aperture_f, b.aperture_f, true))
+                        .then_with(|| b.capture_at_ms.cmp(&a.capture_at_ms))
+                } else {
+                    b.is_favorite
+                        .cmp(&a.is_favorite)
+                        .then_with(|| b.rating.cmp(&a.rating))
+                        .then_with(|| cmp_opt_f64(a.aperture_f, b.aperture_f, true))
+                        .then_with(|| b.capture_at_ms.cmp(&a.capture_at_ms))
+                }
+            }
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal,
@@ -549,45 +567,94 @@ pub(crate) async fn execute_hybrid_search(
     }
 
     if want_ocr {
-        for (asset_id, ocr_score, snippet) in ocr_hits {
-            if let Some(existing) = by_asset.get_mut(&asset_id) {
-                existing.score =
-                    existing.score.max(ocr_score) + 0.25 * existing.score.min(ocr_score);
-                existing.match_reasons.push("OCR".to_string());
-                existing.ocr_snippet = Some(snippet);
-            } else {
-                by_asset.insert(
-                    asset_id.clone(),
-                    PendingHit {
-                        asset_id,
-                        score: ocr_score,
-                        timestamp_sec: None,
-                        match_reasons: vec!["OCR".to_string()],
-                        ocr_snippet: Some(snippet),
-                    },
-                );
-            }
-        }
+        let explicit_ocr_constraint = req
+            .ocr_query
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
 
-        // Fuse deterministic EXIF/camera/lens/filename/tag/person matches in Hybrid mode so queries
-        // like "canon r7", "12mm", "f/1.4", "iso 6400", or "Portland Zoo" always surface exact matches.
-        for (rank_idx, asset_id) in metadata_hits.into_iter().enumerate() {
-            let meta_score = (0.85 - (rank_idx as f32) * 0.0005).max(0.50);
-            if let Some(existing) = by_asset.get_mut(&asset_id) {
-                existing.score =
-                    existing.score.max(meta_score) + 0.15 * existing.score.min(meta_score);
-                existing.match_reasons.push("Metadata".to_string());
-            } else {
-                by_asset.insert(
-                    asset_id.clone(),
-                    PendingHit {
-                        asset_id,
-                        score: meta_score,
-                        timestamp_sec: None,
-                        match_reasons: vec!["Metadata".to_string()],
-                        ocr_snippet: None,
-                    },
-                );
+        if explicit_ocr_constraint {
+            // Explicit `ocr_query` combined with `query` ("coffee shop photos with text saying Starbucks")
+            // must INTERSECT OCR matches with semantic ranking rather than unioning non-OCR photos.
+            let ocr_map: HashMap<String, (f32, String)> = ocr_hits
+                .into_iter()
+                .map(|(aid, sc, snip)| (aid, (sc, snip)))
+                .collect();
+            let mut intersected: HashMap<String, PendingHit> = HashMap::new();
+            for (aid, (ocr_score, snippet)) in ocr_map {
+                if let Some(mut existing) = by_asset.remove(&aid) {
+                    existing.score =
+                        existing.score.max(ocr_score) + 0.25 * existing.score.min(ocr_score);
+                    existing.match_reasons.push("OCR".to_string());
+                    existing.ocr_snippet = Some(snippet);
+                    intersected.insert(aid, existing);
+                } else {
+                    intersected.insert(
+                        aid.clone(),
+                        PendingHit {
+                            asset_id: aid,
+                            score: ocr_score,
+                            timestamp_sec: None,
+                            match_reasons: vec!["OCR".to_string()],
+                            ocr_snippet: Some(snippet),
+                        },
+                    );
+                }
+            }
+            by_asset = intersected;
+        } else {
+            for (asset_id, ocr_score, snippet) in ocr_hits {
+                if let Some(existing) = by_asset.get_mut(&asset_id) {
+                    existing.score =
+                        existing.score.max(ocr_score) + 0.25 * existing.score.min(ocr_score);
+                    existing.match_reasons.push("OCR".to_string());
+                    existing.ocr_snippet = Some(snippet);
+                } else {
+                    by_asset.insert(
+                        asset_id.clone(),
+                        PendingHit {
+                            asset_id,
+                            score: ocr_score,
+                            timestamp_sec: None,
+                            match_reasons: vec!["OCR".to_string()],
+                            ocr_snippet: Some(snippet),
+                        },
+                    );
+                }
+            }
+
+            // Fuse deterministic EXIF/camera/lens/filename/tag/person matches in Hybrid mode so queries
+            // like "canon r7", "12mm", "f/1.4", "iso 6400", or "Portland Zoo" always surface exact matches.
+            // Guard against broad metadata hijacking (e.g. searching "apple" matching 200+ iPhone
+            // camera_make rows at 0.85 above strong SigLIP2 visual hits): when metadata hits are broad
+            // and strong visual hits exist, apply a gentle boost instead of dominating visual relevance.
+            let broad_meta_vs_visual =
+                metadata_hits.len() > 40 && top_semantic_score >= 0.14 && !by_asset.is_empty();
+            for (rank_idx, asset_id) in metadata_hits.into_iter().enumerate() {
+                if broad_meta_vs_visual {
+                    if let Some(existing) = by_asset.get_mut(&asset_id) {
+                        existing.score += 0.04;
+                        existing.match_reasons.push("Metadata".to_string());
+                    }
+                    continue;
+                }
+                let meta_score = (0.85 - (rank_idx as f32) * 0.0005).max(0.50);
+                if let Some(existing) = by_asset.get_mut(&asset_id) {
+                    existing.score =
+                        existing.score.max(meta_score) + 0.15 * existing.score.min(meta_score);
+                    existing.match_reasons.push("Metadata".to_string());
+                } else {
+                    by_asset.insert(
+                        asset_id.clone(),
+                        PendingHit {
+                            asset_id,
+                            score: meta_score,
+                            timestamp_sec: None,
+                            match_reasons: vec!["Metadata".to_string()],
+                            ocr_snippet: None,
+                        },
+                    );
+                }
             }
         }
     }

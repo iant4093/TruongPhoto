@@ -70,13 +70,14 @@ mod macos {
     }
 
     fn query_diskutil(mount_point: &str) -> Option<VolumeInfo> {
-        let output = Command::new("/usr/sbin/diskutil")
-            .args(["info", "-plist", mount_point])
-            .output()
+        let timeout = std::time::Duration::from_secs(10);
+        let mut cmd = Command::new("/usr/sbin/diskutil");
+        cmd.args(["info", "-plist", mount_point]);
+        let output = truongphoto_core::process::run_command_with_timeout(&mut cmd, timeout)
             .or_else(|_| {
-                Command::new("diskutil")
-                    .args(["info", "-plist", mount_point])
-                    .output()
+                let mut fallback = Command::new("diskutil");
+                fallback.args(["info", "-plist", mount_point]);
+                truongphoto_core::process::run_command_with_timeout(&mut fallback, timeout)
             })
             .ok()?;
 

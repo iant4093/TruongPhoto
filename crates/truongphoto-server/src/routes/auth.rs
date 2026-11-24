@@ -155,6 +155,9 @@ pub async fn server_pin(
         ));
     }
 
+    if req.server_pin.len() > 64 {
+        return Err(AppError::validation("Invalid server PIN length."));
+    }
     let Some(stored_hash) = server_pin_hash else {
         return Err(AppError::internal("Server PIN hash is missing."));
     };
@@ -190,6 +193,9 @@ pub async fn login(
     let target_user_id = req.user_id.trim().to_string();
     if target_user_id.is_empty() || target_user_id.len() > 128 {
         return Err(AppError::validation("Invalid user_id."));
+    }
+    if req.profile_pin.len() > 64 || req.server_pin.as_ref().is_some_and(|p| p.len() > 64) {
+        return Err(AppError::validation("Invalid PIN length."));
     }
     let user_scope = format!("login_user:{target_user_id}");
     if let Err(retry_after_secs) = state.rate_limiter.check_scoped("login", &peer.rate_key) {
@@ -233,10 +239,10 @@ pub async fn login(
                 "Server PIN verification is required before profile login.",
             ));
         };
-        let Some(stored_server_hash) = server_pin_hash else {
+        let Some(ref stored_server_hash) = server_pin_hash else {
             return Err(AppError::internal("Server PIN hash is missing."));
         };
-        if !verify_pin(inline_server_pin, stored_server_hash).await? {
+        if !verify_pin(inline_server_pin, stored_server_hash.clone()).await? {
             if let Some(retry_after_secs) = state
                 .rate_limiter
                 .record_failure_scoped("server_pin", &peer.rate_key)
@@ -251,13 +257,14 @@ pub async fn login(
     }
 
     let Some(user) = user_opt.filter(|u| u.disabled_at_ms.is_none()) else {
-        let r1 = state
+        // Equalize timing against real profile Argon2id verification without allocating per-unknown-ID buckets.
+        if let Some(dummy_hash) = server_pin_hash {
+            let _ = verify_pin(req.profile_pin, dummy_hash).await;
+        }
+        if let Some(retry_after_secs) = state
             .rate_limiter
-            .record_failure_scoped("login", &peer.rate_key);
-        let r2 = state
-            .rate_limiter
-            .record_failure_scoped(&user_scope, &peer.rate_key);
-        if let Some(retry_after_secs) = r1.max(r2) {
+            .record_failure_scoped("login", &peer.rate_key)
+        {
             return Err(AppError::rate_limited(retry_after_secs));
         }
         return Err(AppError::unauthorized("Invalid profile or PIN."));

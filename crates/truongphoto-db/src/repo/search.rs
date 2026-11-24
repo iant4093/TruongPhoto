@@ -4,7 +4,7 @@ use crate::repo::assets::{row_to_asset_summary, ASSET_SUMMARY_COLUMNS};
 use roaring::RoaringBitmap;
 use rusqlite::{params_from_iter, types::Value, Connection};
 use std::collections::{HashMap, HashSet};
-use truongphoto_core::models::{AiTier, AssetSummary, SearchRequest};
+use truongphoto_core::models::{AiTier, AssetKind, AssetSummary, SearchRequest};
 use truongphoto_core::rbac::RbacScope;
 
 const DEFAULT_SEARCH_LIMIT: u32 = 60;
@@ -234,9 +234,15 @@ fn append_deterministic_filters(
             }
             let idx = params.len() + 1;
             params.push(Value::Text(trimmed.to_string()));
-            where_clauses.push(format!(
-                "NOT EXISTS (SELECT 1 FROM faces f_ep WHERE f_ep.asset_id = v.id AND f_ep.person_id = ?{idx})"
-            ));
+            if is_admin {
+                where_clauses.push(format!(
+                    "NOT EXISTS (SELECT 1 FROM faces f_ep WHERE f_ep.asset_id = v.id AND f_ep.person_id = ?{idx})"
+                ));
+            } else {
+                where_clauses.push(format!(
+                    "NOT EXISTS (SELECT 1 FROM faces f_ep JOIN people p_ep ON p_ep.id = f_ep.person_id WHERE f_ep.asset_id = v.id AND f_ep.person_id = ?{idx} AND p_ep.is_hidden = 0)"
+                ));
+            }
         }
     }
 
@@ -476,7 +482,15 @@ fn append_deterministic_filters(
     if let Some(kind) = req.kind {
         let idx = params.len() + 1;
         params.push(Value::Text(kind.as_str().to_string()));
-        where_clauses.push(format!("v.kind = ?{idx}"));
+        if kind == AssetKind::RawJpgStack {
+            // Include standalone RAW files (.CR3/.ARW/.NEF/.DNG ingested as kind='photo' with file_role='raw')
+            // in addition to paired RAW+JPG stacks so "RAW photos" finds all RAW files.
+            where_clauses.push(format!(
+                "(v.kind = ?{idx} OR EXISTS (SELECT 1 FROM asset_files af_raw WHERE af_raw.asset_id = v.id AND af_raw.file_role = 'raw' AND af_raw.is_missing = 0))"
+            ));
+        } else {
+            where_clauses.push(format!("v.kind = ?{idx}"));
+        }
     }
 
     if let Some(exclude_kind) = req.exclude_kind {
@@ -806,11 +820,15 @@ fn append_free_text_metadata_clauses(
             ));
         }
 
-        // For short pure-alpha tokens (<= 4 chars, e.g. "cat", "dog", "art", "son", "rain", "car"),
-        // match on normalized word boundaries so "cat" never hijacks "Vacation", "art" never hijacks
-        // "Art 025", "son" never hijacks "Sony", and "car" never hijacks "Carson" at score 0.85.
-        let use_word_boundary =
-            tok.chars().count() <= 4 && tok.chars().all(|c| c.is_ascii_alphabetic());
+        // Match pure-alpha tokens on normalized word boundaries so tokens like "cat"/"art"/"water"
+        // never substring-match unrelated words ("Vacation", "Art 025", "Waterfall").
+        // Singularize common media plural nouns ("screenshots" -> "screenshot", "recordings" -> "recording").
+        let normalized_tok = match tok.as_str() {
+            "screenshots" => "screenshot".to_string(),
+            "recordings" => "recording".to_string(),
+            _ => tok.clone(),
+        };
+        let use_word_boundary = normalized_tok.chars().all(|c| c.is_ascii_alphabetic());
         let like_expr = |col: &str, p_idx: usize| -> String {
             if use_word_boundary {
                 format!(
@@ -823,9 +841,15 @@ fn append_free_text_metadata_clauses(
 
         let idx = params.len() + 1;
         if use_word_boundary {
-            params.push(Value::Text(format!("% {} %", escape_like_lower(&tok))));
+            params.push(Value::Text(format!(
+                "% {} %",
+                escape_like_lower(&normalized_tok)
+            )));
         } else {
-            params.push(Value::Text(format!("%{}%", escape_like_lower(&tok))));
+            params.push(Value::Text(format!(
+                "%{}%",
+                escape_like_lower(&normalized_tok)
+            )));
         }
         ors.push(like_expr("v.effective_title", idx));
         ors.push(like_expr("v.effective_description", idx));

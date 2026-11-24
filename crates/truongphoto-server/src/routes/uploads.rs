@@ -43,9 +43,20 @@ pub async fn upload_files(
     {
         let field_name = field.name().unwrap_or_default().to_string();
         if field_name == "folder_id" && field.file_name().is_none() {
-            let val = field.text().await.map_err(|e| {
-                AppError::validation(format!("Failed to read folder_id field: {e}"))
-            })?;
+            // Bounded read (max 256 bytes) because DefaultBodyLimit is disabled for file uploads.
+            let mut buf = Vec::with_capacity(64);
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|e| AppError::validation(format!("Failed to read folder_id field: {e}")))?
+            {
+                if buf.len().saturating_add(chunk.len()) > 256 {
+                    return Err(AppError::validation("folder_id field is too large."));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            let val = String::from_utf8(buf)
+                .map_err(|_| AppError::validation("folder_id must be valid UTF-8."))?;
             let trimmed = val.trim().to_string();
             if !trimmed.is_empty() {
                 requested_folder_id = Some(trimmed);
@@ -301,29 +312,19 @@ async fn resolve_upload_target_folder(
     let folder = state
         .db
         .write(move |conn| {
-            let (folder, newly_created) = repo::folders::find_or_create_managed_uploads_folder(
+            let (folder, _newly_created) = repo::folders::find_or_create_managed_uploads_folder(
                 conn,
                 &root_str,
                 vol.volume_uuid.as_deref(),
                 vol.volume_label.as_deref(),
             )?;
+            // Contributors uploading without an explicit folder_id always target the shared Managed Uploads folder.
             if !role.is_admin() {
-                if newly_created {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO user_folder_acls (user_id, folder_id, granted_at_ms)
-                         VALUES (?1, ?2, ?3)",
-                        params![uid, folder.id, now_ms],
-                    )?;
-                } else {
-                    let allowed = repo::users::get_allowed_folder_ids(conn, &uid)?
-                        .iter()
-                        .any(|id| id == &folder.id);
-                    if !allowed {
-                        return Err(truongphoto_db::DbError::InvalidArgument(
-                            "__FORBIDDEN__".to_string(),
-                        ));
-                    }
-                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO user_folder_acls (user_id, folder_id, granted_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![uid, folder.id, now_ms],
+                )?;
             }
             Ok(folder)
         })

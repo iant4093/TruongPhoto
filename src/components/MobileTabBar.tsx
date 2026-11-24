@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   FolderHeart,
   Images,
+  LogOut,
   MapPin,
   MoreHorizontal,
   Settings as SettingsIcon,
@@ -40,6 +41,8 @@ export const MobileTabBar: React.FC<{
 }> = ({ activeNav: activeNavProp, onSelect }) => {
   const storeActiveNav = useAppStore((s) => s.activeNav);
   const storeSetActiveNav = useAppStore((s) => s.setActiveNav);
+  const logout = useAppStore((s) => s.logout);
+  const user = useAppStore((s) => s.user);
   const [moreOpen, setMoreOpen] = useState(false);
   const barRef = useRef<HTMLElement | null>(null);
 
@@ -94,6 +97,20 @@ export const MobileTabBar: React.FC<{
               </button>
             );
           })}
+          {user && (
+            <button
+              type="button"
+              role="menuitem"
+              className="mobile-more-item mobile-more-signout"
+              onClick={() => {
+                setMoreOpen(false);
+                void logout();
+              }}
+            >
+              <LogOut size={16} strokeWidth={1.6} />
+              <span>Sign Out ({user.display_name})</span>
+            </button>
+          )}
         </div>
       )}
 

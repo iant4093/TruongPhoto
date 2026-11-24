@@ -5,7 +5,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::Response,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -14,12 +15,49 @@ use tokio::sync::broadcast::error::RecvError;
 use truongphoto_core::{Role, WsClientMessage, WsServerEvent, APP_VERSION};
 use truongphoto_db::repo;
 
+pub(crate) fn is_same_origin_request(headers: &HeaderMap) -> bool {
+    if let Some(sfs) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        if sfs.eq_ignore_ascii_case("cross-site") {
+            return false;
+        }
+    }
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let origin_trimmed = origin.trim();
+    if origin_trimmed.is_empty() || origin_trimmed.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let origin_host = origin_trimmed
+        .strip_prefix("http://")
+        .or_else(|| origin_trimmed.strip_prefix("https://"))
+        .or_else(|| origin_trimmed.strip_prefix("tauri://"))
+        .map(|rest| rest.split('/').next().unwrap_or(rest));
+    let Some(origin_host) = origin_host else {
+        return false;
+    };
+    // Allow Tauri desktop WebView origins (`tauri://localhost`, `http://tauri.localhost`, `https://tauri.localhost`)
+    if origin_host.eq_ignore_ascii_case("tauri.localhost")
+        || origin_trimmed.eq_ignore_ascii_case("tauri://localhost")
+    {
+        return true;
+    }
+    let Some(req_host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    origin_host.eq_ignore_ascii_case(req_host.trim())
+}
+
 /// Authenticated WebSocket upgrade endpoint (`GET /api/ws`).
 pub async fn ws_handler(
     auth: AuthSession,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    if !is_same_origin_request(&headers) {
+        return (StatusCode::FORBIDDEN, "Cross-origin WebSocket rejected.").into_response();
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state, auth))
 }
 

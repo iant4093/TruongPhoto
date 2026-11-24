@@ -343,7 +343,11 @@ pub fn get_album_detail(
         .collect::<Result<Vec<_>, _>>()?;
 
     album.asset_count = assets.len() as u64;
-    let shares = list_album_shares(conn, album_id)?;
+    let shares = if permission == AlbumPermission::View {
+        Vec::new()
+    } else {
+        list_album_shares(conn, album_id)?
+    };
 
     Ok(Some(AlbumDetail {
         album,

@@ -240,12 +240,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .or_else(|| app.path().home_dir().ok().map(|h| h.join("Downloads")));
 
-    let last_download_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let dl_name_cb = Arc::clone(&last_download_name);
+    let download_names: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let dl_name_cb = Arc::clone(&download_names);
 
     let builder = tauri::WebviewWindowBuilder::new(app, "main", main_url)
         .title("TruongPhoto")
         .visible(false)
+        .background_color(tauri::window::Color(0x20, 0x20, 0x20, 0xFF))
         .inner_size(1280.0, 820.0)
         .min_inner_size(980.0, 640.0)
         .decorations(cfg!(target_os = "macos"))
@@ -272,18 +274,23 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         .and_then(|n| n.to_str())
                         .map(str::to_string)
                         .unwrap_or(suggested);
-                    *dl_name_cb.lock() = Some(final_name);
+                    dl_name_cb
+                        .lock()
+                        .insert(url.as_str().to_string(), final_name);
                     *destination = target;
                 }
                 true
             }
-            tauri::webview::DownloadEvent::Finished { path, success, .. } => {
+            tauri::webview::DownloadEvent::Finished {
+                url, path, success, ..
+            } => {
+                let mapped_name = dl_name_cb.lock().remove(url.as_str());
                 let filename = path
                     .as_ref()
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
                     .map(str::to_string)
-                    .or_else(|| dl_name_cb.lock().take());
+                    .or(mapped_name);
                 let _ = webview.emit(
                     "desktop-download-finished",
                     serde_json::json!({
@@ -308,6 +315,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
+            #[cfg(target_os = "macos")]
+            if main_win.is_fullscreen().unwrap_or(false) {
+                let _ = main_win.set_fullscreen(false);
+            }
             let _ = main_win.hide();
         }
     });
@@ -445,6 +456,19 @@ fn report_fatal_startup_error(message: &str) {
                 MB_OK | MB_ICONERROR,
             );
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let escaped = message
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ");
+        let script = format!(
+            "display alert \"TruongPhoto Failed to Start\" message \"{escaped}\" as critical"
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .status();
     }
 }
 

@@ -382,7 +382,7 @@ export const ChatView: React.FC = () => {
 
   const [promptInput, setPromptInput] = useState('');
   const [threadsOpen, setThreadsOpen] = useState(() =>
-    typeof window !== 'undefined' ? window.innerWidth >= 960 : true,
+    typeof window !== 'undefined' ? window.innerWidth > 960 : true,
   );
   const [isNarrowViewport, setIsNarrowViewport] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth <= 960 : false,
@@ -396,6 +396,18 @@ export const ChatView: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const sessionEpochRef = useRef(0);
+  const skipNextAutoScrollRef = useRef(false);
+
+  const focusComposerIfFinePointer = () => {
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(pointer: coarse)').matches
+    ) {
+      return;
+    }
+    textareaRef.current?.focus();
+  };
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
@@ -461,6 +473,10 @@ export const ChatView: React.FC = () => {
 
   // Smooth auto-scroll: follow thinking bubble to bottom, and frame new photo-heavy replies at their header.
   useEffect(() => {
+    if (skipNextAutoScrollRef.current) {
+      skipNextAutoScrollRef.current = false;
+      return;
+    }
     if (!stickToBottomRef.current && !chatSending) return;
     if (chatSending) {
       messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
@@ -551,11 +567,12 @@ export const ChatView: React.FC = () => {
   useEffect(() => {
     sessionEpochRef.current += 1;
     stickToBottomRef.current = true;
+    skipNextAutoScrollRef.current = true;
     const scroller = scrollContainerRef.current;
     if (scroller) {
       scroller.scrollTop = scroller.scrollHeight;
     }
-    textareaRef.current?.focus();
+    focusComposerIfFinePointer();
   }, [activeChatSessionId]);
 
   const submitPrompt = async (text: string) => {
@@ -577,7 +594,7 @@ export const ChatView: React.FC = () => {
       }
     } finally {
       if (epoch === sessionEpochRef.current) {
-        textareaRef.current?.focus();
+        focusComposerIfFinePointer();
       }
     }
   };
@@ -597,7 +614,7 @@ export const ChatView: React.FC = () => {
   const handleNewChat = async () => {
     try {
       await createNewChatSession();
-      textareaRef.current?.focus();
+      focusComposerIfFinePointer();
     } catch (err) {
       notifyError(err, 'Could not create conversation');
     }

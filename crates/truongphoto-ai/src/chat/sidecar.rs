@@ -23,6 +23,7 @@ struct SidecarProcess {
     tier: ChatTier,
     port: u16,
     cpu_only: bool,
+    has_mmproj: bool,
     child: Child,
     last_used: Instant,
 }
@@ -230,6 +231,7 @@ impl SidecarLlamaRouter {
             tier,
             port,
             cpu_only,
+            has_mmproj: mmproj_path.is_some(),
             child,
             last_used: Instant::now(),
         })
@@ -245,7 +247,8 @@ impl SidecarLlamaRouter {
         let Some((gguf_path, mmproj_path)) = self.resolve_model_paths(tier) else {
             return Ok(None);
         };
-        if tier == ChatTier::Tier3 && mmproj_path.is_none() {
+        let want_mmproj = mmproj_path.is_some();
+        if tier == ChatTier::Tier3 && !want_mmproj {
             tracing::debug!(
                 tier = %tier,
                 "Tier 3 mmproj missing; sidecar running text-only unless mmproj is present"
@@ -259,97 +262,122 @@ impl SidecarLlamaRouter {
         let want_cpu = self.cpu_fallback_tiers.lock().contains(&tier);
         if let Some(existing) = guard.as_mut() {
             let alive = matches!(existing.child.try_wait(), Ok(None));
-            if alive && existing.tier == tier && existing.cpu_only == want_cpu {
+            if alive
+                && existing.tier == tier
+                && existing.cpu_only == want_cpu
+                && existing.has_mmproj == want_mmproj
+            {
                 existing.last_used = Instant::now();
                 return Ok(Some(existing.port));
             }
-            // Tier or offload mode changed, or child exited; drop and respawn cleanly.
+            // Tier, offload mode, or mmproj availability changed, or child exited; drop and respawn cleanly.
             *guard = None;
             self.loaded.store(false, Ordering::Release);
         }
 
         let use_rb = !self.no_reasoning_budget.load(Ordering::Acquire);
-        match self.spawn_and_wait_server(
-            &bin_path,
-            &gguf_path,
-            mmproj_path.as_deref(),
-            tier,
-            want_cpu,
-            use_rb,
-        ) {
-            Ok(proc) => {
+        let mut last_err: Option<(AiError, String)> = None;
+        for attempt in 0..3 {
+            match self.spawn_and_wait_server(
+                &bin_path,
+                &gguf_path,
+                mmproj_path.as_deref(),
+                tier,
+                want_cpu,
+                use_rb,
+            ) {
+                Ok(proc) => {
+                    let port = proc.port;
+                    *guard = Some(proc);
+                    self.loaded.store(true, Ordering::Release);
+                    return Ok(Some(port));
+                }
+                Err((err, stderr_text)) => {
+                    let low_err = stderr_text.to_ascii_lowercase();
+                    let is_port_conflict = low_err.contains("address already in use")
+                        || low_err.contains("failed to listen")
+                        || low_err.contains("failed to bind")
+                        || low_err.contains("eaddrinuse");
+                    if is_port_conflict
+                        && attempt < 2
+                        && !self.shutting_down.load(Ordering::Acquire)
+                    {
+                        tracing::warn!(tier = %tier, attempt, "llama-server ephemeral port collision; retrying with fresh port");
+                        last_err = Some((err, stderr_text));
+                        continue;
+                    }
+                    last_err = Some((err, stderr_text));
+                    break;
+                }
+            }
+        }
+        let (err, stderr_text) = last_err.expect("spawn loop always produces result");
+        let low_err = stderr_text.to_ascii_lowercase();
+        // 1. Retry without `--reasoning-budget` if an older llama-server binary rejects the flag.
+        if use_rb
+            && (low_err.contains("reasoning-budget")
+                || low_err.contains("unknown argument")
+                || low_err.contains("invalid argument"))
+        {
+            tracing::warn!(
+                tier = %tier,
+                "llama-server rejected --reasoning-budget; latching off and retrying"
+            );
+            self.no_reasoning_budget.store(true, Ordering::Release);
+            if let Ok(proc) = self.spawn_and_wait_server(
+                &bin_path,
+                &gguf_path,
+                mmproj_path.as_deref(),
+                tier,
+                want_cpu,
+                false,
+            ) {
                 let port = proc.port;
                 *guard = Some(proc);
                 self.loaded.store(true, Ordering::Release);
-                Ok(Some(port))
-            }
-            Err((err, stderr_text)) => {
-                let low_err = stderr_text.to_ascii_lowercase();
-                // 1. Retry without `--reasoning-budget` if an older llama-server binary rejects the flag.
-                if use_rb
-                    && (low_err.contains("reasoning-budget")
-                        || low_err.contains("unknown argument")
-                        || low_err.contains("invalid argument"))
-                {
-                    tracing::warn!(
-                        tier = %tier,
-                        "llama-server rejected --reasoning-budget; latching off and retrying"
-                    );
-                    self.no_reasoning_budget.store(true, Ordering::Release);
-                    if let Ok(proc) = self.spawn_and_wait_server(
-                        &bin_path,
-                        &gguf_path,
-                        mmproj_path.as_deref(),
-                        tier,
-                        want_cpu,
-                        false,
-                    ) {
-                        let port = proc.port;
-                        *guard = Some(proc);
-                        self.loaded.store(true, Ordering::Release);
-                        return Ok(Some(port));
-                    }
-                }
-                // 2. If GPU offload failed (Windows Vulkan driver missing/old or discrete VRAM OOM),
-                // latch CPU-only (`-ngl 0 -fa off`) for this tier and retry once so local LLM still works!
-                if !want_cpu && !self.shutting_down.load(Ordering::Acquire) {
-                    tracing::warn!(
-                        tier = %tier,
-                        error = %err,
-                        "llama-server GPU launch failed; latching CPU fallback (-ngl 0) and retrying"
-                    );
-                    self.cpu_fallback_tiers.lock().insert(tier);
-                    let use_rb_retry = !self.no_reasoning_budget.load(Ordering::Acquire);
-                    match self.spawn_and_wait_server(
-                        &bin_path,
-                        &gguf_path,
-                        mmproj_path.as_deref(),
-                        tier,
-                        true,
-                        use_rb_retry,
-                    ) {
-                        Ok(proc) => {
-                            let port = proc.port;
-                            *guard = Some(proc);
-                            self.loaded.store(true, Ordering::Release);
-                            return Ok(Some(port));
-                        }
-                        Err((cpu_err, _)) => return Err(cpu_err),
-                    }
-                }
-                Err(err)
+                return Ok(Some(port));
             }
         }
+        // 2. If GPU offload failed (Windows Vulkan driver missing/old or discrete VRAM OOM),
+        // latch CPU-only (`-ngl 0 -fa off`) for this tier and retry once so local LLM still works!
+        if !want_cpu && !self.shutting_down.load(Ordering::Acquire) {
+            tracing::warn!(
+                tier = %tier,
+                error = %err,
+                "llama-server GPU launch failed; latching CPU fallback (-ngl 0) and retrying"
+            );
+            self.cpu_fallback_tiers.lock().insert(tier);
+            let use_rb_retry = !self.no_reasoning_budget.load(Ordering::Acquire);
+            match self.spawn_and_wait_server(
+                &bin_path,
+                &gguf_path,
+                mmproj_path.as_deref(),
+                tier,
+                true,
+                use_rb_retry,
+            ) {
+                Ok(proc) => {
+                    let port = proc.port;
+                    *guard = Some(proc);
+                    self.loaded.store(true, Ordering::Release);
+                    return Ok(Some(port));
+                }
+                Err((cpu_err, _)) => return Err(cpu_err),
+            }
+        }
+        Err(err)
     }
 
-    fn clear_if_dead(&self) {
+    fn clear_if_dead(&self) -> bool {
         let mut guard = self.process.lock();
         if let Some(existing) = guard.as_mut() {
             if !matches!(existing.child.try_wait(), Ok(None)) {
                 *guard = None;
                 self.loaded.store(false, Ordering::Release);
+                return true;
             }
         }
+        false
     }
 
     fn latch_cpu_fallback_and_restart(&self, tier: ChatTier) -> bool {
@@ -430,9 +458,18 @@ impl ChatRouterBackend for SidecarLlamaRouter {
         let content = match post_chat_completion(port, &payload, Duration::from_secs(60)) {
             Ok(c) => c,
             Err(err) => {
-                self.clear_if_dead();
-                // If mid-inference GPU/VRAM failure happened, latch CPU fallback and retry once.
-                if self.latch_cpu_fallback_and_restart(tier) {
+                let died = self.clear_if_dead();
+                let err_low = err.to_string().to_ascii_lowercase();
+                let is_gpu_or_oom = died
+                    || err_low.contains("out of memory")
+                    || err_low.contains("oom")
+                    || err_low.contains("vulkan")
+                    || err_low.contains("metal")
+                    || err_low.contains("cuda")
+                    || err_low.contains("connection reset")
+                    || err_low.contains("broken pipe");
+                // Only latch CPU fallback on genuine sidecar crash/GPU/VRAM failure — NEVER on HTTP 400 or read timeout.
+                if is_gpu_or_oom && self.latch_cpu_fallback_and_restart(tier) {
                     tracing::warn!(tier = %tier, error = %err, "llama-server inference failed on GPU; retrying on CPU");
                     if let Ok(Some(cpu_port)) = self.ensure_server_port(tier) {
                         if let Ok(c) =
@@ -629,11 +666,15 @@ impl ChatRouterBackend for SidecarLlamaRouter {
             }
         }
 
+        // Return ONLY candidates that the VLM actually scored so omitted/missing-thumbnail items
+        // preserve their hybrid order instead of being falsely demoted as `< 0.15` VLM rejections.
         let mut ordered: Vec<(String, f32)> = candidates
             .iter()
-            .map(|c| {
-                let s = score_map.get(&c.asset_id).copied().unwrap_or(c.score);
-                (c.asset_id.clone(), s)
+            .filter_map(|c| {
+                score_map
+                    .get(&c.asset_id)
+                    .copied()
+                    .map(|s| (c.asset_id.clone(), s))
             })
             .collect();
         ordered.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -666,6 +707,24 @@ impl ChatRouterBackend for SidecarLlamaRouter {
 
     fn is_loaded(&self) -> bool {
         self.loaded.load(Ordering::Acquire)
+    }
+
+    fn is_loaded_for_tier(&self, tier: ChatTier) -> bool {
+        if tier == ChatTier::Tier0 {
+            return false;
+        }
+        let want_mmproj = self
+            .resolve_model_paths(tier)
+            .is_some_and(|(_, mmproj)| mmproj.is_some());
+        let mut guard = self.process.lock();
+        if let Some(existing) = guard.as_mut() {
+            if matches!(existing.child.try_wait(), Ok(None)) {
+                return existing.tier == tier && existing.has_mmproj == want_mmproj;
+            }
+            *guard = None;
+            self.loaded.store(false, Ordering::Release);
+        }
+        false
     }
 
     fn warmup(&self, tier: ChatTier) -> bool {
@@ -1035,6 +1094,13 @@ fn build_router_system_prompt(tier: ChatTier, input: &ChatTurnInput) -> String {
         .take(12)
         .map(|(p, cnt)| format!("{p} ({cnt})"))
         .collect();
+    let years_overview: Vec<String> = input
+        .library
+        .year_counts
+        .iter()
+        .take(12)
+        .map(|(yr, cnt)| format!("{yr} ({cnt})"))
+        .collect();
     let months_overview: Vec<String> = input
         .library
         .top_months
@@ -1085,6 +1151,7 @@ fn build_router_system_prompt(tier: ChatTier, input: &ChatTurnInput) -> String {
          - Today: {} | \"yesterday\": {} | \"this week\": {}..{} | \"last weekend\": {}..{} | \"last week\": {}..{} | \"last 30 days\": {}..{}\n\
          - Calendar: \"this month\": {}..{} | \"last month\": {}..{} | \"two months ago\": {}..{} | \"this year\": {}-01-01..{}-12-31 | \"last year\": {}-01-01..{}-12-31\n\
          - Total items: {} | Favorites: {} | Kinds: {:?} | Capture span: {}\n\
+         - Years: {:?}\n\
          - Top months: {:?}\n\
          - Folders / Events: {:?}\n\
          - Top GPS places: {:?}\n\
@@ -1117,6 +1184,7 @@ fn build_router_system_prompt(tier: ChatTier, input: &ChatTurnInput) -> String {
         input.library.favorite_count,
         kinds_overview,
         date_span,
+        years_overview,
         months_overview,
         folders_overview,
         places_overview,
@@ -1245,7 +1313,8 @@ pub(crate) fn strip_semantic_filler(raw: &str) -> Option<String> {
     ];
     const EDGE_WRAPPERS: &[&str] = &[
         "show", "me", "find", "my", "some", "any", "all", "the", "a", "an", "of", "pics", "pic",
-        "photos", "photo", "pictures", "picture", "shots", "shot", "images", "image",
+        "photos", "photo", "pictures", "picture", "shots", "shot", "images", "image", "ones",
+        "one", "trip", "trips", "now", "from", "that", "those", "these",
     ];
 
     let raw_words: Vec<&str> = raw
@@ -1352,21 +1421,70 @@ pub(crate) fn try_apply_filter_removal(
     prior: &RouterPlan,
     plan: &mut RouterPlan,
 ) -> bool {
+    // Handle negation-undo phrasing ("actually include videos too", "include non-favorites")
+    let include_videos_undo = (lower.contains("include video")
+        || lower.contains("with videos too")
+        || lower.contains("include videos too"))
+        && prior.exclude_kind == Some(AssetKind::Video);
+    let include_non_fav_undo = (lower.contains("include non-fav")
+        || lower.contains("not just fav")
+        || lower.contains("not only fav"))
+        && prior.favorite == Some(true);
+    if (include_videos_undo || include_non_fav_undo) && plan_has_any_criteria(prior) {
+        let mut updated = prior.clone();
+        updated.intent = Some("search".to_string());
+        updated.clear_prior_filters = true;
+        updated.assistant_reply = plan.assistant_reply.clone();
+        updated.follow_up_suggestions = plan.follow_up_suggestions.clone();
+        if include_videos_undo {
+            updated.exclude_kind = None;
+            if updated.kind == Some(AssetKind::Photo) {
+                updated.kind = None;
+            }
+        }
+        if include_non_fav_undo {
+            updated.favorite = None;
+        }
+        *plan = updated;
+        return true;
+    }
+
     let is_removal = lower.contains("remove the")
         || lower.contains("remove filter")
+        || lower.starts_with("remove ")
         || lower.contains("drop the")
+        || lower.starts_with("drop ")
         || lower.contains("clear the");
     if !is_removal || !plan_has_any_criteria(prior) {
         return false;
     }
 
-    // Extract the filter target label (before any `:` value like `"remove the Location: Mountain Resort filter"`)
-    // and strip trailing `"from my search"` / `"from search"` phrasing so it never drops dates or semantic_query.
-    let target_raw = lower.split_once(':').map(|(lhs, _)| lhs).unwrap_or(lower);
+    // Extract the filter target label AND optional value after `:` (e.g., `"remove the Person: Sebastian filter"`).
+    let (target_raw, value_raw) = match lower.split_once(':') {
+        Some((lhs, rhs)) => (
+            lhs,
+            Some(
+                rhs.replace("filter", "")
+                    .replace("from my search", "")
+                    .replace("from the search", "")
+                    .replace("from search", "")
+                    .replace("from my photos", "")
+                    .trim()
+                    .to_string(),
+            ),
+        ),
+        None => (lower, None),
+    };
+    let target_val = value_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let target_clause = target_raw
         .replace("from my search", "")
         .replace("from the search", "")
-        .replace("from search", "");
+        .replace("from search", "")
+        .replace("from my photos", "")
+        .replace("from photos", "");
     let target_clause = target_clause.as_str();
 
     let mut updated = prior.clone();
@@ -1395,8 +1513,19 @@ pub(crate) fn try_apply_filter_removal(
         removed_any = true;
     }
     if has_word(target_clause, "person") || has_word(target_clause, "people") {
-        updated.person_names.clear();
-        updated.has_people = None;
+        if let Some(val) = target_val {
+            if !matches!(val, "present" | "none" | "any") && !updated.person_names.is_empty() {
+                updated
+                    .person_names
+                    .retain(|p| p.trim().to_ascii_lowercase() != val);
+            } else {
+                updated.person_names.clear();
+                updated.has_people = None;
+            }
+        } else {
+            updated.person_names.clear();
+            updated.has_people = None;
+        }
         removed_any = true;
     }
     if has_word(target_clause, "date")
@@ -1462,10 +1591,38 @@ pub(crate) fn try_apply_filter_removal(
     if has_word(target_clause, "exclude")
         || has_word(target_clause, "excluding")
         || has_word(target_clause, "exclusion")
+        || has_word(target_clause, "without")
+        || has_word(target_clause, "not")
     {
-        updated.exclude_person_names.clear();
-        updated.exclude_location_query = None;
-        updated.exclude_kind = None;
+        if let Some(val) = target_val {
+            let before_people = updated.exclude_person_names.len();
+            updated
+                .exclude_person_names
+                .retain(|p| p.trim().to_ascii_lowercase() != val);
+            let removed_person = updated.exclude_person_names.len() < before_people;
+            let removed_loc = updated
+                .exclude_location_query
+                .as_deref()
+                .is_some_and(|l| l.trim().to_ascii_lowercase() == val);
+            if removed_loc {
+                updated.exclude_location_query = None;
+            }
+            let removed_kind = updated
+                .exclude_kind
+                .is_some_and(|k| val.contains(k.as_str()));
+            if removed_kind {
+                updated.exclude_kind = None;
+            }
+            if !removed_person && !removed_loc && !removed_kind {
+                updated.exclude_person_names.clear();
+                updated.exclude_location_query = None;
+                updated.exclude_kind = None;
+            }
+        } else {
+            updated.exclude_person_names.clear();
+            updated.exclude_location_query = None;
+            updated.exclude_kind = None;
+        }
         removed_any = true;
     }
     if has_word(target_clause, "sort") {
@@ -1473,7 +1630,14 @@ pub(crate) fn try_apply_filter_removal(
         removed_any = true;
     }
     if has_word(target_clause, "tag") || has_word(target_clause, "tags") {
-        updated.tags.clear();
+        if let Some(val) = target_val {
+            let v_clean = val.trim_start_matches('#');
+            updated
+                .tags
+                .retain(|t| t.trim().to_ascii_lowercase() != v_clean);
+        } else {
+            updated.tags.clear();
+        }
         removed_any = true;
     }
     if has_word(target_clause, "kind")
@@ -1499,6 +1663,22 @@ pub(crate) fn try_apply_filter_removal(
     if has_word(target_clause, "ocr") || has_word(target_clause, "text") {
         updated.ocr_terms = None;
         removed_any = true;
+    }
+
+    // Fallback: `"remove Sebastian"` directly naming a prior person filter
+    if !removed_any && !updated.person_names.is_empty() {
+        let before = updated.person_names.len();
+        updated.person_names.retain(|p| {
+            let first = p
+                .split_whitespace()
+                .next()
+                .unwrap_or(p)
+                .to_ascii_lowercase();
+            !has_word(target_clause, &p.to_ascii_lowercase()) && !has_word(target_clause, &first)
+        });
+        if updated.person_names.len() < before {
+            removed_any = true;
+        }
     }
 
     if removed_any {
@@ -1627,7 +1807,9 @@ pub(crate) fn is_meta_library_question(lower: &str) -> bool {
         "who's in my",
         "whos in my",
         "who are the people",
-        "who appears in",
+        "who appears",
+        "who is in the most",
+        "most photographed",
         "who do you know",
         "who do i have",
         "what people",
@@ -1656,6 +1838,11 @@ pub(crate) fn is_meta_library_question(lower: &str) -> bool {
         "what album",
         "what collection",
         "where have i been",
+        "where do i take",
+        "where do i shoot",
+        "favorite place",
+        "favourite place",
+        "most visited",
         "what places are in my",
         "what camera",
         "which camera",
@@ -1670,6 +1857,7 @@ pub(crate) fn is_meta_library_question(lower: &str) -> bool {
         "which month",
         "what month",
         "which year",
+        "what year",
         "when were my",
         "what dates",
         "date range",
@@ -1811,15 +1999,15 @@ fn sanitize_sidecar_plan(
                 .filter(|p| !prior_low.contains(&p.to_ascii_lowercase()))
                 .cloned()
                 .collect();
-            let reply = plan.assistant_reply.clone();
-            let suggestions = plan.follow_up_suggestions.clone();
-            let mut swapped = prior.clone();
-            swapped.intent = Some("search".to_string());
-            swapped.person_names = new_people;
-            swapped.clear_prior_filters = true;
-            swapped.assistant_reply = reply;
-            swapped.follow_up_suggestions = suggestions;
-            *plan = swapped;
+            let mut prior_without_people = prior.clone();
+            prior_without_people.person_names.clear();
+            let mut next_turn = plan.clone();
+            next_turn.person_names = new_people;
+            next_turn.clear_prior_filters = false;
+            let mut merged = merge_router_plan(&prior_without_people, &next_turn);
+            merged.intent = Some("search".to_string());
+            merged.clear_prior_filters = true;
+            *plan = merged;
         }
     }
     let _ = known_people;
@@ -1979,7 +2167,10 @@ fn sanitize_sidecar_plan(
                 plan.iso_max = Some(lo);
             }
         } else if let (None, Some(hi)) = (plan.iso_min, plan.iso_max) {
-            if !has_upper_bound_cue && !is_low_iso_vague {
+            if is_high_iso_vague && !has_upper_bound_cue {
+                // Small models sometimes misread "low light" as low ISO (e.g., iso_max: 200); drop it.
+                plan.iso_max = None;
+            } else if !has_upper_bound_cue && !is_low_iso_vague {
                 plan.iso_min = Some(hi);
             }
         }
@@ -2347,6 +2538,24 @@ fn sanitize_sidecar_plan(
         "spring",
         "fall",
         "autumn",
+        "cafe",
+        "restaurant",
+        "kitchen",
+        "pool",
+        "wedding",
+        "concert",
+        "canyon",
+        "desert",
+        "island",
+        "trail",
+        "coast",
+        "shore",
+        "hills",
+        "valley",
+        "field",
+        "meadow",
+        "backyard",
+        "patio",
     ];
     // Relative date & season rescue: run BEFORE moving season words from location_query to semantic_query,
     // and allow combining with person/camera filters (e.g. "summer photos of Sebastian").
@@ -2502,14 +2711,25 @@ fn sanitize_sidecar_plan(
     }
 
     if let Some(loc) = plan.location_query.as_deref() {
-        let loc_low = loc.trim().to_ascii_lowercase();
-        if GENERIC_SCENE_LOCATIONS.contains(&loc_low.as_str()) {
+        let loc_trimmed = loc.trim().to_ascii_lowercase();
+        let loc_low = loc_trimmed
+            .strip_prefix("the ")
+            .or_else(|| loc_trimmed.strip_prefix("a "))
+            .or_else(|| loc_trimmed.strip_prefix("my "))
+            .unwrap_or(&loc_trimmed);
+        if GENERIC_SCENE_LOCATIONS.contains(&loc_low) {
             let moved = plan.location_query.take();
             if plan.semantic_query.is_none() {
-                plan.semantic_query = match loc_low.as_str() {
+                plan.semantic_query = match loc_low {
                     "outdoor" | "outdoors" => Some("outdoor nature landscape".to_string()),
                     "indoor" | "indoors" => Some("indoor room interior".to_string()),
-                    _ => moved,
+                    _ => moved.map(|m| {
+                        m.trim()
+                            .strip_prefix("the ")
+                            .or_else(|| m.trim().strip_prefix("The "))
+                            .unwrap_or(m.trim())
+                            .to_string()
+                    }),
                 };
             }
         }
@@ -2573,6 +2793,10 @@ fn sanitize_sidecar_plan(
         "clear filter",
         "clear all",
         "new search",
+        "nevermind",
+        "never mind",
+        "forget that",
+        "scratch that",
     ]
     .iter()
     .any(|kw| lower.contains(kw));

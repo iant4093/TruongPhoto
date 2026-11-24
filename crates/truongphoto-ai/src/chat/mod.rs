@@ -82,6 +82,11 @@ pub trait ChatRouterBackend: Send + Sync {
 
     fn is_loaded(&self) -> bool;
 
+    /// Checks whether the sidecar is currently alive and loaded for `tier`.
+    fn is_loaded_for_tier(&self, tier: ChatTier) -> bool {
+        tier != ChatTier::Tier0 && self.is_loaded()
+    }
+
     /// Optionally pre-warms the local LLM runtime for `tier` in the background.
     /// Returns `true` if the runtime is warm/ready.
     fn warmup(&self, _tier: ChatTier) -> bool {
