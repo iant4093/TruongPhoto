@@ -140,7 +140,7 @@ jobs:
             b=src-tauri/target/release/bundle
           fi
           if [ "$RUNNER_OS" = "macOS" ]; then
-            cp "$b"/dmg/*.dmg release-assets/TruongPhoto-macOS-aarch64.dmg
+            cp "$b"/dmg/*.dmg release-assets/TruongPhoto-macOS.dmg
             if [ -f "$b/macos/TruongPhoto.app.tar.gz.sig" ]; then
               cp "$b/macos/TruongPhoto.app.tar.gz" release-assets/TruongPhoto-macOS.app.tar.gz
               cp "$b/macos/TruongPhoto.app.tar.gz.sig" release-assets/TruongPhoto-macOS.app.tar.gz.sig
@@ -211,20 +211,28 @@ jobs:
             const fs = require("fs");
             const v = process.env.VERSION;
             const url = (f) => `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/v${v}/${f}`;
-            const sig = (f) => fs.readFileSync(`release-assets/${f}.sig`, "utf8").trim();
-            const platforms = Object.fromEntries([
+            const entries = [
               ["darwin-aarch64", "TruongPhoto-macOS.app.tar.gz"],
               ["windows-x86_64", "TruongPhoto-Windows-Setup.exe"],
-            ].map(([platform, file]) => {
-              if (!fs.existsSync(`release-assets/${file}`)) throw new Error(`Missing installer for ${platform}`);
-              const signature = sig(file);
-              if (!signature) throw new Error(`Missing updater signature for ${platform}`);
-              return [platform, { signature, url: url(file) }];
-            }));
+            ];
+            const signed = entries.filter(([, file]) =>
+              fs.existsSync(`release-assets/${file}`) && fs.existsSync(`release-assets/${file}.sig`)
+            );
+            if (signed.length === 0) {
+              console.log("No updater .sig files present (TAURI_SIGNING_PRIVATE_KEY unset); skipping latest.json.");
+              process.exit(0);
+            }
+            const platforms = Object.fromEntries(
+              signed.map(([platform, file]) => {
+                const signature = fs.readFileSync(`release-assets/${file}.sig`, "utf8").trim();
+                if (!signature) throw new Error(`Empty updater signature for ${platform}`);
+                return [platform, { signature, url: url(file) }];
+              })
+            );
             const notes = fs.readFileSync("release-notes.txt", "utf8").trim() || `TruongPhoto ${v}`;
             const manifest = { version: v, notes, pub_date: new Date().toISOString(), platforms };
             fs.writeFileSync("release-assets/latest.json", JSON.stringify(manifest, null, 2));
-            console.log(Object.keys(platforms));
+            console.log("Generated latest.json for:", Object.keys(platforms));
           NODE
           rm -f release-assets/*.sig
           (cd release-assets && sha256sum -- * > SHA256SUMS)
