@@ -35,6 +35,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0005_r5_perf_indexes",
         sql: include_str!("../migrations/0005_r5_perf_indexes.sql"),
     },
+    Migration {
+        version: 6,
+        name: "0006_universal_stacks",
+        sql: include_str!("../migrations/0006_universal_stacks.sql"),
+    },
 ];
 
 /// Creates `schema_migrations` if missing and applies all pending migrations atomically.

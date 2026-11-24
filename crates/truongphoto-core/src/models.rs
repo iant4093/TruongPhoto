@@ -282,6 +282,65 @@ pub struct AssetSummary {
     pub geo_city: Option<String>,
     pub geo_country: Option<String>,
     pub camera_model: Option<String>,
+    #[serde(default)]
+    pub stack_group_id: Option<String>,
+    #[serde(default)]
+    pub stack_role: Option<String>,
+    #[serde(default = "default_stack_count")]
+    pub stack_count: u32,
+    #[serde(default)]
+    pub stack_has_edited: bool,
+    #[serde(default)]
+    pub stack_has_raw: bool,
+}
+
+const fn default_stack_count() -> u32 {
+    1
+}
+
+/// One RBAC-accessible version inside a cross-folder or sibling photo stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackMemberView {
+    pub asset_id: String,
+    pub folder_id: String,
+    pub folder_name: String,
+    pub rel_path: String,
+    pub filename: String,
+    pub extension: String,
+    pub kind: AssetKind,
+    pub stack_role: String,
+    pub is_cover: bool,
+    pub is_raw: bool,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub file_size: u64,
+    pub thumb_ready: bool,
+    pub capture_at_ms: i64,
+    pub software: Option<String>,
+}
+
+/// Nested subfolder entry inside a watched folder (`GET /api/folders/{id}/subfolders`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSubfolderView {
+    pub path: String,
+    pub name: String,
+    pub parent_path: Option<String>,
+    pub depth: u32,
+    pub asset_count: u64,
+}
+
+/// Request payload for `POST /api/stacks` to manually group assets into a stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateStackRequest {
+    pub asset_ids: Vec<String>,
+    #[serde(default)]
+    pub cover_asset_id: Option<String>,
+}
+
+/// Request payload for `POST /api/stacks/{group_id}/cover`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetStackCoverRequest {
+    pub asset_id: String,
 }
 
 /// Year/month asset count bucket for the timeline scrubber.
@@ -523,6 +582,12 @@ pub struct PhotoMetaView {
     pub geo_country: Option<String>,
     pub geo_country_code: Option<String>,
     pub taken_at_ms: Option<i64>,
+    #[serde(default)]
+    pub software: Option<String>,
+    #[serde(default)]
+    pub exif_modified_at_ms: Option<i64>,
+    #[serde(default)]
+    pub taken_at_has_subsec: bool,
 }
 
 /// Deterministic video stream and offline reverse-geocoded metadata (`deterministic_video_meta`).
@@ -758,6 +823,8 @@ pub struct AssetDetail {
     pub histogram: Option<Histogram256>,
     pub album_ids: Vec<String>,
     pub playback: PlaybackInfo,
+    #[serde(default)]
+    pub stack_members: Vec<StackMemberView>,
 }
 
 /// Result summary returned by `POST /api/trash/purge` and background trash retention sweeps.
@@ -1813,6 +1880,11 @@ mod tests {
                 geo_city: Some("Kyoto".to_string()),
                 geo_country: Some("Japan".to_string()),
                 camera_model: Some("iPhone 16 Pro".to_string()),
+                stack_group_id: None,
+                stack_role: None,
+                stack_count: 1,
+                stack_has_edited: false,
+                stack_has_raw: false,
             },
             files: vec![AssetFileView {
                 id: "file-1".to_string(),
@@ -1867,6 +1939,7 @@ mod tests {
                 thumb_url: "/api/media/asset-1/thumb".to_string(),
                 original_url: "/api/media/asset-1/original".to_string(),
             },
+            stack_members: vec![],
         };
 
         let json = serde_json::to_string(&detail).unwrap();
@@ -2047,6 +2120,11 @@ mod tests {
             geo_city: Some("Tokyo".to_string()),
             geo_country: Some("Japan".to_string()),
             camera_model: None,
+            stack_group_id: None,
+            stack_role: None,
+            stack_count: 1,
+            stack_has_edited: false,
+            stack_has_raw: false,
         };
 
         let sample_hit = SearchHit {

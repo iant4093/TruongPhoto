@@ -105,6 +105,7 @@ fn make_photo_ingest(
         duration_ms: None,
         thumb_rel_path: Some(format!("th/{lower_stem}.webp")),
         thumb_ready: true,
+        dhash64: None,
         photo_meta: Some(PhotoMetaView {
             camera_make: Some("Fujifilm".to_string()),
             camera_model: Some("X100VI".to_string()),
@@ -245,6 +246,7 @@ async fn migration_0004_idempotency_backfill_and_chat_tier_state() {
             (3, "0003_phase2_ai".to_string()),
             (4, "0004_phase3_chat_map".to_string()),
             (5, "0005_r5_perf_indexes".to_string()),
+            (6, "0006_universal_stacks".to_string()),
         ]
     );
     assert_eq!(state.active_vision_tier, AiTier::Tier2);

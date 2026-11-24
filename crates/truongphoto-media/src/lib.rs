@@ -18,14 +18,14 @@ pub use classify::{
 };
 pub use color::{bake_icc_to_srgb, composite_to_rgb, compute_histogram};
 pub use decode::{
-    decode_image_to_srgb, encode_webp_resized, generate_preview_webp, generate_thumb_and_histogram,
-    GeneratedThumb,
+    compute_dhash64, compute_dhash64_from_file, decode_image_to_srgb, dhash_hamming_distance,
+    encode_webp_resized, generate_preview_webp, generate_thumb_and_histogram, GeneratedThumb,
 };
 pub use geocode::{reverse_geocode, GeoLocation};
 pub use metadata::{
-    extract_livp, extract_livp_entry_bytes, extract_metadata, inspect_livp,
+    extract_livp, extract_livp_entry_bytes, extract_metadata, inspect_livp, is_editing_software,
     parse_android_motion_photo, parse_apple_makernote_content_id, parse_isobmff_content_id,
-    parse_isobmff_content_id_bytes, ExtractedMetadata, LivpContents, LivpEntries,
+    parse_isobmff_content_id_bytes, parse_subsec_ms, ExtractedMetadata, LivpContents, LivpEntries,
 };
 pub use raw::{demosaic_raw_to_jpeg, extract_embedded_raw_jpeg, try_libraw_demosaic_jpeg};
 pub use video::{

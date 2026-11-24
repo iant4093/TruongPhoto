@@ -102,6 +102,7 @@ fn make_still_ingest(
         duration_ms: None,
         thumb_rel_path: Some(format!("th/{lower_stem}.webp")),
         thumb_ready: !is_raw,
+        dhash64: None,
         photo_meta: Some(PhotoMetaView {
             camera_make: Some("Apple".to_string()),
             camera_model: Some("iPhone 16 Pro".to_string()),
@@ -156,6 +157,7 @@ fn make_video_ingest(
         duration_ms: Some(duration_ms),
         thumb_rel_path: Some(format!("th/{lower_stem}-vid.webp")),
         thumb_ready: true,
+        dhash64: None,
         photo_meta: None,
         raw_exif_json: None,
         video_meta: Some(VideoMetaView {
@@ -201,6 +203,7 @@ async fn migration_0002_histograms_and_lru_cache_eviction() {
             (3, "0003_phase2_ai".to_string()),
             (4, "0004_phase3_chat_map".to_string()),
             (5, "0005_r5_perf_indexes".to_string()),
+            (6, "0006_universal_stacks".to_string()),
         ]
     );
     db1.shutdown().await.expect("shutdown db1");

@@ -1,13 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Check,
   ChevronLeft,
   ChevronRight,
   Download,
   Info,
+  Layers,
   Play,
   Share2,
   Star,
   Trash2,
+  Unlink,
   X,
   ZoomIn,
 } from 'lucide-react';
@@ -17,7 +20,9 @@ import {
   mediaOriginalUrl,
   mediaPreviewUrl,
   mediaThumbUrl,
+  removeFromStack,
   setAssetFavorite,
+  setStackCover,
   trashAssets,
   triggerAssetDownload,
 } from '../lib/api';
@@ -26,7 +31,7 @@ import { formatDateTime } from '../lib/format';
 import { isTauri } from '../lib/tauri';
 import { notifyError, notifyInfo, notifySuccess, useFeedback } from '../store/feedback';
 import { errorMessage, useAppStore } from '../store/useAppStore';
-import type { AssetDetail } from '../types/api';
+import type { AssetDetail, StackMemberView } from '../types/api';
 import { AssetInspector } from './AssetInspector';
 import { openContextMenu, useContextMenuStore } from './ContextMenu';
 import { VideoPlayer } from './VideoPlayer';
@@ -35,6 +40,31 @@ import { WindowsCaptionButtons, isWindowsPlatform } from './WindowControls';
 const showWindowsCaption = isTauri() && isWindowsPlatform();
 const ZERO_PAN = { x: 0, y: 0 };
 const INFO_SHEET_EXIT_MS = 220;
+
+function formatStackVersionLabel(member: StackMemberView, members: StackMemberView[]): string {
+  const base =
+    member.stack_role === 'edited'
+      ? 'Edited'
+      : member.stack_role === 'raw' || member.is_raw
+        ? 'RAW'
+        : member.stack_role === 'jpeg'
+          ? 'JPEG'
+          : member.extension.toUpperCase() || 'Version';
+  const sameRole = members.filter((m) => {
+    const mb =
+      m.stack_role === 'edited'
+        ? 'Edited'
+        : m.stack_role === 'raw' || m.is_raw
+          ? 'RAW'
+          : m.stack_role === 'jpeg'
+            ? 'JPEG'
+            : m.extension.toUpperCase() || 'Version';
+    return mb === base;
+  });
+  if (sameRole.length <= 1) return base;
+  const idx = sameRole.findIndex((m) => m.asset_id === member.asset_id);
+  return `${base} ${idx + 1}`;
+}
 
 function readIsMobileViewport(): boolean {
   if (typeof window === 'undefined') return false;
@@ -137,8 +167,16 @@ export const Lightbox: React.FC = () => {
 
   const canMutate = user?.role === 'admin' || user?.role === 'contributor';
 
+  // Active version inside a multi-version stack (null = use the timeline slot's `lightboxAssetId`).
+  const [activeVersionId, setActiveVersionId] = useState<string | null>(null);
+  const displayedAssetId = lightboxAssetId ? (activeVersionId ?? lightboxAssetId) : null;
+
+  useEffect(() => {
+    setActiveVersionId(null);
+  }, [lightboxAssetId]);
+
   const [detail, setDetail] = useState<AssetDetail | null>(() =>
-    lightboxAssetId ? getCachedDetail(lightboxAssetId) : null,
+    displayedAssetId ? getCachedDetail(displayedAssetId) : null,
   );
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -156,7 +194,7 @@ export const Lightbox: React.FC = () => {
   const [liveVideoReady, setLiveVideoReady] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState(ZERO_PAN);
-  const [mediaStateAssetId, setMediaStateAssetId] = useState<string | null>(lightboxAssetId);
+  const [mediaStateAssetId, setMediaStateAssetId] = useState<string | null>(displayedAssetId);
   const [isDragging, setIsDragging] = useState(false);
   const [animateZoom, setAnimateZoom] = useState(false);
 
@@ -177,8 +215,8 @@ export const Lightbox: React.FC = () => {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const infoDrawerRef = useRef<HTMLElement | null>(null);
   const shareAbortRef = useRef<AbortController | null>(null);
-  const activeAssetIdRef = useRef<string | null>(lightboxAssetId);
-  activeAssetIdRef.current = lightboxAssetId;
+  const activeAssetIdRef = useRef<string | null>(displayedAssetId);
+  activeAssetIdRef.current = displayedAssetId;
   const exitingTimerRef = useRef<number | null>(null);
   const slideSeqRef = useRef(0);
   const prevAssetRef = useRef<{ id: string; previewUrl: string } | null>(null);
@@ -371,7 +409,7 @@ export const Lightbox: React.FC = () => {
     setSharing(false);
     gestureRef.current.lastTapAt = 0;
     gestureRef.current.ignoreTouch = false;
-    if (!lightboxAssetId) {
+    if (!displayedAssetId) {
       setDetail(null);
       setDetailLoading(false);
       setInfoOpen(false);
@@ -390,13 +428,13 @@ export const Lightbox: React.FC = () => {
       return;
     }
 
-    const cached = getCachedDetail(lightboxAssetId);
-    const nextPreview = cached?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId);
-    prevAssetRef.current = { id: lightboxAssetId, previewUrl: nextPreview };
+    const cached = getCachedDetail(displayedAssetId);
+    const nextPreview = cached?.playback.preview_url ?? mediaPreviewUrl(displayedAssetId);
+    prevAssetRef.current = { id: displayedAssetId, previewUrl: nextPreview };
 
     let active = true;
     setError(null);
-    setMediaStateAssetId(lightboxAssetId);
+    setMediaStateAssetId(displayedAssetId);
     setRawDemosaic(false);
     setLivePlaying(false);
     setLiveVideoReady(false);
@@ -418,14 +456,14 @@ export const Lightbox: React.FC = () => {
       setDetailLoading(true);
     }
 
-    void getAssetDetail(lightboxAssetId)
+    void getAssetDetail(displayedAssetId)
       .then((res) => {
         if (!active) return;
-        setCachedDetail(lightboxAssetId, res);
+        setCachedDetail(displayedAssetId, res);
         setDetail(res);
         prevAssetRef.current = {
-          id: lightboxAssetId,
-          previewUrl: res.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId),
+          id: displayedAssetId,
+          previewUrl: res.playback.preview_url ?? mediaPreviewUrl(displayedAssetId),
         };
       })
       .catch((err) => {
@@ -442,7 +480,7 @@ export const Lightbox: React.FC = () => {
       active = false;
       clearLongPress();
     };
-  }, [clearLongPress, lightboxAssetId]);
+  }, [clearLongPress, displayedAssetId]);
 
   // Preload adjacent ±1 and ±2 preview images AND AssetDetail metadata so photo switching is instant & flash-free.
   useEffect(() => {
@@ -474,9 +512,108 @@ export const Lightbox: React.FC = () => {
     };
   }, [currentIndex, lightboxAssetId, lightboxAssetIds]);
 
-  const activeDetail = detail?.summary.id === lightboxAssetId ? detail : null;
+  const activeDetail = detail?.summary.id === displayedAssetId ? detail : null;
   // Keep prior detail ONLY to stabilize non-conflicting toolbar layout during cold cache misses.
   const toolbarDetail = activeDetail ?? detail;
+  const stackMembers = useMemo(
+    () => activeDetail?.stack_members ?? toolbarDetail?.stack_members ?? [],
+    [activeDetail?.stack_members, toolbarDetail?.stack_members],
+  );
+  const currentStackGroupId =
+    activeDetail?.summary.stack_group_id ?? toolbarDetail?.summary.stack_group_id ?? null;
+
+  // Preload sibling versions in the active stack so switching Edited <-> JPEG <-> RAW is instant.
+  useEffect(() => {
+    if (!displayedAssetId || stackMembers.length <= 1) return;
+    let cancelled = false;
+    for (const member of stackMembers) {
+      if (member.asset_id === displayedAssetId) continue;
+      const cached = getCachedDetail(member.asset_id);
+      preloadPreviewUrl(cached?.playback.preview_url ?? mediaPreviewUrl(member.asset_id));
+      if (!cached) {
+        void getAssetDetail(member.asset_id)
+          .then((res) => {
+            if (cancelled) return;
+            setCachedDetail(member.asset_id, res);
+            if (res.playback.preview_url) {
+              preloadPreviewUrl(res.playback.preview_url);
+            }
+          })
+          .catch(() => {});
+      }
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [displayedAssetId, stackMembers]);
+
+  const switchStackVersion = useCallback(
+    (targetAssetId: string) => {
+      if (!lightboxAssetId || targetAssetId === displayedAssetId) return;
+      // Instant Before/After swap in place (no directional slide animation).
+      setNavDir('fade');
+      setExitingSlide(null);
+      if (exitingTimerRef.current !== null) {
+        window.clearTimeout(exitingTimerRef.current);
+        exitingTimerRef.current = null;
+      }
+      setActiveVersionId(targetAssetId === lightboxAssetId ? null : targetAssetId);
+    },
+    [displayedAssetId, lightboxAssetId],
+  );
+
+  const toggleBeforeAfterVersion = useCallback(() => {
+    if (stackMembers.length <= 1 || !displayedAssetId) return;
+    const coverMember = stackMembers.find((m) => m.is_cover) ?? stackMembers[0];
+    const compareMember =
+      stackMembers.find((m) => (m.stack_role === 'raw' || m.is_raw) && m.asset_id !== coverMember.asset_id) ??
+      stackMembers.find((m) => m.asset_id !== coverMember.asset_id);
+    if (!compareMember) return;
+    const nextId =
+      displayedAssetId === coverMember.asset_id ? compareMember.asset_id : coverMember.asset_id;
+    switchStackVersion(nextId);
+  }, [displayedAssetId, stackMembers, switchStackVersion]);
+
+  const cycleStackVersion = useCallback(() => {
+    if (stackMembers.length <= 1 || !displayedAssetId) return;
+    const idx = stackMembers.findIndex((m) => m.asset_id === displayedAssetId);
+    const next = stackMembers[(idx + 1) % stackMembers.length];
+    if (next) switchStackVersion(next.asset_id);
+  }, [displayedAssetId, stackMembers, switchStackVersion]);
+
+  const handleSetAsStackCover = useCallback(async () => {
+    if (!canMutate || !currentStackGroupId || !displayedAssetId) return;
+    try {
+      await setStackCover(currentStackGroupId, displayedAssetId);
+      for (const m of stackMembers) {
+        detailCache.delete(m.asset_id);
+      }
+      const refreshed = await getAssetDetail(displayedAssetId);
+      setCachedDetail(displayedAssetId, refreshed);
+      setDetail(refreshed);
+      bumpLibraryRevision();
+      notifySuccess('Updated stack cover');
+    } catch (err) {
+      notifyError(err, 'Could not set stack cover');
+    }
+  }, [bumpLibraryRevision, canMutate, currentStackGroupId, displayedAssetId, stackMembers]);
+
+  const handleRemoveFromStack = useCallback(async () => {
+    if (!canMutate || !currentStackGroupId || !displayedAssetId) return;
+    try {
+      await removeFromStack(currentStackGroupId, displayedAssetId);
+      for (const m of stackMembers) {
+        detailCache.delete(m.asset_id);
+      }
+      const refreshed = await getAssetDetail(displayedAssetId);
+      setCachedDetail(displayedAssetId, refreshed);
+      setDetail(refreshed);
+      bumpLibraryRevision();
+      notifySuccess('Removed photo from stack');
+    } catch (err) {
+      notifyError(err, 'Could not remove from stack');
+    }
+  }, [bumpLibraryRevision, canMutate, currentStackGroupId, displayedAssetId, stackMembers]);
 
   const clampPan = useCallback((x: number, y: number, targetZoom: number) => {
     if (targetZoom <= 1.02) return { x: 0, y: 0 };
@@ -501,40 +638,58 @@ export const Lightbox: React.FC = () => {
   }, [lightboxAssetId]);
 
   const handleToggleFavorite = useCallback(async () => {
-    if (!canMutate || !lightboxAssetId || !activeDetail) return;
+    if (!canMutate || !displayedAssetId || !activeDetail) return;
     const nextFav = !activeDetail.summary.is_favorite;
     const optimistic: AssetDetail = {
       ...activeDetail,
       summary: { ...activeDetail.summary, is_favorite: nextFav },
     };
-    setCachedDetail(lightboxAssetId, optimistic);
+    setCachedDetail(displayedAssetId, optimistic);
     setDetail(optimistic);
     try {
-      await setAssetFavorite(lightboxAssetId, nextFav);
+      await setAssetFavorite(displayedAssetId, nextFav);
       bumpLibraryRevision();
     } catch (err) {
-      setCachedDetail(lightboxAssetId, activeDetail);
-      setDetail((prev) => (prev && prev.summary.id === lightboxAssetId ? activeDetail : prev));
+      setCachedDetail(displayedAssetId, activeDetail);
+      setDetail((prev) => (prev && prev.summary.id === displayedAssetId ? activeDetail : prev));
       notifyError(err, 'Could not update favorite');
     }
-  }, [activeDetail, bumpLibraryRevision, canMutate, lightboxAssetId]);
+  }, [activeDetail, bumpLibraryRevision, canMutate, displayedAssetId]);
 
   const handleMoveToTrash = useCallback(async () => {
-    if (!canMutate || !lightboxAssetId || trashing) return;
-    const trashedId = lightboxAssetId;
+    if (!canMutate || !displayedAssetId || trashing) return;
+    const trashedId = displayedAssetId;
     setTrashing(true);
     try {
       await trashAssets([trashedId]);
       detailCache.delete(trashedId);
+      for (const m of stackMembers) {
+        detailCache.delete(m.asset_id);
+      }
       bumpLibraryRevision();
       notifySuccess('Moved item to Trash');
-      removeLightboxAsset(trashedId);
+      // If user trashed one version of a multi-version stack, switch to another surviving version.
+      const remainingSibling = stackMembers.find((m) => m.asset_id !== trashedId);
+      if (remainingSibling) {
+        switchStackVersion(remainingSibling.asset_id);
+      } else if (lightboxAssetId) {
+        removeLightboxAsset(lightboxAssetId);
+      }
     } catch (err) {
       notifyError(err, 'Could not move item to Trash');
     } finally {
       setTrashing(false);
     }
-  }, [bumpLibraryRevision, canMutate, lightboxAssetId, removeLightboxAsset, trashing]);
+  }, [
+    bumpLibraryRevision,
+    canMutate,
+    displayedAssetId,
+    lightboxAssetId,
+    removeLightboxAsset,
+    stackMembers,
+    switchStackVersion,
+    trashing,
+  ]);
 
   const togglePixelPeepZoom = useCallback(() => {
     setAnimateZoom(true);
@@ -631,6 +786,19 @@ export const Lightbox: React.FC = () => {
           event.preventDefault();
           setInfoOpen((prev) => !prev);
           break;
+        case '\\':
+          if (stackMembers.length > 1) {
+            event.preventDefault();
+            toggleBeforeAfterVersion();
+          }
+          break;
+        case 'v':
+        case 'V':
+          if (stackMembers.length > 1) {
+            event.preventDefault();
+            cycleStackVersion();
+          }
+          break;
         case '+':
         case '=':
           event.preventDefault();
@@ -696,12 +864,15 @@ export const Lightbox: React.FC = () => {
     activeDetail,
     clampPan,
     currentIndex,
+    cycleStackVersion,
     goNext,
     goPrev,
     handleToggleFavorite,
     lightboxAssetId,
     lightboxAssetIds,
     navigateWithSlide,
+    stackMembers.length,
+    toggleBeforeAfterVersion,
   ]);
 
   const isVideo =
@@ -727,9 +898,9 @@ export const Lightbox: React.FC = () => {
   const browserNativeOriginal = ['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif'].includes(primaryExt);
 
   const fullResUrl = useMemo(() => {
-    if (!lightboxAssetId || isVideo) return null;
-    if (rawDemosaic) return mediaOriginalUrl(lightboxAssetId, { mode: 'raw_demosaic' });
-    if (browserNativeOriginal) return mediaOriginalUrl(lightboxAssetId);
+    if (!displayedAssetId || isVideo) return null;
+    if (rawDemosaic) return mediaOriginalUrl(displayedAssetId, { mode: 'raw_demosaic' });
+    if (browserNativeOriginal) return mediaOriginalUrl(displayedAssetId);
     if (
       hasRaw ||
       primaryExt === 'heic' ||
@@ -738,21 +909,21 @@ export const Lightbox: React.FC = () => {
       primaryExt === 'tiff' ||
       primaryExt === 'jxl'
     ) {
-      return mediaOriginalUrl(lightboxAssetId, { mode: 'raw_demosaic' });
+      return mediaOriginalUrl(displayedAssetId, { mode: 'raw_demosaic' });
     }
-    return mediaOriginalUrl(lightboxAssetId);
-  }, [browserNativeOriginal, hasRaw, isVideo, lightboxAssetId, primaryExt, rawDemosaic]);
+    return mediaOriginalUrl(displayedAssetId);
+  }, [browserNativeOriginal, displayedAssetId, hasRaw, isVideo, primaryExt, rawDemosaic]);
 
   // Zero-flash stacked hi-res / RAW overlay:
   // Keeps the base preview <img> untouched underneath; mounts the overlay <img> at opacity 0
   // and fades it in smoothly ONLY after load + decode(). Stays mounted on zoom-out so zooming
   // in and out never swaps src or flashes!
   const wantsOverlay = Boolean(
-    lightboxAssetId && !isVideo && fullResUrl && (rawDemosaic || zoom > 1.02),
+    displayedAssetId && !isVideo && fullResUrl && (rawDemosaic || zoom > 1.02),
   );
 
   useEffect(() => {
-    if (!lightboxAssetId || isVideo || !fullResUrl) return;
+    if (!displayedAssetId || isVideo || !fullResUrl) return;
     if (!wantsOverlay) {
       // Only fade out RAW 100% overlay when explicitly toggling a RAW+JPG stack back to Preview at 1x
       // (keep decoded hi-res overlay mounted for standalone HEIC/TIFF/RAW zoomed back out to 1x).
@@ -767,9 +938,9 @@ export const Lightbox: React.FC = () => {
       return;
     }
 
-    if (readyOverlayUrl !== fullResUrl || readyOverlayAssetId !== lightboxAssetId) {
+    if (readyOverlayUrl !== fullResUrl || readyOverlayAssetId !== displayedAssetId) {
       setReadyOverlayUrl(fullResUrl);
-      setReadyOverlayAssetId(lightboxAssetId);
+      setReadyOverlayAssetId(displayedAssetId);
     }
     if (decodedUrlSet.has(fullResUrl)) {
       setOverlayVisible(true);
@@ -780,9 +951,9 @@ export const Lightbox: React.FC = () => {
     }
   }, [
     activeDetail?.summary.kind,
+    displayedAssetId,
     fullResUrl,
     isVideo,
-    lightboxAssetId,
     rawDemosaic,
     readyOverlayAssetId,
     readyOverlayUrl,
@@ -791,8 +962,8 @@ export const Lightbox: React.FC = () => {
 
   // Dismiss thumbnail underlay after preview fade completes, even if onTransitionEnd doesn't fire
   // (e.g., prefers-reduced-motion or synchronous HTTP cache hits).
-  const activePreviewUrl = lightboxAssetId
-    ? activeDetail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId)
+  const activePreviewUrl = displayedAssetId
+    ? activeDetail?.playback.preview_url ?? mediaPreviewUrl(displayedAssetId)
     : null;
   const activePreviewReady = Boolean(
     activePreviewUrl &&
@@ -856,7 +1027,7 @@ export const Lightbox: React.FC = () => {
     return () => window.clearTimeout(t);
   }, [clampPan, infoOpen, isMobileViewport, lightboxAssetId]);
 
-  if (!lightboxAssetId) return null;
+  if (!lightboxAssetId || !displayedAssetId) return null;
 
   const titleDetail = activeDetail ?? toolbarDetail;
   const titlePrimaryFile =
@@ -867,17 +1038,18 @@ export const Lightbox: React.FC = () => {
     titlePrimaryFile?.rel_path.split(/[\\/]/).pop() ||
     '\u00A0';
 
-  const previewUrl = activeDetail?.playback.preview_url ?? mediaPreviewUrl(lightboxAssetId);
-  const thumbUrl = mediaThumbUrl(lightboxAssetId);
+  const previewUrl = activeDetail?.playback.preview_url ?? mediaPreviewUrl(displayedAssetId);
+  const thumbUrl = mediaThumbUrl(displayedAssetId);
   const previewIsReady = previewLoadedUrl === previewUrl || decodedUrlSet.has(previewUrl);
   const showUnderlay = !previewIsReady || underlayDismissedUrl !== previewUrl;
-  const effectiveZoom = mediaStateAssetId === lightboxAssetId ? zoom : 1;
-  const effectivePan = mediaStateAssetId === lightboxAssetId ? pan : ZERO_PAN;
-  const activeOverlayUrl = readyOverlayAssetId === lightboxAssetId ? readyOverlayUrl : null;
+  const effectiveZoom = mediaStateAssetId === displayedAssetId ? zoom : 1;
+  const effectivePan = mediaStateAssetId === displayedAssetId ? pan : ZERO_PAN;
+  const activeOverlayUrl = readyOverlayAssetId === displayedAssetId ? readyOverlayUrl : null;
   const usingHiRes = Boolean(
     activeOverlayUrl && overlayVisible && (rawDemosaic || effectiveZoom > 1.02),
   );
-  const liveVideoUrl = activeDetail?.playback.live_video_url ?? mediaLiveVideoUrl(lightboxAssetId);
+  const liveVideoUrl = activeDetail?.playback.live_video_url ?? mediaLiveVideoUrl(displayedAssetId);
+  const currentStackMember = stackMembers.find((m) => m.asset_id === displayedAssetId) ?? null;
 
   const zoomAtPoint = (clientX: number, clientY: number, targetZoom: number) => {
     setAnimateZoom(true);
@@ -1130,8 +1302,8 @@ export const Lightbox: React.FC = () => {
   };
 
   const handleNativeShare = async () => {
-    if (!lightboxAssetId || sharing) return;
-    const targetAssetId = lightboxAssetId;
+    if (!displayedAssetId || sharing) return;
+    const targetAssetId = displayedAssetId;
     const knownSize = titlePrimaryFile?.file_size ?? 0;
     // Avoid buffering huge videos or RAW files (>25 MB) into mobile JS memory / expiring user activation
     if (isVideo || knownSize > 25 * 1024 * 1024) {
@@ -1204,8 +1376,40 @@ export const Lightbox: React.FC = () => {
   };
 
   const handleMediaContextMenu = (e: React.MouseEvent) => {
-    if (!lightboxAssetId) return;
+    if (!displayedAssetId) return;
     openContextMenu(e, [
+      ...(stackMembers.length > 1
+        ? [
+            {
+              id: 'lb-compare',
+              label: 'Toggle Before / After Version',
+              icon: <Layers size={14} />,
+              shortcut: '\\',
+              onSelect: () => toggleBeforeAfterVersion(),
+            },
+            ...(canMutate && currentStackGroupId && currentStackMember && !currentStackMember.is_cover
+              ? [
+                  {
+                    id: 'lb-set-cover',
+                    label: 'Set This Version as Cover',
+                    icon: <Check size={14} />,
+                    onSelect: () => void handleSetAsStackCover(),
+                  },
+                ]
+              : []),
+            ...(canMutate && currentStackGroupId
+              ? [
+                  {
+                    id: 'lb-unstack',
+                    label: 'Remove Version from Stack',
+                    icon: <Unlink size={14} />,
+                    onSelect: () => void handleRemoveFromStack(),
+                  },
+                ]
+              : []),
+            { type: 'separator' as const, id: 'lb-sep-stack' },
+          ]
+        : []),
       ...(!isVideo
         ? [
             {
@@ -1248,7 +1452,7 @@ export const Lightbox: React.FC = () => {
         label: 'Download Original',
         icon: <Download size={14} />,
         onSelect: () => {
-          triggerAssetDownload(lightboxAssetId);
+          triggerAssetDownload(displayedAssetId);
         },
       },
       ...(canMutate
@@ -1352,6 +1556,32 @@ export const Lightbox: React.FC = () => {
         </div>
 
         <div className="row lightbox-toolbar-actions">
+          {stackMembers.length > 1 && !isVideo && (
+            <div
+              className="lightbox-version-switcher"
+              role="group"
+              aria-label="Photo stack versions"
+            >
+              {stackMembers.map((member) => {
+                const isSelected = member.asset_id === displayedAssetId;
+                const label = formatStackVersionLabel(member, stackMembers);
+                const tip = `${label}${member.is_cover ? ' (Cover)' : ''} · ${member.folder_name}/${member.rel_path}${member.software ? ` · ${member.software}` : ''} (\\ to compare)`;
+                return (
+                  <button
+                    key={member.asset_id}
+                    type="button"
+                    className={`lightbox-version-btn${isSelected ? ' is-active' : ''}`}
+                    aria-pressed={isSelected}
+                    title={tip}
+                    onClick={() => switchStackVersion(member.asset_id)}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           {hasRaw && !isVideo && (
             <div className="row" style={{ gap: 4 }} role="group" aria-label="RAW tier toggle">
               <button
@@ -1422,7 +1652,7 @@ export const Lightbox: React.FC = () => {
 
               <a
                 className="icon-button"
-                href={mediaOriginalUrl(lightboxAssetId, { download: true })}
+                href={mediaOriginalUrl(displayedAssetId, { download: true })}
                 download
                 aria-label="Download original"
                 title="Download original"
@@ -1514,16 +1744,16 @@ export const Lightbox: React.FC = () => {
               {error}
             </div>
           ) : isVideo && activeDetail ? (
-            <div key={lightboxAssetId} className={`lightbox-media-frame is-nav-${navDir}`}>
+            <div key={displayedAssetId} className={`lightbox-media-frame is-nav-${navDir}`}>
               <VideoPlayer
                 playback={activeDetail.playback}
-                posterUrl={activeDetail.playback.preview_url ?? mediaThumbUrl(lightboxAssetId)}
+                posterUrl={activeDetail.playback.preview_url ?? mediaThumbUrl(displayedAssetId)}
                 initialTimestampSec={lightboxInitialTimestampSec}
                 className="lightbox-media"
               />
             </div>
           ) : (
-            <div key={lightboxAssetId} className={`lightbox-media-frame is-nav-${navDir}`}>
+            <div key={displayedAssetId} className={`lightbox-media-frame is-nav-${navDir}`}>
               <div
                 className="lightbox-zoom-surface"
                 style={{
@@ -1695,15 +1925,92 @@ export const Lightbox: React.FC = () => {
           </div>
           <div className="lightbox-info-scroll">
             {infoRendered && (
-              <AssetInspector
-                assetId={lightboxAssetId}
-                initialDetail={activeDetail}
-                loadingInitialDetail={detailLoading}
-                onAssetUpdated={(updated) => {
-                  setCachedDetail(updated.summary.id, updated);
-                  setDetail(updated);
-                }}
-              />
+              <>
+                {stackMembers.length > 1 && (
+                  <div className="lightbox-stack-inspector-card">
+                    <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+                      <span className="row" style={{ gap: 6, fontSize: 12, fontWeight: 600 }}>
+                        <Layers size={13} />
+                        <span>Stacked Versions ({stackMembers.length})</span>
+                      </span>
+                      <span className="view-subtitle" style={{ marginTop: 0, fontSize: 11 }}>
+                        Press \ to compare
+                      </span>
+                    </div>
+                    <div className="stack" style={{ gap: 6 }}>
+                      {stackMembers.map((member) => {
+                        const isSelected = member.asset_id === displayedAssetId;
+                        const label = formatStackVersionLabel(member, stackMembers);
+                        return (
+                          <button
+                            key={member.asset_id}
+                            type="button"
+                            className={`lightbox-stack-member-row${isSelected ? ' is-active' : ''}`}
+                            onClick={() => switchStackVersion(member.asset_id)}
+                          >
+                            <div style={{ minWidth: 0, textAlign: 'left' }}>
+                              <div className="row" style={{ gap: 6 }}>
+                                <strong style={{ fontSize: 12 }}>{label}</strong>
+                                {member.is_cover && (
+                                  <span className="lightbox-stack-cover-tag">Cover</span>
+                                )}
+                              </div>
+                              <div
+                                className="view-subtitle"
+                                style={{
+                                  marginTop: 1,
+                                  fontSize: 11,
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {member.folder_name} / {member.filename}
+                              </div>
+                            </div>
+                            <span className="view-subtitle" style={{ marginTop: 0, fontSize: 11, flexShrink: 0 }}>
+                              {member.extension.toUpperCase()}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {canMutate && currentStackGroupId && (
+                      <div className="row" style={{ gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                        {currentStackMember && !currentStackMember.is_cover && (
+                          <button
+                            type="button"
+                            className="button"
+                            style={{ fontSize: 11, padding: '4px 9px' }}
+                            onClick={() => void handleSetAsStackCover()}
+                          >
+                            <Check size={12} />
+                            Set as Cover
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="button button-quiet"
+                          style={{ fontSize: 11, padding: '4px 9px' }}
+                          onClick={() => void handleRemoveFromStack()}
+                        >
+                          <Unlink size={12} />
+                          Unstack
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+                <AssetInspector
+                  assetId={displayedAssetId}
+                  initialDetail={activeDetail}
+                  loadingInitialDetail={detailLoading}
+                  onAssetUpdated={(updated) => {
+                    setCachedDetail(updated.summary.id, updated);
+                    setDetail(updated);
+                  }}
+                />
+              </>
             )}
           </div>
         </aside>
@@ -1740,7 +2047,7 @@ export const Lightbox: React.FC = () => {
           ) : (
             <a
               className="lightbox-mobile-action"
-              href={mediaOriginalUrl(lightboxAssetId, { download: true })}
+              href={mediaOriginalUrl(displayedAssetId, { download: true })}
               download
               aria-label="Download original"
               onClick={handleWebDownloadClick}

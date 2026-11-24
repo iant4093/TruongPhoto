@@ -23,6 +23,7 @@ import type {
   CreateAdminUserRequest,
   CreateAlbumRequest,
   CreateFolderRequest,
+  FolderSubfolderListResponse,
   FolderView,
   HealthResponse,
   ListAssetsParams,
@@ -38,6 +39,7 @@ import type {
   PersonListResponse,
   PersonSummary,
   PurgeReport,
+  RebuildStacksResponse,
   ReassignFaceRequest,
   ReassignFaceResponse,
   ReindexScope,
@@ -52,6 +54,7 @@ import type {
   SetupInitializeRequest,
   SetupStatusResponse,
   ShareableUser,
+  StackGroupResponse,
   SystemInfoResponse,
   TailscaleStatus,
   TrashListResponse,
@@ -316,16 +319,66 @@ export const triggerBackup = (): Promise<BackupResult> =>
 export const listAssets = (params: ListAssetsParams = {}): Promise<AssetListResponse> => {
   const query = new URLSearchParams();
   if (params.folder_id) query.set('folder_id', params.folder_id);
+  if (params.path_prefix) query.set('path_prefix', params.path_prefix);
   if (params.favorite !== undefined) query.set('favorite', String(params.favorite));
   if (params.before_ms !== undefined) query.set('before_ms', String(params.before_ms));
   if (params.cursor) query.set('cursor', params.cursor);
   if (params.limit !== undefined) query.set('limit', String(params.limit));
+  if (params.collapse_stacks !== undefined) {
+    query.set('collapse_stacks', String(params.collapse_stacks));
+  }
   const qs = query.toString();
   return request<AssetListResponse>(qs ? `/api/assets?${qs}` : '/api/assets', { method: 'GET' });
 };
 
-export const listAssetBuckets = (): Promise<AssetBucketsResponse> =>
-  request<AssetBucketsResponse>('/api/assets/buckets', { method: 'GET' });
+export const listAssetBuckets = (
+  params: { folder_id?: string; path_prefix?: string; collapse_stacks?: boolean } = {},
+): Promise<AssetBucketsResponse> => {
+  const query = new URLSearchParams();
+  if (params.folder_id) query.set('folder_id', params.folder_id);
+  if (params.path_prefix) query.set('path_prefix', params.path_prefix);
+  if (params.collapse_stacks !== undefined) {
+    query.set('collapse_stacks', String(params.collapse_stacks));
+  }
+  const qs = query.toString();
+  return request<AssetBucketsResponse>(
+    qs ? `/api/assets/buckets?${qs}` : '/api/assets/buckets',
+    { method: 'GET' },
+  );
+};
+
+export const listFolderSubfolders = (folderId: string): Promise<FolderSubfolderListResponse> =>
+  request<FolderSubfolderListResponse>(
+    `/api/folders/${encodeURIComponent(folderId)}/subfolders`,
+    { method: 'GET' },
+  );
+
+export const createStack = (
+  assetIds: string[],
+  coverAssetId?: string,
+): Promise<StackGroupResponse> =>
+  request<StackGroupResponse>('/api/stacks', {
+    method: 'POST',
+    body: JSON.stringify({
+      asset_ids: assetIds,
+      ...(coverAssetId ? { cover_asset_id: coverAssetId } : {}),
+    }),
+  });
+
+export const setStackCover = (groupId: string, assetId: string): Promise<void> =>
+  request<void>(`/api/stacks/${encodeURIComponent(groupId)}/cover`, {
+    method: 'POST',
+    body: JSON.stringify({ asset_id: assetId }),
+  });
+
+export const removeFromStack = (groupId: string, assetId: string): Promise<void> =>
+  request<void>(
+    `/api/stacks/${encodeURIComponent(groupId)}/members/${encodeURIComponent(assetId)}`,
+    { method: 'DELETE' },
+  );
+
+export const rebuildStacks = (): Promise<RebuildStacksResponse> =>
+  request<RebuildStacksResponse>('/api/admin/stacks/rebuild', { method: 'POST' });
 
 export const listAlbums = (): Promise<AlbumListResponse> =>
   request<AlbumListResponse>('/api/albums', { method: 'GET' });

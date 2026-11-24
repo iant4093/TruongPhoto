@@ -17,20 +17,26 @@ const MAX_LIMIT: usize = 500;
 #[derive(Debug, Clone)]
 pub struct AssetListQuery {
     pub folder_id: Option<String>,
+    /// Optional nested subfolder prefix inside `folder_id` (e.g. `"2026/hikes/album"`).
+    pub path_prefix: Option<String>,
     pub favorite: Option<bool>,
     pub before_ms: Option<i64>,
     pub cursor: Option<String>,
     pub limit: usize,
+    /// When `true` (default), collapses multi-version stacks to their top-ranked visible cover.
+    pub collapse_stacks: bool,
 }
 
 impl Default for AssetListQuery {
     fn default() -> Self {
         Self {
             folder_id: None,
+            path_prefix: None,
             favorite: None,
             before_ms: None,
             cursor: None,
             limit: DEFAULT_LIMIT,
+            collapse_stacks: true,
         }
     }
 }
@@ -67,7 +73,9 @@ pub(crate) const ASSET_SUMMARY_COLUMNS: &str = "
     v.effective_gps_lon,
     v.effective_geo_city,
     v.effective_geo_country,
-    v.camera_model
+    v.camera_model,
+    v.stack_group_id,
+    v.stack_role
 ";
 
 pub(crate) fn row_to_asset_summary(row: &Row<'_>) -> rusqlite::Result<AssetSummary> {
@@ -78,6 +86,9 @@ pub(crate) fn row_to_asset_summary(row: &Row<'_>) -> rusqlite::Result<AssetSumma
     let width: Option<i64> = row.get(4)?;
     let height: Option<i64> = row.get(5)?;
     let rating: Option<i64> = row.get(13)?;
+    let stack_role: Option<String> = row.get(20)?;
+    let stack_has_edited = stack_role.as_deref() == Some("edited");
+    let stack_has_raw = kind == AssetKind::RawJpgStack || stack_role.as_deref() == Some("raw");
 
     Ok(AssetSummary {
         id: row.get(0)?,
@@ -99,6 +110,11 @@ pub(crate) fn row_to_asset_summary(row: &Row<'_>) -> rusqlite::Result<AssetSumma
         geo_city: row.get(16)?,
         geo_country: row.get(17)?,
         camera_model: row.get(18)?,
+        stack_group_id: row.get(19)?,
+        stack_role,
+        stack_count: 1,
+        stack_has_edited,
+        stack_has_raw,
     })
 }
 
@@ -154,7 +170,7 @@ fn load_photo_meta(conn: &Connection, asset_id: &str) -> DbResult<Option<PhotoMe
                 camera_make, camera_model, lens_model, focal_length_mm, focal_length_35mm,
                 aperture_f, shutter_speed_sec, iso, orientation, color_space,
                 gps_lat, gps_lon, gps_alt_m, geo_city, geo_admin1, geo_country,
-                geo_country_code, taken_at_ms
+                geo_country_code, taken_at_ms, software, exif_modified_at_ms, taken_at_has_subsec
              FROM deterministic_photo_meta
              WHERE asset_id = ?1",
             params![asset_id],
@@ -181,6 +197,9 @@ fn load_photo_meta(conn: &Connection, asset_id: &str) -> DbResult<Option<PhotoMe
                     geo_country: row.get(15)?,
                     geo_country_code: row.get(16)?,
                     taken_at_ms: row.get(17)?,
+                    software: row.get(18)?,
+                    exif_modified_at_ms: row.get(19)?,
+                    taken_at_has_subsec: row.get::<_, i64>(20)? != 0,
                 })
             },
         )
@@ -426,8 +445,110 @@ const ASSET_SUMMARY_JOIN_COLUMNS: &str = "
     COALESCE(o.gps_lon, p.gps_lon, v.gps_lon) AS effective_gps_lon,
     COALESCE(o.geo_city, p.geo_city, v.geo_city) AS effective_geo_city,
     COALESCE(o.geo_country, p.geo_country, v.geo_country) AS effective_geo_country,
-    p.camera_model
+    p.camera_model,
+    a.stack_group_id,
+    a.stack_role
 ";
+
+fn escape_like_prefix(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + 2);
+    for ch in prefix.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push_str("/%");
+    out
+}
+
+/// Appends active/RBAC/folder/subfolder/favorite scope clauses for table alias `alias`.
+fn append_scope_clauses(
+    alias: &str,
+    scope: &RbacScope,
+    folder_id: Option<&str>,
+    path_prefix_like: Option<&str>,
+    favorite: Option<bool>,
+    params: &mut Vec<Value>,
+    clauses: &mut Vec<String>,
+) {
+    clauses.push(format!("{alias}.deleted_at_ms IS NULL"));
+    clauses.push(format!("{alias}.is_hidden = 0"));
+    clauses.push(rbac_sql::folder_clause(alias, scope, params));
+
+    if let Some(fid) = folder_id {
+        let idx = params.len() + 1;
+        params.push(Value::Text(fid.to_string()));
+        clauses.push(format!("{alias}.folder_id = ?{idx}"));
+    }
+
+    if let Some(like_pattern) = path_prefix_like {
+        let idx = params.len() + 1;
+        params.push(Value::Text(like_pattern.to_string()));
+        clauses.push(format!(
+            "EXISTS (SELECT 1 FROM asset_files af_p WHERE af_p.id = {alias}.primary_file_id AND af_p.is_missing = 0 AND af_p.rel_path LIKE ?{idx} ESCAPE '\\')"
+        ));
+    }
+
+    if let Some(fav) = favorite {
+        let idx = params.len() + 1;
+        params.push(Value::Integer(i64::from(fav)));
+        clauses.push(format!("{alias}.is_favorite = ?{idx}"));
+    }
+}
+
+/// Appends the deterministic, RBAC-safe stack-collapse predicate for table alias `a`
+/// (assuming `p` = `deterministic_photo_meta` and `af` = primary `asset_files` are joined).
+fn append_stack_collapse_clause(
+    scope: &RbacScope,
+    folder_id: Option<&str>,
+    path_prefix_like: Option<&str>,
+    favorite: Option<bool>,
+    params: &mut Vec<Value>,
+    clauses: &mut Vec<String>,
+) {
+    let mut sub_clauses = vec![
+        "a2.stack_group_id = a.stack_group_id".to_string(),
+        "a2.id != a.id".to_string(),
+    ];
+    append_scope_clauses(
+        "a2",
+        scope,
+        folder_id,
+        path_prefix_like,
+        favorite,
+        params,
+        &mut sub_clauses,
+    );
+    let sub_where = sub_clauses.join(" AND ");
+    clauses.push(format!(
+        "(a.stack_group_id IS NULL OR NOT EXISTS (
+            SELECT 1
+            FROM assets a2
+            LEFT JOIN deterministic_photo_meta p2 ON p2.asset_id = a2.id
+            LEFT JOIN asset_files af2 ON af2.id = a2.primary_file_id
+            WHERE {sub_where}
+              AND (
+                  a2.stack_rank > a.stack_rank
+                  OR (
+                      a2.stack_rank = a.stack_rank
+                      AND (
+                          COALESCE(p2.exif_modified_at_ms, af2.mtime_ms, a2.capture_at_ms)
+                              > COALESCE(p.exif_modified_at_ms, af.mtime_ms, a.capture_at_ms)
+                          OR (
+                              COALESCE(p2.exif_modified_at_ms, af2.mtime_ms, a2.capture_at_ms)
+                                  = COALESCE(p.exif_modified_at_ms, af.mtime_ms, a.capture_at_ms)
+                              AND a2.id > a.id
+                          )
+                      )
+                  )
+              )
+        ))"
+    ));
+}
 
 #[inline]
 fn year_month_from_unix_ms(ms: i64) -> (i32, u32) {
@@ -463,25 +584,23 @@ pub fn list_assets(
         }
     }
 
+    let path_prefix_norm = match query.path_prefix.as_deref() {
+        Some(raw) => crate::repo::stacks::normalize_subfolder_prefix(raw)?,
+        None => None,
+    };
+    let path_prefix_like = path_prefix_norm.as_deref().map(escape_like_prefix);
+
     let mut base_params: Vec<Value> = Vec::new();
-    let rbac_clause = rbac_sql::folder_clause("a", scope, &mut base_params);
-    let mut where_clauses = vec![
-        "a.deleted_at_ms IS NULL".to_string(),
-        "a.is_hidden = 0".to_string(),
-        rbac_clause,
-    ];
-
-    if let Some(folder_id) = &query.folder_id {
-        let idx = base_params.len() + 1;
-        base_params.push(Value::Text(folder_id.clone()));
-        where_clauses.push(format!("a.folder_id = ?{idx}"));
-    }
-
-    if let Some(favorite) = query.favorite {
-        let idx = base_params.len() + 1;
-        base_params.push(Value::Integer(i64::from(favorite)));
-        where_clauses.push(format!("a.is_favorite = ?{idx}"));
-    }
+    let mut where_clauses: Vec<String> = Vec::new();
+    append_scope_clauses(
+        "a",
+        scope,
+        query.folder_id.as_deref(),
+        path_prefix_like.as_deref(),
+        query.favorite,
+        &mut base_params,
+        &mut where_clauses,
+    );
 
     if let Some(before_ms) = query.before_ms {
         let idx = base_params.len() + 1;
@@ -489,8 +608,25 @@ pub fn list_assets(
         where_clauses.push(format!("a.capture_at_ms <= ?{idx}"));
     }
 
+    if query.collapse_stacks {
+        append_stack_collapse_clause(
+            scope,
+            query.folder_id.as_deref(),
+            path_prefix_like.as_deref(),
+            query.favorite,
+            &mut base_params,
+            &mut where_clauses,
+        );
+    }
+
     let base_where = where_clauses.join(" AND ");
-    let count_sql = format!("SELECT COUNT(*) FROM assets a WHERE {base_where}");
+    let count_sql = format!(
+        "SELECT COUNT(*)
+         FROM assets a
+         LEFT JOIN deterministic_photo_meta p ON p.asset_id = a.id
+         LEFT JOIN asset_files af ON af.id = a.primary_file_id
+         WHERE {base_where}"
+    );
     let total_count: i64 =
         conn.query_row(&count_sql, params_from_iter(base_params.clone()), |row| {
             row.get(0)
@@ -518,6 +654,7 @@ pub fn list_assets(
          LEFT JOIN deterministic_photo_meta p ON p.asset_id = a.id
          LEFT JOIN deterministic_video_meta v ON v.asset_id = a.id
          LEFT JOIN user_overrides o ON o.asset_id = a.id
+         LEFT JOIN asset_files af ON af.id = a.primary_file_id
          WHERE {page_where}
          ORDER BY a.capture_at_ms DESC, a.id DESC
          LIMIT ?{limit_idx}"
@@ -527,7 +664,7 @@ pub fn list_assets(
     let mut rows_with_cursor: Vec<(AssetSummary, i64)> = stmt
         .query_map(params_from_iter(page_params), |row| {
             let summary = row_to_asset_summary(row)?;
-            let raw_capture_at_ms: i64 = row.get(19)?;
+            let raw_capture_at_ms: i64 = row.get(21)?;
             Ok((summary, raw_capture_at_ms))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -540,7 +677,8 @@ pub fn list_assets(
     } else {
         None
     };
-    let items: Vec<AssetSummary> = rows_with_cursor.into_iter().map(|(s, _)| s).collect();
+    let mut items: Vec<AssetSummary> = rows_with_cursor.into_iter().map(|(s, _)| s).collect();
+    crate::repo::stacks::hydrate_stack_summaries(conn, scope, &mut items)?;
 
     Ok((items, next_cursor, total_count))
 }
@@ -550,14 +688,57 @@ pub fn list_timeline_buckets(
     conn: &Connection,
     scope: &RbacScope,
 ) -> DbResult<Vec<TimelineBucket>> {
+    list_timeline_buckets_filtered(conn, scope, None, None, true)
+}
+
+/// Returns year/month asset count buckets filtered by optional folder, nested subfolder prefix,
+/// and stack-collapse setting.
+pub fn list_timeline_buckets_filtered(
+    conn: &Connection,
+    scope: &RbacScope,
+    folder_id: Option<&str>,
+    path_prefix: Option<&str>,
+    collapse_stacks: bool,
+) -> DbResult<Vec<TimelineBucket>> {
+    if let Some(fid) = folder_id {
+        if !scope.allows_folder(fid) {
+            return Ok(Vec::new());
+        }
+    }
+    let path_prefix_norm = match path_prefix {
+        Some(raw) => crate::repo::stacks::normalize_subfolder_prefix(raw)?,
+        None => None,
+    };
+    let path_prefix_like = path_prefix_norm.as_deref().map(escape_like_prefix);
+
     let mut params: Vec<Value> = Vec::new();
-    let rbac_clause = rbac_sql::folder_clause("a", scope, &mut params);
+    let mut clauses: Vec<String> = Vec::new();
+    append_scope_clauses(
+        "a",
+        scope,
+        folder_id,
+        path_prefix_like.as_deref(),
+        None,
+        &mut params,
+        &mut clauses,
+    );
+    if collapse_stacks {
+        append_stack_collapse_clause(
+            scope,
+            folder_id,
+            path_prefix_like.as_deref(),
+            None,
+            &mut params,
+            &mut clauses,
+        );
+    }
+    let where_sql = clauses.join(" AND ");
     let sql = format!(
         "SELECT a.capture_at_ms
          FROM assets a
-         WHERE a.deleted_at_ms IS NULL
-           AND a.is_hidden = 0
-           AND {rbac_clause}"
+         LEFT JOIN deterministic_photo_meta p ON p.asset_id = a.id
+         LEFT JOIN asset_files af ON af.id = a.primary_file_id
+         WHERE {where_sql}"
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -671,6 +852,12 @@ pub fn get_asset_detail_for_user(
         return Ok(None);
     };
 
+    let stack_members =
+        crate::repo::stacks::load_stack_members(conn, scope, summary.stack_group_id.as_deref())?;
+    let mut summary_slice = [summary];
+    crate::repo::stacks::hydrate_stack_summaries(conn, scope, &mut summary_slice)?;
+    let [summary] = summary_slice;
+
     let files = load_asset_files(conn, asset_id)?;
     let photo_meta = load_photo_meta(conn, asset_id)?;
     let video_meta = load_video_meta(conn, asset_id)?;
@@ -725,6 +912,7 @@ pub fn get_asset_detail_for_user(
         histogram,
         album_ids,
         playback,
+        stack_members,
     }))
 }
 

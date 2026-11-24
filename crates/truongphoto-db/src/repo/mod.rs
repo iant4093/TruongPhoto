@@ -11,6 +11,7 @@ pub mod people;
 pub mod search;
 pub mod sessions;
 pub mod settings;
+pub mod stacks;
 pub mod tags;
 pub mod users;
 

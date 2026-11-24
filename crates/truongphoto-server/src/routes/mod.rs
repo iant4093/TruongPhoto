@@ -118,6 +118,17 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .route("/assets/{id}/overrides", patch(library::update_overrides))
         .route("/assets/{id}/tags", post(library::add_tag))
         .route("/assets/{id}/tags/{tag}", delete(library::remove_tag))
+        .route(
+            "/folders/{id}/subfolders",
+            get(folders::list_folder_subfolders),
+        )
+        .route("/stacks", post(library::create_stack))
+        .route("/stacks/{group_id}/cover", post(library::set_stack_cover))
+        .route(
+            "/stacks/{group_id}/members/{asset_id}",
+            delete(library::remove_from_stack),
+        )
+        .route("/admin/stacks/rebuild", post(library::rebuild_stacks))
         // Phase 2 People & Face Clustering
         .route("/people", get(people::list_people))
         .route("/people/merge", post(people::merge_people))

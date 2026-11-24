@@ -135,6 +135,52 @@ export interface AssetSummary {
   geo_city: string | null;
   geo_country: string | null;
   camera_model: string | null;
+  stack_group_id?: string | null;
+  stack_role?: string | null;
+  stack_count?: number;
+  stack_has_edited?: boolean;
+  stack_has_raw?: boolean;
+}
+
+export interface StackMemberView {
+  asset_id: string;
+  folder_id: string;
+  folder_name: string;
+  rel_path: string;
+  filename: string;
+  extension: string;
+  kind: AssetKind;
+  stack_role: string;
+  is_cover: boolean;
+  is_raw: boolean;
+  width: number | null;
+  height: number | null;
+  file_size: number;
+  thumb_ready: boolean;
+  capture_at_ms: number;
+  software: string | null;
+}
+
+export interface FolderSubfolderView {
+  path: string;
+  name: string;
+  parent_path: string | null;
+  depth: number;
+  asset_count: number;
+}
+
+export interface FolderSubfolderListResponse {
+  items: FolderSubfolderView[];
+}
+
+export interface StackGroupResponse {
+  stack_group_id: string;
+}
+
+export interface RebuildStacksResponse {
+  scanned_photos: number;
+  stacked_assets: number;
+  stack_groups: number;
 }
 
 export interface TimelineBucket {
@@ -325,10 +371,12 @@ export interface UpdateServerPinRequest {
 
 export interface ListAssetsParams {
   folder_id?: string;
+  path_prefix?: string;
   favorite?: boolean;
   before_ms?: number;
   cursor?: string;
   limit?: number;
+  collapse_stacks?: boolean;
 }
 
 export interface AssetListResponse {
@@ -451,6 +499,9 @@ export interface PhotoMetaView {
   geo_country: string | null;
   geo_country_code: string | null;
   taken_at_ms: number | null;
+  software?: string | null;
+  exif_modified_at_ms?: number | null;
+  taken_at_has_subsec?: boolean;
 }
 
 export interface VideoMetaView {
@@ -542,6 +593,7 @@ export interface AssetDetail {
   histogram: Histogram256 | null;
   album_ids: string[];
   playback: PlaybackInfo;
+  stack_members?: StackMemberView[];
 }
 
 export interface PurgeReport {

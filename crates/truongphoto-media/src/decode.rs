@@ -12,13 +12,53 @@ use std::io::BufReader;
 use std::path::Path;
 use truongphoto_core::Histogram256;
 
-/// Thumbnail generation result containing oriented pixel dimensions, WebP size, and RGB/Luma histogram.
+/// Thumbnail generation result containing oriented pixel dimensions, WebP size, RGB/Luma histogram,
+/// and 64-bit perceptual difference hash (`dhash64`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedThumb {
     pub width: u32,
     pub height: u32,
     pub thumb_bytes_len: u64,
     pub histogram: Histogram256,
+    pub dhash64: i64,
+}
+
+/// Computes a 64-bit horizontal perceptual difference hash (`dHash`) from an RGB image.
+///
+/// Resizes to 9x8 grayscale and sets bit `y * 8 + x` when `luma(x, y) > luma(x + 1, y)`.
+/// Robust to color grading, exposure push, recompression, and moderate resolution changes.
+pub fn compute_dhash64(rgb: &RgbImage) -> i64 {
+    let small = image::imageops::resize(rgb, 9, 8, FilterType::Triangle);
+    let mut hash: u64 = 0;
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let p1 = small.get_pixel(x, y);
+            let p2 = small.get_pixel(x + 1, y);
+            let l1 =
+                (u32::from(p1[0]) * 299 + u32::from(p1[1]) * 587 + u32::from(p1[2]) * 114) / 1000;
+            let l2 =
+                (u32::from(p2[0]) * 299 + u32::from(p2[1]) * 587 + u32::from(p2[2]) * 114) / 1000;
+            if l1 > l2 {
+                hash |= 1u64 << (y * 8 + x);
+            }
+        }
+    }
+    hash as i64
+}
+
+/// Hamming distance (`0..=64`) between two 64-bit perceptual difference hashes.
+pub const fn dhash_hamming_distance(a: i64, b: i64) -> u32 {
+    ((a as u64) ^ (b as u64)).count_ones()
+}
+
+/// Computes a 64-bit perceptual difference hash from an existing thumbnail/image file on disk.
+pub fn compute_dhash64_from_file(path: &Path) -> Option<i64> {
+    let file = File::open(path).ok()?;
+    let reader = ImageReader::new(BufReader::new(file))
+        .with_guessed_format()
+        .ok()?;
+    let img = reader.decode().ok()?;
+    Some(compute_dhash64(&img.to_rgb8()))
 }
 
 fn decode_standard_image_reader(
@@ -338,6 +378,7 @@ pub fn generate_thumb_and_histogram(
 ) -> Result<GeneratedThumb, MediaError> {
     let rgb = decode_image_to_srgb(src)?;
     let histogram = compute_histogram(&rgb);
+    let dhash64 = compute_dhash64(&rgb);
     let webp_bytes = encode_webp_resized(&rgb, 400, 80.0)?;
     atomic_write_bytes(thumb_out, &webp_bytes)?;
     Ok(GeneratedThumb {
@@ -345,6 +386,7 @@ pub fn generate_thumb_and_histogram(
         height: rgb.height(),
         thumb_bytes_len: webp_bytes.len() as u64,
         histogram,
+        dhash64,
     })
 }
 

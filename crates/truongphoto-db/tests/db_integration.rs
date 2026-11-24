@@ -87,7 +87,7 @@ async fn idempotent_migrations_on_reopen() {
         )
         .await
         .expect("query schema_migrations");
-    assert_eq!(count1, 5);
+    assert_eq!(count1, 6);
     assert!(db1.db_size_bytes() > 0);
     db1.shutdown().await.expect("shutdown db1");
 
@@ -98,7 +98,7 @@ async fn idempotent_migrations_on_reopen() {
         )
         .await
         .expect("query schema_migrations after reopen");
-    assert_eq!(count2, 5);
+    assert_eq!(count2, 6);
     db2.shutdown().await.expect("shutdown db2");
 }
 

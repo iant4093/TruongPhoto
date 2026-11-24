@@ -714,17 +714,18 @@ async fn process_candidate_file(
         }
     };
 
-    let (thumb_rel_path, thumb_ready, histogram, thumb_w, thumb_h) = match thumb_res {
+    let (thumb_rel_path, thumb_ready, histogram, thumb_w, thumb_h, dhash64) = match thumb_res {
         Ok(gen_thumb) => (
             Some(thumb_rel),
             true,
             Some(gen_thumb.histogram),
             Some(gen_thumb.width),
             Some(gen_thumb.height),
+            Some(gen_thumb.dhash64),
         ),
         Err(err) => {
             tracing::debug!(path = %cand.abs_path.display(), error = %err, "thumbnail generation skipped");
-            (None, false, None, None, None)
+            (None, false, None, None, None, None)
         }
     };
 
@@ -754,6 +755,7 @@ async fn process_candidate_file(
         duration_ms: meta.duration_ms,
         thumb_rel_path,
         thumb_ready,
+        dhash64,
         photo_meta: meta.photo_meta,
         raw_exif_json: None,
         video_meta: meta.video_meta,
@@ -820,4 +822,115 @@ fn compute_rel_path(root_path: &Path, abs_path: &Path) -> Option<String> {
     } else {
         Some(parts.join("/"))
     }
+}
+
+/// Backfills sub-second EXIF timestamps, editing `Software` / `ModifyDate`, and 64-bit `dhash64`
+/// for pre-migration photos, then reconciles universal EXIF cross-folder stacks.
+///
+/// When `force == false`, exits immediately in O(1) if all active photos already have `stack_role`
+/// and `dhash64` populated.
+pub async fn backfill_exif_and_stacks(
+    state: Arc<AppState>,
+    force: bool,
+) -> Result<repo::stacks::StackReconcileReport, String> {
+    let default_paths = state.default_paths.clone();
+    let settings = state
+        .db
+        .read(move |conn| repo::settings::load_app_settings(conn, &default_paths))
+        .await
+        .map_err(|e| e.to_string())?;
+    let thumbs_dir = PathBuf::from(settings.thumbnails_dir);
+
+    let candidates = state
+        .db
+        .read(move |conn| repo::stacks::list_backfill_candidates(conn, force))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !force && candidates.is_empty() {
+        return Ok(repo::stacks::StackReconcileReport::default());
+    }
+
+    tracing::info!(
+        count = candidates.len(),
+        force,
+        "running EXIF & universal stack backfill"
+    );
+
+    let shutdown = state.shutdown_token.clone();
+    let updates: Vec<repo::stacks::BackfillUpdateRow> = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(candidates.len());
+        for cand in candidates {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            let mut abs_path = PathBuf::from(&cand.root_path);
+            for seg in cand.rel_path.split('/') {
+                if !seg.is_empty() {
+                    abs_path.push(seg);
+                }
+            }
+            let thumb_abs = cand.thumb_rel_path.as_deref().map(|r| thumbs_dir.join(r));
+            let meta = if abs_path.is_file() {
+                extract_metadata(&abs_path).ok()
+            } else {
+                None
+            };
+            let dhash64 = if cand.needs_dhash {
+                thumb_abs
+                    .as_deref()
+                    .filter(|p| p.is_file())
+                    .and_then(truongphoto_media::compute_dhash64_from_file)
+            } else {
+                None
+            };
+            let (taken_at_ms, taken_at_has_subsec, software, exif_modified_at_ms) =
+                match meta.as_ref().and_then(|m| m.photo_meta.as_ref()) {
+                    Some(pm) => (
+                        pm.taken_at_ms,
+                        pm.taken_at_has_subsec,
+                        pm.software.clone(),
+                        pm.exif_modified_at_ms,
+                    ),
+                    None => (None, false, None, None),
+                };
+            let tz_offset_m = meta.as_ref().and_then(|m| m.capture_tz_offset_m);
+            out.push(repo::stacks::BackfillUpdateRow {
+                asset_id: cand.asset_id,
+                taken_at_ms,
+                taken_at_has_subsec,
+                tz_offset_m,
+                software,
+                exif_modified_at_ms,
+                dhash64,
+            });
+        }
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if state.shutdown_token.is_cancelled() {
+        return Ok(repo::stacks::StackReconcileReport::default());
+    }
+
+    let report = state
+        .db
+        .write(move |conn| repo::stacks::apply_backfill_and_reconcile(conn, &updates))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        scanned = report.scanned_photos,
+        stacked = report.stacked_assets,
+        groups = report.stack_groups,
+        "universal EXIF stack reconciliation finished"
+    );
+
+    let _ = state.ws_tx.send(WsServerEvent::FolderChanged {
+        folder_id: "all".to_string(),
+        action: "stacks_reconciled".to_string(),
+    });
+
+    Ok(report)
 }

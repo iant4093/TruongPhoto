@@ -663,64 +663,201 @@ fn entry_as_u32(exif: &Exif, tag: ExifTag) -> Option<u32> {
     }
 }
 
-fn parse_exif_timestamp(exif: &Exif) -> (Option<i64>, Option<i32>) {
-    for tag in [
-        ExifTag::DateTimeOriginal,
-        ExifTag::CreateDate,
-        ExifTag::ModifyDate,
-    ] {
-        let Some(val) = exif.get(tag) else {
-            continue;
-        };
-        match val {
-            EntryValue::DateTime(dt) => {
-                return (
-                    Some(dt.timestamp_millis()),
-                    Some(dt.offset().local_minus_utc() / 60),
-                );
+/// Parses an EXIF fractional-second string (`SubSecTimeOriginal` / `SubSecTimeDigitized`) into milliseconds (0..=999).
+///
+/// EXIF fractional seconds are decimal fractions right-padded with zeros:
+/// `"9"` -> `900`, `"09"` -> `90`, `"095"` -> `95`, `"123456"` -> `123`, `"00"` -> `0`.
+pub fn parse_subsec_ms(raw: &str) -> Option<i64> {
+    let digits: String = raw
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let ms = match digits.len() {
+        1 => digits.parse::<i64>().ok()? * 100,
+        2 => digits.parse::<i64>().ok()? * 10,
+        _ => digits[..3].parse::<i64>().ok()?,
+    };
+    Some(ms.clamp(0, 999))
+}
+
+/// Returns `true` when an EXIF `Software` / `ProcessingSoftware` string identifies a photo editor
+/// rather than in-camera firmware.
+pub fn is_editing_software(software: &str) -> bool {
+    let low = software.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    const EDITOR_KEYWORDS: &[&str] = &[
+        "lightroom",
+        "photoshop",
+        "adobe",
+        "capture one",
+        "darktable",
+        "rawtherapee",
+        "dxo",
+        "luminar",
+        "affinity",
+        "pixelmator",
+        "photomator",
+        "on1",
+        "acorn",
+        "gimp",
+        "snapseed",
+        "vsco",
+        "polarr",
+        "skylum",
+        "topaz",
+        "nik collection",
+        "silkypix",
+        "digital photo professional",
+        "imaging edge",
+        "nx studio",
+        "x raw studio",
+        "om workspace",
+        "aftershot",
+        "acdsee",
+        "paintshop",
+        "canva",
+        "figma",
+        "imagemagick",
+        "exiftool",
+        "apple photos",
+        "photos ",
+        "preview",
+    ];
+    EDITOR_KEYWORDS.iter().any(|kw| low.contains(kw))
+}
+
+fn parse_single_exif_timestamp(
+    exif: &Exif,
+    tag: ExifTag,
+    subsec_tag: Option<ExifTag>,
+    offset_tags: &[ExifTag],
+) -> (Option<i64>, Option<i32>, bool) {
+    let Some(val) = exif.get(tag) else {
+        return (None, None, false);
+    };
+    let subsec_ms = subsec_tag
+        .and_then(|st| entry_as_str(exif, st))
+        .and_then(|s| parse_subsec_ms(&s));
+    let has_subsec = subsec_ms.is_some();
+
+    let apply_subsec = |base_ms: i64| -> i64 {
+        if let Some(ms) = subsec_ms {
+            if base_ms % 1000 == 0 {
+                return base_ms.saturating_add(ms);
             }
-            EntryValue::NaiveDateTime(naive) => {
-                if let Some(offset_str) = entry_as_str(exif, ExifTag::OffsetTimeOriginal)
-                    .or_else(|| entry_as_str(exif, ExifTag::OffsetTime))
-                {
-                    if let Ok(offset) = offset_str.parse::<FixedOffset>() {
-                        if let Some(dt) = naive.and_local_timezone(offset).single() {
-                            return (
-                                Some(dt.timestamp_millis()),
-                                Some(offset.local_minus_utc() / 60),
-                            );
-                        }
-                    }
+        }
+        base_ms
+    };
+
+    let resolve_offset = || -> Option<FixedOffset> {
+        for ot in offset_tags {
+            if let Some(offset_str) = entry_as_str(exif, *ot) {
+                if let Ok(offset) = offset_str.parse::<FixedOffset>() {
+                    return Some(offset);
                 }
-                return (Some(naive.and_utc().timestamp_millis()), None);
             }
-            EntryValue::Text(s) => {
-                if let Ok(dt) = DateTime::parse_from_rfc3339(s.trim()) {
+        }
+        None
+    };
+
+    match val {
+        EntryValue::DateTime(dt) => (
+            Some(apply_subsec(dt.timestamp_millis())),
+            Some(dt.offset().local_minus_utc() / 60),
+            has_subsec || (dt.timestamp_millis() % 1000 != 0),
+        ),
+        EntryValue::NaiveDateTime(naive) => {
+            if let Some(offset) = resolve_offset() {
+                if let Some(dt) = naive.and_local_timezone(offset).single() {
                     return (
-                        Some(dt.timestamp_millis()),
-                        Some(dt.offset().local_minus_utc() / 60),
+                        Some(apply_subsec(dt.timestamp_millis())),
+                        Some(offset.local_minus_utc() / 60),
+                        has_subsec,
                     );
                 }
-                if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S") {
-                    if let Some(offset_str) = entry_as_str(exif, ExifTag::OffsetTimeOriginal)
-                        .or_else(|| entry_as_str(exif, ExifTag::OffsetTime))
-                    {
-                        if let Ok(offset) = offset_str.parse::<FixedOffset>() {
-                            if let Some(dt) = naive.and_local_timezone(offset).single() {
-                                return (
-                                    Some(dt.timestamp_millis()),
-                                    Some(offset.local_minus_utc() / 60),
-                                );
-                            }
-                        }
-                    }
-                    return (Some(naive.and_utc().timestamp_millis()), None);
-                }
             }
-            _ => {}
+            (
+                Some(apply_subsec(naive.and_utc().timestamp_millis())),
+                None,
+                has_subsec,
+            )
+        }
+        EntryValue::Text(s) => {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(s.trim()) {
+                return (
+                    Some(apply_subsec(dt.timestamp_millis())),
+                    Some(dt.offset().local_minus_utc() / 60),
+                    has_subsec || (dt.timestamp_millis() % 1000 != 0),
+                );
+            }
+            if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S") {
+                if let Some(offset) = resolve_offset() {
+                    if let Some(dt) = naive.and_local_timezone(offset).single() {
+                        return (
+                            Some(apply_subsec(dt.timestamp_millis())),
+                            Some(offset.local_minus_utc() / 60),
+                            has_subsec,
+                        );
+                    }
+                }
+                return (
+                    Some(apply_subsec(naive.and_utc().timestamp_millis())),
+                    None,
+                    has_subsec,
+                );
+            }
+            (None, None, false)
+        }
+        _ => (None, None, false),
+    }
+}
+
+fn parse_exif_timestamp(exif: &Exif) -> (Option<i64>, Option<i32>, bool) {
+    let candidates: [(ExifTag, Option<ExifTag>, &[ExifTag]); 3] = [
+        (
+            ExifTag::DateTimeOriginal,
+            Some(ExifTag::SubSecTimeOriginal),
+            &[ExifTag::OffsetTimeOriginal, ExifTag::OffsetTime],
+        ),
+        (
+            ExifTag::CreateDate,
+            Some(ExifTag::SubSecTimeDigitized),
+            &[
+                ExifTag::OffsetTimeDigitized,
+                ExifTag::OffsetTimeOriginal,
+                ExifTag::OffsetTime,
+            ],
+        ),
+        (
+            ExifTag::ModifyDate,
+            Some(ExifTag::SubSecTime),
+            &[ExifTag::OffsetTime, ExifTag::OffsetTimeOriginal],
+        ),
+    ];
+    for (tag, subsec_tag, offset_tags) in candidates {
+        let (ts, tz, has_subsec) = parse_single_exif_timestamp(exif, tag, subsec_tag, offset_tags);
+        if ts.is_some() {
+            return (ts, tz, has_subsec);
         }
     }
-    (None, None)
+    (None, None, false)
+}
+
+fn parse_exif_modify_timestamp(exif: &Exif) -> Option<i64> {
+    parse_single_exif_timestamp(
+        exif,
+        ExifTag::ModifyDate,
+        Some(ExifTag::SubSecTime),
+        &[ExifTag::OffsetTime, ExifTag::OffsetTimeOriginal],
+    )
+    .0
 }
 
 fn populate_from_exif(
@@ -732,7 +869,10 @@ fn populate_from_exif(
     Option<i32>,
     Option<String>,
 ) {
-    let (taken_at_ms, tz_offset_m) = parse_exif_timestamp(exif);
+    let (taken_at_ms, tz_offset_m, taken_at_has_subsec) = parse_exif_timestamp(exif);
+    let exif_modified_at_ms = parse_exif_modify_timestamp(exif);
+    let software = entry_as_str(exif, ExifTag::Software)
+        .or_else(|| entry_as_str(exif, ExifTag::ProcessingSoftware));
     let orientation = entry_as_u32(exif, ExifTag::Orientation).and_then(|v| u16::try_from(v).ok());
 
     let color_space = match entry_as_u32(exif, ExifTag::ColorSpace) {
@@ -813,6 +953,9 @@ fn populate_from_exif(
         geo_country,
         geo_country_code,
         taken_at_ms,
+        software,
+        exif_modified_at_ms,
+        taken_at_has_subsec,
     };
 
     (view, width, height, tz_offset_m, content_identifier)
@@ -1305,5 +1448,35 @@ pub fn extract_metadata(path: &Path) -> Result<ExtractedMetadata, MediaError> {
         MediaCategory::Raw => Ok(extract_image_metadata(path, &ext, true)),
         MediaCategory::Video => Ok(extract_video_metadata(path)),
         MediaCategory::Livp => extract_livp_metadata(path),
+    }
+}
+
+#[cfg(test)]
+mod subsec_and_software_tests {
+    use super::*;
+
+    #[test]
+    fn parses_exif_subsec_fractional_milliseconds() {
+        assert_eq!(parse_subsec_ms("9"), Some(900));
+        assert_eq!(parse_subsec_ms("09"), Some(90));
+        assert_eq!(parse_subsec_ms("095"), Some(95));
+        assert_eq!(parse_subsec_ms("123456"), Some(123));
+        assert_eq!(parse_subsec_ms("00"), Some(0));
+        assert_eq!(parse_subsec_ms(".40"), Some(400));
+        assert_eq!(parse_subsec_ms(""), None);
+        assert_eq!(parse_subsec_ms("   "), None);
+    }
+
+    #[test]
+    fn distinguishes_editing_software_from_camera_firmware() {
+        assert!(is_editing_software(
+            "Adobe Photoshop Lightroom Classic 15.3 (Windows)"
+        ));
+        assert!(is_editing_software("Capture One 23 Macintosh"));
+        assert!(is_editing_software("darktable 4.8.1"));
+        assert!(is_editing_software("Affinity Photo 2"));
+        assert!(!is_editing_software("Ver.1.4.0"));
+        assert!(!is_editing_software("18.1.1"));
+        assert!(!is_editing_software(""));
     }
 }

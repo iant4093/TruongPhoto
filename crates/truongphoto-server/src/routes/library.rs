@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use truongphoto_core::{
-    AssetDetail, AssetSummary, MediaTagView, PurgeReport, ShareableUser, TimelineBucket,
-    UpdateOverridesRequest,
+    AssetDetail, AssetSummary, CreateStackRequest, MediaTagView, PurgeReport, SetStackCoverRequest,
+    ShareableUser, TimelineBucket, UpdateOverridesRequest, WsServerEvent,
 };
 use truongphoto_db::{repo, DbError};
 
@@ -31,6 +31,8 @@ pub struct AssetsQueryParams {
     #[serde(default)]
     pub folder_id: Option<String>,
     #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
     pub favorite: Option<bool>,
     #[serde(default)]
     pub before_ms: Option<i64>,
@@ -38,6 +40,30 @@ pub struct AssetsQueryParams {
     pub cursor: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub collapse_stacks: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AssetBucketsQueryParams {
+    #[serde(default)]
+    pub folder_id: Option<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub collapse_stacks: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StackGroupResponse {
+    pub stack_group_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RebuildStacksResponse {
+    pub scanned_photos: usize,
+    pub stacked_assets: usize,
+    pub stack_groups: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,10 +142,12 @@ pub async fn list_assets(
     let scope = rbac.scope;
     let query = repo::assets::AssetListQuery {
         folder_id: params.folder_id,
+        path_prefix: params.path_prefix,
         favorite: params.favorite,
         before_ms: params.before_ms,
         cursor: params.cursor,
         limit: params.limit.unwrap_or(100),
+        collapse_stacks: params.collapse_stacks.unwrap_or(true),
     };
 
     let (items, next_cursor, total_count) = state
@@ -138,11 +166,23 @@ pub async fn list_assets(
 pub async fn list_asset_buckets(
     rbac: RbacContext,
     State(state): State<Arc<AppState>>,
+    Query(params): Query<AssetBucketsQueryParams>,
 ) -> Result<Json<AssetBucketsResponse>, AppError> {
     let scope = rbac.scope;
+    let folder_id = params.folder_id;
+    let path_prefix = params.path_prefix;
+    let collapse_stacks = params.collapse_stacks.unwrap_or(true);
     let buckets = state
         .db
-        .read(move |conn| repo::assets::list_timeline_buckets(conn, &scope))
+        .read(move |conn| {
+            repo::assets::list_timeline_buckets_filtered(
+                conn,
+                &scope,
+                folder_id.as_deref(),
+                path_prefix.as_deref(),
+                collapse_stacks,
+            )
+        })
         .await?;
     Ok(Json(AssetBucketsResponse { buckets }))
 }
@@ -421,4 +461,84 @@ pub async fn list_shareable_users(
 ) -> Result<Json<ShareableUsersResponse>, AppError> {
     let items = state.db.read(repo::albums::list_shareable_users).await?;
     Ok(Json(ShareableUsersResponse { items }))
+}
+
+/// `POST /api/stacks` (Contributor or Admin + RbacContext) — manually group 2+ assets into a stack.
+pub async fn create_stack(
+    rbac: RbacContext,
+    State(state): State<Arc<AppState>>,
+    ApiJson(req): ApiJson<CreateStackRequest>,
+) -> Result<Json<StackGroupResponse>, AppError> {
+    ensure_contributor(&rbac)?;
+    let scope = rbac.scope;
+    let stack_group_id = state
+        .db
+        .write(move |conn| {
+            repo::stacks::create_manual_stack(
+                conn,
+                &scope,
+                &req.asset_ids,
+                req.cover_asset_id.as_deref(),
+            )
+        })
+        .await?;
+    let _ = state.ws_tx.send(WsServerEvent::FolderChanged {
+        folder_id: "all".to_string(),
+        action: "stacks_updated".to_string(),
+    });
+    Ok(Json(StackGroupResponse { stack_group_id }))
+}
+
+/// `POST /api/stacks/{group_id}/cover` (Contributor or Admin + RbacContext).
+pub async fn set_stack_cover(
+    rbac: RbacContext,
+    State(state): State<Arc<AppState>>,
+    AxumPath(group_id): AxumPath<String>,
+    ApiJson(req): ApiJson<SetStackCoverRequest>,
+) -> Result<StatusCode, AppError> {
+    ensure_contributor(&rbac)?;
+    let scope = rbac.scope;
+    state
+        .db
+        .write(move |conn| repo::stacks::set_stack_cover(conn, &scope, &group_id, &req.asset_id))
+        .await?;
+    let _ = state.ws_tx.send(WsServerEvent::FolderChanged {
+        folder_id: "all".to_string(),
+        action: "stacks_updated".to_string(),
+    });
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/stacks/{group_id}/members/{asset_id}` (Contributor or Admin + RbacContext).
+pub async fn remove_from_stack(
+    rbac: RbacContext,
+    State(state): State<Arc<AppState>>,
+    AxumPath((group_id, asset_id)): AxumPath<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    ensure_contributor(&rbac)?;
+    let scope = rbac.scope;
+    state
+        .db
+        .write(move |conn| repo::stacks::remove_from_stack(conn, &scope, &group_id, &asset_id))
+        .await?;
+    let _ = state.ws_tx.send(WsServerEvent::FolderChanged {
+        folder_id: "all".to_string(),
+        action: "stacks_updated".to_string(),
+    });
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/admin/stacks/rebuild` (RequireAdmin) — re-extracts sub-second EXIF/dHash and rebuilds auto stacks.
+pub async fn rebuild_stacks(
+    RequireAdmin(_auth): RequireAdmin,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<RebuildStacksResponse>, AppError> {
+    let report = crate::ingest::scanner::backfill_exif_and_stacks(state, true)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(RebuildStacksResponse {
+        scanned_photos: report.scanned_photos,
+        stacked_assets: report.stacked_assets,
+        stack_groups: report.stack_groups,
+    }))
 }

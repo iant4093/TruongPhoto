@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use truongphoto_core::{FolderView, RbacScope, WsServerEvent};
+use truongphoto_core::{FolderSubfolderView, FolderView, RbacScope, WsServerEvent};
 use truongphoto_db::{repo, DbError};
 use truongphoto_media::volume::resolve_volume_identity;
 use uuid::Uuid;
@@ -18,6 +18,25 @@ use uuid::Uuid;
 #[derive(Debug, Serialize)]
 pub struct FolderListResponse {
     pub items: Vec<FolderView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FolderSubfolderListResponse {
+    pub items: Vec<FolderSubfolderView>,
+}
+
+/// `GET /api/folders/{id}/subfolders` (Authenticated + RbacContext).
+pub async fn list_folder_subfolders(
+    rbac: RbacContext,
+    State(state): State<Arc<AppState>>,
+    AxumPath(folder_id): AxumPath<String>,
+) -> Result<Json<FolderSubfolderListResponse>, AppError> {
+    let scope = rbac.scope;
+    let items = state
+        .db
+        .read(move |conn| repo::stacks::list_folder_subfolders(conn, &scope, &folder_id))
+        .await?;
+    Ok(Json(FolderSubfolderListResponse { items }))
 }
 
 #[derive(Debug, Serialize)]

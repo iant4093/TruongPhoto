@@ -267,6 +267,15 @@ pub async fn start_server(
         state.clone(),
         shutdown_token.clone(),
     ));
+    {
+        let backfill_state = state.clone();
+        bg_tasks.push(tokio::spawn(async move {
+            if let Err(err) = ingest::scanner::backfill_exif_and_stacks(backfill_state, false).await
+            {
+                tracing::warn!(error = %err, "background EXIF & stack backfill failed");
+            }
+        }));
+    }
     state.watcher.start_existing_folders(&state).await;
     let router = build_router(state.clone());
     let serve_shutdown = shutdown_token.clone();

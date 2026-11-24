@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Check, Download, Eye, FolderPlus, Heart, Info, Star, Trash2, X } from 'lucide-react';
+import { Check, Download, Eye, FolderPlus, Heart, Info, Layers, Star, Trash2, X } from 'lucide-react';
 import {
   addAlbumAssets,
+  createStack,
   listAlbums,
   mediaThumbUrl,
   setAssetFavorite,
@@ -32,6 +33,19 @@ function formatVideoDuration(ms: number | null): string {
 }
 
 function getTilePill(asset: AssetSummary): string | null {
+  const stackCount = asset.stack_count ?? 1;
+  if (stackCount > 1) {
+    if (asset.stack_has_edited && asset.stack_has_raw) {
+      return stackCount > 2 ? `EDITED · ${stackCount}` : 'EDITED+RAW';
+    }
+    if (asset.stack_has_edited) {
+      return `EDITED · ${stackCount}`;
+    }
+    if (asset.stack_has_raw) {
+      return stackCount > 2 ? `RAW+JPG · ${stackCount}` : 'RAW+JPG';
+    }
+    return `${stackCount} VERSIONS`;
+  }
   switch (asset.kind) {
     case 'raw_jpg_stack':
       return 'RAW+JPG';
@@ -375,6 +389,22 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
     }
   };
 
+  const handleBulkStack = async () => {
+    if (!canMutate || selectedIds.size < 2) return;
+    setBulkBusy(true);
+    const ids = Array.from(selectedIds);
+    try {
+      await createStack(ids);
+      notifySuccess(`Stacked ${ids.length} photos together`);
+      clearSelection();
+      bumpLibraryRevision();
+    } catch (err) {
+      notifyError(err, 'Could not stack selected photos');
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
   const renderRow = (row: JustifiedRow) => {
     if (row.type === 'header') {
       return (
@@ -680,6 +710,18 @@ export const JustifiedTimeline: React.FC<JustifiedTimelineProps> = ({
                 <Heart size={13} />
                 Favorite
               </button>
+
+              {selectedIds.size >= 2 && (
+                <button
+                  type="button"
+                  className="button"
+                  disabled={bulkBusy}
+                  onClick={() => void handleBulkStack()}
+                >
+                  <Layers size={13} />
+                  Stack
+                </button>
+              )}
 
               <div ref={albumPickerRef}>
                 <button

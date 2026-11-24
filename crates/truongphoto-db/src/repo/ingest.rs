@@ -34,6 +34,7 @@ pub struct IngestedFileData {
     pub duration_ms: Option<i64>,
     pub thumb_rel_path: Option<String>,
     pub thumb_ready: bool,
+    pub dhash64: Option<i64>,
     pub photo_meta: Option<PhotoMetaView>,
     pub raw_exif_json: Option<String>,
     pub video_meta: Option<VideoMetaView>,
@@ -301,10 +302,10 @@ fn upsert_photo_meta(
             focal_length_mm, focal_length_35mm, aperture_f, shutter_speed_sec,
             iso, orientation, color_space, gps_lat, gps_lon, gps_alt_m,
             geo_city, geo_admin1, geo_country, geo_country_code,
-            taken_at_ms, raw_exif_json
+            taken_at_ms, software, exif_modified_at_ms, taken_at_has_subsec, raw_exif_json
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-            ?15, ?16, ?17, ?18, ?19, ?20
+            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
          )
          ON CONFLICT(asset_id) DO UPDATE SET
             camera_make = excluded.camera_make,
@@ -325,6 +326,9 @@ fn upsert_photo_meta(
             geo_country = excluded.geo_country,
             geo_country_code = excluded.geo_country_code,
             taken_at_ms = excluded.taken_at_ms,
+            software = excluded.software,
+            exif_modified_at_ms = excluded.exif_modified_at_ms,
+            taken_at_has_subsec = excluded.taken_at_has_subsec,
             raw_exif_json = COALESCE(excluded.raw_exif_json, deterministic_photo_meta.raw_exif_json)",
         params![
             asset_id,
@@ -346,6 +350,9 @@ fn upsert_photo_meta(
             meta.geo_country,
             meta.geo_country_code,
             meta.taken_at_ms,
+            meta.software,
+            meta.exif_modified_at_ms,
+            bool_to_int(meta.taken_at_has_subsec),
             raw_exif_json,
         ],
     )?;
@@ -450,11 +457,11 @@ fn insert_asset_row(conn: &Connection, row: NewAssetRow<'_>) -> DbResult<()> {
         "INSERT INTO assets (
             id, folder_id, kind, primary_file_id, stack_key,
             capture_at_ms, capture_tz_offset_m, width, height, duration_ms, aspect_ratio,
-            is_favorite, is_hidden, thumb_rel_path, thumb_ready, ai_stage,
+            is_favorite, is_hidden, thumb_rel_path, thumb_ready, dhash64, ai_stage,
             created_at_ms, updated_at_ms
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-            ?12, 0, ?13, ?14, 0, ?15, ?15
+            ?12, 0, ?13, ?14, ?15, 0, ?16, ?16
          )",
         params![
             row.asset_id,
@@ -471,6 +478,7 @@ fn insert_asset_row(conn: &Connection, row: NewAssetRow<'_>) -> DbResult<()> {
             bool_to_int(row.is_favorite),
             row.data.thumb_rel_path,
             bool_to_int(row.data.thumb_ready),
+            row.data.dhash64,
             row.now,
         ],
     )?;
@@ -875,6 +883,7 @@ pub fn reconcile_ingested_file(conn: &Connection, data: &IngestedFileData) -> Db
             params![&asset_id],
         )?;
         crate::repo::map::sync_asset_geo(conn, &asset_id)?;
+        crate::repo::stacks::reconcile_stacks_for_asset(conn, &asset_id)?;
         Ok(asset_id)
     })
 }
@@ -958,6 +967,7 @@ fn reconcile_ingested_file_inner(conn: &Connection, data: &IngestedFileData) -> 
                          duration_ms = COALESCE(?7, duration_ms),
                          thumb_rel_path = CASE WHEN ?8 = 1 THEN COALESCE(?9, thumb_rel_path) ELSE thumb_rel_path END,
                          thumb_ready = CASE WHEN ?8 = 1 THEN 1 ELSE thumb_ready END,
+                         dhash64 = COALESCE(?12, dhash64),
                          updated_at_ms = ?10
                      WHERE id = ?11",
                     params![
@@ -972,6 +982,7 @@ fn reconcile_ingested_file_inner(conn: &Connection, data: &IngestedFileData) -> 
                         data.thumb_rel_path,
                         now,
                         existing_asset_id,
+                        data.dhash64,
                     ],
                 )?;
         } else if existing_role == FileRole::JpegCompanion.as_str() && data.thumb_ready {

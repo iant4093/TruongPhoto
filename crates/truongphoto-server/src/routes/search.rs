@@ -789,14 +789,28 @@ pub(crate) async fn execute_hybrid_search(
     let page_ids: Vec<String> = page.iter().map(|h| h.asset_id.clone()).collect();
     let scope = rbac.scope.clone();
 
-    let summaries = state
+    let mut summaries = state
         .db
-        .read(move |conn| repo::search::load_asset_summaries_by_ids(conn, &scope, &page_ids))
+        .read(move |conn| {
+            let mut map = repo::search::load_asset_summaries_by_ids(conn, &scope, &page_ids)?;
+            let mut vals: Vec<AssetSummary> = map.values().cloned().collect();
+            repo::stacks::hydrate_stack_summaries(conn, &scope, &mut vals)?;
+            for v in vals {
+                map.insert(v.id.clone(), v);
+            }
+            Ok(map)
+        })
         .await?;
 
+    let mut seen_stacks = std::collections::HashSet::new();
     let mut items = Vec::with_capacity(page.len());
     for hit in page {
-        if let Some(asset) = summaries.get(&hit.asset_id).cloned() {
+        if let Some(asset) = summaries.remove(&hit.asset_id) {
+            if let Some(gid) = asset.stack_group_id.as_ref() {
+                if !seen_stacks.insert(gid.clone()) {
+                    continue;
+                }
+            }
             items.push(SearchHit {
                 asset,
                 score: hit.score,
